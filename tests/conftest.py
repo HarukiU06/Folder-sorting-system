@@ -1,5 +1,6 @@
 """Shared fixtures. Every test runs against temporary folders, never real user data."""
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,6 +17,16 @@ def app_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "app home"
     monkeypatch.setenv(HOME_ENV_VAR, str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def reset_logging() -> Iterator[None]:
+    """Close handlers that ``cli.main`` attaches, so log files in temp dirs aren't held open."""
+    yield
+    logger = logging.getLogger("autoshelf")
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
 
 @pytest.fixture

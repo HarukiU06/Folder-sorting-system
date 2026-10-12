@@ -17,7 +17,7 @@ classifiers = [
     "Environment :: Win32 (MS Windows)",
 ]
 # Heavy dependencies (sentence-transformers, PySide6, extractors) are added in the phase that uses them.
-dependencies = []
+dependencies = ["watchdog>=4.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

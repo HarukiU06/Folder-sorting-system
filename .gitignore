@@ -1,0 +1,32 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python build and cache output
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local data: never commit databases, logs, secrets or personal files
+*.db
+*.db-wal
+*.db-shm
+*.log
+.env
+.env.*
+
+# Model caches
+.cache/
+models/
+huggingface/
+
+# Editors and OS
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db
+.DS_Store

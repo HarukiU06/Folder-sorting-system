@@ -8,7 +8,14 @@ from helpers import make
 from autoshelf.actions.undo import undo
 from autoshelf.db import repository
 from autoshelf.ml.library import LibraryIndex
-from autoshelf.pipeline import REASON_ASK, REASON_AUTO, TEXT_EXCERPT_CHARS, OutcomeKind, Pipeline
+from autoshelf.pipeline import (
+    REASON_ASK,
+    REASON_AUTO,
+    TEXT_EXCERPT_CHARS,
+    Outcome,
+    OutcomeKind,
+    Pipeline,
+)
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
 
@@ -309,3 +316,17 @@ def test_new_folder_is_picked_up_without_restarting(conn, shelf: Path, smart: Pi
     outcome = smart.process(make(shelf / "kyoto.txt", "trip itinerary hotel flight kyoto"))
 
     assert outcome.dst == shelf / "Travel" / "kyoto.txt"
+
+
+@pytest.mark.parametrize(
+    ("kind", "dst", "needs"),
+    [
+        (OutcomeKind.MOVED, Path("C:/shelf/_Inbox/a.pdf"), True),
+        (OutcomeKind.MOVED, Path("C:/shelf/Finance/a.pdf"), False),
+        (OutcomeKind.WAITING, None, True),
+        (OutcomeKind.WOULD_MOVE, Path("C:/shelf/_Inbox/a.pdf"), False),
+        (OutcomeKind.SKIPPED, None, False),
+    ],
+)
+def test_needs_decision(kind: OutcomeKind, dst: Path | None, needs: bool) -> None:
+    assert Outcome(kind, Path("a.pdf"), "", dst=dst).needs_decision is needs

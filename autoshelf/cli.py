@@ -11,9 +11,16 @@ from datetime import datetime
 from pathlib import Path
 
 from autoshelf import __version__
-from autoshelf.actions.inbox import AssignError, assign, resolve_folder, waiting_files
+from autoshelf.actions.inbox import (
+    AssignError,
+    assign,
+    inbox_items,
+    resolve_folder,
+    waiting_files,
+)
 from autoshelf.actions.mover import MoveResult
 from autoshelf.actions.undo import UndoError, undo, undo_last
+from autoshelf.app_service import library_factory, watch_lock
 from autoshelf.config import (
     DEFAULT_EMBEDDING_MODEL,
     AppPaths,
@@ -130,9 +137,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
-        parser.print_help()
-        print("\nThe desktop app is not built yet (Phase 4).")
-        return 0
+        from autoshelf.ui.app import run_app  # imports Qt; only needed for the app
+
+        return run_app(verbose=args.verbose)
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
@@ -176,11 +183,7 @@ def _settings(paths: AppPaths) -> Settings:
 
 def _open_library(conn: sqlite3.Connection, root: Path, settings: Settings, paths: AppPaths):
     """Load the language model and index the folders under ``root``."""
-    from autoshelf.ml.embedder import load_embedder  # imports torch; only needed here
-    from autoshelf.ml.library import LibraryIndex
-
-    embedder = load_embedder(settings.embedding_model, paths.model_dir)
-    library = LibraryIndex(conn, root, embedder, ignore_patterns=settings.ignore_patterns)
+    library = library_factory(paths, settings, root)(conn)
 
     def progress(done: int, total: int) -> None:
         if done == total or done % 25 == 0:
@@ -191,28 +194,37 @@ def _open_library(conn: sqlite3.Connection, root: Path, settings: Settings, path
 
 
 def _cmd_watch(args: argparse.Namespace, paths: AppPaths) -> int:
-    from autoshelf.ml.library import LibraryIndex
-    from autoshelf.watcher.service import WatchService  # imports watchdog; only needed here
-
     settings = _settings(paths)
     root = _root(args, settings, paths)
+    lock = watch_lock(paths)
+    if not lock.acquire():
+        holder = lock.holder_pid()
+        print(
+            "error: AutoShelf is already sorting files"
+            + (f" (process {holder})" if holder else "")
+            + "; only one can run at a time. Quit the app or the other watch first.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        return _watch(args, paths, settings, root)
+    finally:
+        lock.release()
+
+
+def _watch(args: argparse.Namespace, paths: AppPaths, settings: Settings, root: Path) -> int:
+    from autoshelf.watcher.service import WatchService  # imports watchdog; only needed here
+
     stable_seconds = (
         args.stable_seconds if args.stable_seconds is not None else settings.stable_seconds
     )
-
-    def make_library(conn: sqlite3.Connection) -> LibraryIndex:
-        from autoshelf.ml.embedder import load_embedder  # imports torch, so on the worker
-
-        embedder = load_embedder(settings.embedding_model, paths.model_dir)
-        return LibraryIndex(conn, root, embedder, ignore_patterns=settings.ignore_patterns)
-
     service = WatchService(
         root,
         paths.db_path,
         dry_run=args.dry_run,
         stable_seconds=stable_seconds,
         ignore_patterns=settings.ignore_patterns,
-        make_library=make_library,
+        make_library=library_factory(paths, settings, root),
         threshold=settings.auto_threshold,
         margin=settings.auto_margin,
     )
@@ -375,29 +387,27 @@ def _cmd_index(args: argparse.Namespace, paths: AppPaths) -> int:
 
 
 def _cmd_inbox(args: argparse.Namespace, paths: AppPaths) -> int:
-    from autoshelf.extract import extract
-
     settings = _settings(paths)
     root = _root(args, settings, paths)
-    waiting = waiting_files(root, settings.ignore_patterns)
-    if not waiting:
+    if not waiting_files(root, settings.ignore_patterns):
         print(f"Nothing is waiting in {INBOX_DIRNAME}.")
         return 0
     with contextlib.closing(open_database(paths.db_path)) as conn:
         library = _open_library(conn, root, settings, paths)
-        print(f"{len(waiting)} file(s) waiting in {INBOX_DIRNAME}:")
-        for path in waiting:
-            vector = library.stored_vector(path)
-            if vector is None:
-                vector = library.vectorize(extract(path), path.name)
-            classification = library.classify(
-                vector, threshold=settings.auto_threshold, margin=settings.auto_margin
-            )
-            suggestions = "  ".join(
-                f"{item.folder} ({item.score:.2f})" for item in classification.top(3)
-            )
-            print(f"  {path.name}")
-            print(f"      suggestions: {suggestions or '-'}")
+        items = inbox_items(
+            conn,
+            root,
+            library,
+            threshold=settings.auto_threshold,
+            margin=settings.auto_margin,
+            ignore_patterns=settings.ignore_patterns,
+        )
+    print(f"{len(items)} file(s) waiting in {INBOX_DIRNAME}:")
+    for item in items:
+        top = item.classification.top(3) if item.classification else ()
+        suggestions = "  ".join(f"{score.folder} ({score.score:.2f})" for score in top)
+        print(f"  {item.path.name}")
+        print(f"      suggestions: {suggestions or '-'}")
     print('Put one away with: autoshelf assign "<file>" "<folder>"')
     return 0
 

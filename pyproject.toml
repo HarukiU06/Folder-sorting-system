@@ -16,10 +16,12 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Environment :: Win32 (MS Windows)",
 ]
-# PySide6 is added in Phase 4. sentence-transformers pulls in PyTorch (the CPU build on
-# Windows); the model itself is downloaded on first use.
+# sentence-transformers pulls in PyTorch (the CPU build on Windows); the model itself is
+# downloaded on first use.
 dependencies = [
     "watchdog>=6.0",
+    # desktop app (Phase 4); LGPL
+    "PySide6-Essentials>=6.12",
     # classification (Phase 3)
     "numpy>=2.5",
     "sentence-transformers>=6.1",
@@ -37,10 +39,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-qt>=4.5", "ruff>=0.6"]
 
 [project.scripts]
 autoshelf = "autoshelf.cli:main"
+
+[project.gui-scripts]
+autoshelf-app = "autoshelf.ui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["autoshelf*"]
@@ -48,6 +53,7 @@ include = ["autoshelf*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["real_model: may load the real language model (opt-in, see test_embedder.py)"]
 
 [tool.ruff]
 line-length = 100

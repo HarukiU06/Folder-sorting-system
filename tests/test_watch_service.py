@@ -54,6 +54,7 @@ def run_service(root: Path, paths: AppPaths) -> Iterator[Callable[..., Recorder]
         )
         service.start()
         services.append(service)
+        recorder.service = service
         return recorder
 
     yield start
@@ -145,3 +146,30 @@ def test_failing_library_means_every_file_waits_in_inbox(
 
     assert (root / "_Inbox" / "banana bread recipe.txt").exists()
     assert "Sorting by content is unavailable (no model for you)" in caplog.text
+
+
+def test_paused_service_holds_files_until_resumed(root: Path, run_service) -> None:
+    recorder = run_service(paused=True)
+    service = recorder.service
+    src = make(root / "report.pdf")
+    time.sleep(1.0)
+    assert src.exists()
+    assert recorder.outcomes == []
+    assert service.paused
+
+    service.resume()
+
+    recorder.wait_for(outcome_for("report.pdf"))
+    assert (root / "_Inbox" / "report.pdf").exists()
+
+
+def test_file_deleted_while_paused_is_forgotten(root: Path, run_service) -> None:
+    recorder = run_service(paused=True)
+    service = recorder.service
+    src = make(root / "report.pdf")
+    time.sleep(1.0)
+    src.unlink()
+    time.sleep(0.3)
+    service.resume()
+    time.sleep(1.0)
+    assert recorder.outcomes == []

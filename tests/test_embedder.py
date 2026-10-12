@@ -52,6 +52,7 @@ def test_vectors_round_trip_through_bytes() -> None:
     assert np.array_equal(from_blob(to_blob(vector)), vector)
 
 
+@pytest.mark.real_model
 @pytest.mark.skipif(
     not os.environ.get(MODEL_CACHE_ENV),
     reason=f"set {MODEL_CACHE_ENV} to a model cache folder to test the real model",

@@ -1,5 +1,11 @@
 """Shared fixtures. Every test runs against temporary folders, never real user data."""
 
+import os
+
+# Qt windows are drawn off screen, so tests never pop up on the desktop. This must happen
+# before anything imports PySide6.
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 import logging
 import sqlite3
 from collections.abc import Iterator
@@ -17,6 +23,22 @@ def app_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "app home"
     monkeypatch.setenv(HOME_ENV_VAR, str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def no_real_model(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make loading the real language model fail, so no test downloads it by accident.
+
+    Tests that need a model inject the fake one; the opt-in real-model test is marked.
+    """
+    if request.node.get_closest_marker("real_model"):
+        return
+    from autoshelf.ml import embedder
+
+    def refuse(model: str, cache_dir: Path):
+        raise embedder.EmbedderError("tests must not load the real model")
+
+    monkeypatch.setattr(embedder, "load_embedder", refuse)
 
 
 @pytest.fixture(autouse=True)

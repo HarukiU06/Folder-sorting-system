@@ -9,10 +9,19 @@ from autoshelf.actions.mover import move_file
 from autoshelf.cli import format_history_entry, main
 from autoshelf.db import repository
 from autoshelf.ml import embedder as embedder_module
+from autoshelf.ui import app as ui_app
 
 
-def test_no_command_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main([]) == 0
+def test_no_command_starts_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(ui_app, "run_app", lambda **kwargs: calls.append(kwargs) or 0)
+    assert main(["-v"]) == 0
+    assert calls == [{"verbose": True}]
+
+
+def test_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
     assert "usage: autoshelf" in capsys.readouterr().out
 
 

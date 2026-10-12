@@ -21,7 +21,7 @@ from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAUL
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
 from autoshelf.fsutil import sha256_file
-from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
 from autoshelf.watcher.ignore import ignore_reason
@@ -55,6 +55,17 @@ class Outcome:
     duplicates: tuple[Path, ...] = ()
     extraction: Extraction | None = None
     classification: Classification | None = None
+
+    @property
+    def needs_decision(self) -> bool:
+        """True if the file now waits in _Inbox for the user to choose a folder."""
+        if self.kind is OutcomeKind.WAITING:
+            return True
+        return (
+            self.kind is OutcomeKind.MOVED
+            and self.dst is not None
+            and self.dst.parent.name.casefold() == INBOX_DIRNAME.casefold()
+        )
 
 
 @dataclass(frozen=True)

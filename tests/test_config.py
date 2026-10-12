@@ -88,3 +88,18 @@ def test_settings_round_trip(conn, root: Path) -> None:
     settings = Settings(root=str(root), stable_seconds=5.5, ignore_patterns=["*.bak"])
     save_settings(conn, settings)
     assert load_settings(conn) == settings
+
+
+def test_balanced_preset_is_the_default() -> None:
+    from autoshelf.config import (
+        CONFIDENCE_LEVELS,
+        DEFAULT_AUTO_MARGIN,
+        DEFAULT_AUTO_THRESHOLD,
+        confidence_level,
+    )
+
+    balanced = confidence_level(DEFAULT_AUTO_THRESHOLD, DEFAULT_AUTO_MARGIN)
+    assert CONFIDENCE_LEVELS[balanced].name == "Balanced"
+    assert confidence_level(0.42, 0.11) is None
+    thresholds = [level.threshold for level in CONFIDENCE_LEVELS]
+    assert thresholds == sorted(thresholds, reverse=True)  # cautious -> automatic

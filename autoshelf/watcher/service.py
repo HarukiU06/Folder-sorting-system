@@ -62,6 +62,9 @@ class WatchService:
     ``make_library(conn)`` builds the classifier's library index on the worker thread
     (loading the language model there, not on the caller's thread). Without it, or if it
     fails, every new file waits in ``_Inbox``.
+
+    While paused, files that become ready are held, not processed; ``resume`` sorts them.
+    ``on_status(message)`` reports progress such as loading the model, from any thread.
     """
 
     def __init__(
@@ -77,6 +80,8 @@ class WatchService:
         make_library: LibraryFactory | None = None,
         threshold: float = DEFAULT_AUTO_THRESHOLD,
         margin: float = DEFAULT_AUTO_MARGIN,
+        paused: bool = False,
+        on_status: Callable[[str], None] | None = None,
     ) -> None:
         self.root = root
         self.db_path = db_path
@@ -89,7 +94,13 @@ class WatchService:
         self._make_library = make_library
         self.threshold = threshold
         self.margin = margin
+        self._on_status = on_status
         self._stop = threading.Event()
+        self._paused = threading.Event()
+        if paused:
+            self._paused.set()
+        self._held: set[Path] = set()
+        self._held_lock = threading.Lock()
         self._observer: Observer | None = None
         self._worker: threading.Thread | None = None
         self._noted: set[Path] = set()
@@ -108,14 +119,39 @@ class WatchService:
         self._worker.start()
         self._queue_existing_files()
 
-    def stop(self) -> None:
-        """Stop watching and wait for the worker to finish the file it is on."""
+    def stop(self, timeout: float | None = None) -> bool:
+        """Stop watching and wait for the worker to finish the file it is on.
+
+        With a ``timeout``, waits at most that long (the worker is a daemon thread, so
+        an exiting app isn't held up by, say, a model download). Returns True if stopped.
+        """
         self._stop.set()
         if self._observer is not None:
             self._observer.stop()
-            self._observer.join()
+            self._observer.join(timeout)
         if self._worker is not None:
-            self._worker.join()
+            self._worker.join(timeout)
+            return not self._worker.is_alive()
+        return True
+
+    @property
+    def paused(self) -> bool:
+        """True while automatic sorting is paused."""
+        return self._paused.is_set()
+
+    def pause(self) -> None:
+        """Stop sorting automatically; files that arrive meanwhile wait until ``resume``."""
+        self._paused.set()
+        log.info("Sorting paused; new files will wait")
+
+    def resume(self) -> None:
+        """Sort again, starting with the files that arrived while paused."""
+        self._paused.clear()
+        with self._held_lock:
+            held, self._held = self._held, set()
+        log.info("Sorting resumed%s", f"; {len(held)} waiting file(s) next" if held else "")
+        for path in held:
+            self.offer(path)
 
     def offer(self, path: Path) -> None:
         """Consider a path from a file event; track it if it should be processed."""
@@ -139,6 +175,8 @@ class WatchService:
     def forget(self, path: Path) -> None:
         """Stop tracking a path that was deleted or moved away."""
         self.tracker.discard(path)
+        with self._held_lock:
+            self._held.discard(path)
 
     def _settle_history(self) -> None:
         conn = open_database(self.db_path)
@@ -167,12 +205,15 @@ class WatchService:
         """Load the classifier and index the files already in category folders."""
         if self._make_library is None:
             return None
+        self._status("Loading the language model...")
         try:
             library = self._make_library(conn)
-            stats = library.refresh(progress=_log_progress)
+            stats = library.refresh(progress=self._index_progress)
         except Exception as exc:
-            log.error("Sorting by content is unavailable (%s); new files will wait in _Inbox", exc)
+            message = f"Sorting by content is unavailable ({exc}); new files will wait in _Inbox"
+            log.error("%s", message)
             log.debug("Library failure", exc_info=True)
+            self._status(message)
             return None
         log.info(
             "Ready: %d folders, %d files in them indexed (%d read just now%s)",
@@ -183,7 +224,20 @@ class WatchService:
         )
         if stats.folders == 0:
             log.info("No folders yet: create folders in the root and new files will be sorted")
+        self._status(f"Ready: {stats.folders} folders, {stats.files} files in them")
         return library
+
+    def _index_progress(self, done: int, total: int) -> None:
+        if done == total or done % _PROGRESS_EVERY == 0:
+            log.info("Reading files already in your folders: %d/%d", done, total)
+            self._status(f"Reading files already in your folders: {done}/{total}")
+
+    def _status(self, message: str) -> None:
+        if self._on_status is not None:
+            try:
+                self._on_status(message)
+            except Exception:
+                log.exception("Status callback failed")
 
     def _run_worker(self) -> None:
         conn = open_database(self.db_path)
@@ -202,12 +256,22 @@ class WatchService:
                 for path in self.tracker.poll():
                     if self._stop.is_set():
                         break
+                    if self._paused.is_set():
+                        self._hold(path)
+                        continue
                     try:
                         self._report(pipeline.process(path))
                     except Exception:
                         log.exception("Error while reporting on %s; still watching", path)
         finally:
             conn.close()
+
+    def _hold(self, path: Path) -> None:
+        with self._held_lock:
+            if path in self._held:
+                return
+            self._held.add(path)
+        log.info("Paused: %s will be sorted when you resume", self._display(path))
 
     def _report(self, outcome: Outcome) -> None:
         name = self._display(outcome.path)
@@ -259,8 +323,3 @@ class WatchService:
             return f"'{path.relative_to(self.root)}'"
         except ValueError:
             return f"'{path}'"
-
-
-def _log_progress(done: int, total: int) -> None:
-    if done == total or done % _PROGRESS_EVERY == 0:
-        log.info("Reading files already in your folders: %d/%d", done, total)

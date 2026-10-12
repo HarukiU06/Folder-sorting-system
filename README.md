@@ -5,9 +5,9 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–3 are done, as a command-line tool: a watcher that
-> reads each new file and either moves it into the right folder (when it is sure) or into
-> `_Inbox/` for you to decide, with full history and undo. The desktop app comes in Phase 4.
+> **Status:** early development. Phases 1–4 are done: a Windows tray app (and a command-line
+> tool) that reads each new file and either moves it into the right folder, when it is sure,
+> or into `_Inbox/` for you to decide, with full history and undo.
 
 ## Safety rules
 
@@ -55,8 +55,33 @@ The commands below call the venv's Python directly, so they work without activat
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once; after activating, plain `python`
 works.)
 
-## Usage
+## The desktop app
 
+```powershell
+.venv\Scripts\autoshelf-app.exe          # or: .venv\Scripts\python.exe -m autoshelf
+```
+
+On first start it asks for the folder to sort (it suggests iCloud Drive if you have it). If
+that folder already has loose files in it, it asks whether to sort them right away or to
+start paused so you can look first. AutoShelf then lives in the system tray:
+
+- **Inbox:** files it wasn't sure about, with its best three guesses as buttons, any other
+  folder, a text preview and why it's waiting. One click puts the file away (and teaches
+  AutoShelf for next time).
+- **History:** every move with its reason and score; undo one, or the last N.
+- **Folders:** your folders with file counts; double-click a description to edit it.
+- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
+  and which files to ignore.
+
+When a file needs your decision, a notification asks "Where should *file* go?"; click it to
+open the Inbox. The tray menu can pause sorting: new files then wait until you resume.
+Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
+sorts at a time: starting the app again just shows its window, and `autoshelf watch`
+refuses to run while the app does.
+
+## Command line
+
+Sorting, the Inbox, folder descriptions, history and undo also work from the command line.
 Try it on a throwaway folder first, never on your real files:
 
 ```powershell

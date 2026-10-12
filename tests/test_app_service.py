@@ -1,0 +1,242 @@
+"""The desktop app's logic, tested without Qt."""
+
+import threading
+import time
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+from fakes import FakeEmbedder
+from helpers import make
+
+from autoshelf.app_service import AppService, watch_lock
+from autoshelf.cli import main
+from autoshelf.config import AppPaths, ConfigError
+from autoshelf.db import repository
+from autoshelf.ml.embedder import EmbedderError
+from autoshelf.pipeline import Outcome
+
+TIMEOUT = 10.0
+
+
+class Outcomes:
+    """Collects outcomes reported by the watcher thread."""
+
+    def __init__(self) -> None:
+        self.items: list[Outcome] = []
+        self._changed = threading.Condition()
+
+    def __call__(self, outcome: Outcome) -> None:
+        with self._changed:
+            self.items.append(outcome)
+            self._changed.notify_all()
+
+    def wait_for(self, name: str) -> Outcome:
+        with self._changed:
+            assert self._changed.wait_for(
+                lambda: any(o.path.name == name for o in self.items), timeout=TIMEOUT
+            ), f"no outcome for {name}: {self.items}"
+            return next(o for o in self.items if o.path.name == name)
+
+
+@pytest.fixture
+def shelf(root: Path) -> Path:
+    make(root / "Finance" / "invoice 2024.txt", "invoice total tax due bank")
+    (root / "Recipes").mkdir()
+    return root
+
+
+@pytest.fixture
+def service(paths: AppPaths, shelf: Path) -> Iterator[AppService]:
+    app = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
+    settings = replace(
+        app.settings(),
+        root=str(shelf),
+        auto_threshold=0.3,
+        auto_margin=0.1,
+        stable_seconds=0.3,
+    )
+    app.save_settings(settings)
+    app.describe("Finance", "invoice receipt tax bank")
+    app.describe("Recipes", "recipe cooking baking oven")
+    yield app
+    app.release()
+
+
+@pytest.fixture
+def outcomes(service: AppService) -> Outcomes:
+    recorder = Outcomes()
+    service.on_outcome = recorder
+    return recorder
+
+
+def test_start_needs_the_lock(service: AppService) -> None:
+    with pytest.raises(RuntimeError, match="acquire"):
+        service.start()
+
+
+def test_app_and_cli_watch_exclude_each_other(
+    service: AppService, shelf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert service.acquire()
+    assert main(["watch", "--root", str(shelf)]) == 1
+    assert "already sorting" in capsys.readouterr().err
+
+    service.release()
+    other = watch_lock(service.paths)
+    assert other.acquire()
+    assert not service.acquire()
+    other.release()
+
+
+def test_start_without_a_root_does_nothing(paths: AppPaths) -> None:
+    app = AppService(paths)
+    assert app.acquire()
+    assert app.start() is False
+    assert not app.watching
+    app.release()
+
+
+def test_watching_sorts_new_files(service: AppService, shelf: Path, outcomes) -> None:
+    assert service.acquire() and service.start()
+    make(shelf / "invoice 2025.txt", "invoice total tax due")
+
+    outcome = outcomes.wait_for("invoice 2025.txt")
+
+    assert outcome.dst == shelf / "Finance" / "invoice 2025.txt"
+    assert not outcome.needs_decision
+
+
+def test_unclear_file_needs_a_decision(service: AppService, shelf: Path, outcomes) -> None:
+    assert service.acquire() and service.start()
+    make(shelf / "notes.txt", "call mom buy milk")
+    outcome = outcomes.wait_for("notes.txt")
+    assert outcome.needs_decision
+    assert outcome.dst == shelf / "_Inbox" / "notes.txt"
+
+
+def test_pause_holds_files_until_resumed(service: AppService, shelf: Path, outcomes) -> None:
+    assert service.acquire() and service.start()
+    service.set_paused(True)
+    src = make(shelf / "invoice 2025.txt", "invoice total tax due")
+    time.sleep(1.5)
+    assert src.exists()
+    assert outcomes.items == []
+    assert service.settings().paused
+
+    service.set_paused(False)
+
+    assert outcomes.wait_for("invoice 2025.txt").dst.parent == shelf / "Finance"
+    assert not service.settings().paused
+
+
+def test_restart_while_paused_stays_paused(service: AppService, shelf: Path, outcomes) -> None:
+    assert service.acquire() and service.start()
+    service.set_paused(True)
+    assert service.restart()
+    src = make(shelf / "invoice 2025.txt", "invoice total tax due")
+    time.sleep(1.5)
+    assert src.exists()
+    service.set_paused(False)
+    outcomes.wait_for("invoice 2025.txt")
+
+
+def test_status_messages_are_reported(service: AppService) -> None:
+    messages: list[str] = []
+    ready = threading.Event()
+
+    def status(message: str) -> None:
+        messages.append(message)
+        if message.startswith("Ready"):
+            ready.set()
+
+    service.on_status = status
+    assert service.acquire() and service.start()
+    assert ready.wait(TIMEOUT)
+    assert messages[0] == "Loading the language model..."
+    assert messages[-1] == "Ready: 2 folders, 1 files in them"
+
+
+def test_loose_files_counts_what_would_be_sorted(service: AppService, shelf: Path) -> None:
+    make(shelf / "a.pdf")
+    make(shelf / "~$temp.docx")
+    make(shelf / "_Inbox" / "from iPhone.pdf")
+    waiting = make(shelf / "_Inbox" / "already waiting.pdf")
+    with repository_conn(service) as conn:
+        file_id = repository.upsert_file(conn, waiting, sha256="x", size=1, mtime=1.0)
+        repository.set_file_status(conn, file_id, "inbox")
+    assert service.loose_files(shelf) == 2
+
+
+def test_inbox_lists_suggestions(service: AppService, shelf: Path) -> None:
+    make(shelf / "_Inbox" / "tax invoice.txt", "invoice tax")
+    (item,) = service.inbox()
+    assert item.path.name == "tax invoice.txt"
+    assert item.excerpt == "invoice tax"
+    assert item.classification.top(1)[0].folder == "Finance"
+
+
+def test_inbox_without_a_model_still_lists_files(paths: AppPaths, shelf: Path) -> None:
+    def broken(model: str, cache_dir: Path):
+        raise EmbedderError("offline")
+
+    app = AppService(paths, loader=broken)
+    app.set_root(shelf)
+    make(shelf / "_Inbox" / "notes.txt", "call mom")
+    (item,) = app.inbox()
+    assert item.classification is None
+    assert item.excerpt == "call mom"
+    assert "can't be sorted" in item.explanation
+
+
+def test_assign_undo_and_history(service: AppService, shelf: Path) -> None:
+    src = make(shelf / "_Inbox" / "bread.txt", "flour")
+
+    moved = service.assign(src, "recipes")
+    assert moved.dst == shelf / "Recipes" / "bread.txt"
+    assert service.history()[0].reason == "user"
+
+    service.undo(moved.history_id)
+    assert src.exists()
+    assert service.history()[0].action == "undo"
+
+    again = service.assign(src, "Recipes")
+    (undone,) = service.undo_last(1)
+    assert undone.history_id != again.history_id
+    assert src.exists()
+
+
+def test_own_moves_are_announced_to_the_running_watcher(service: AppService) -> None:
+    assert service._before_rename() is None
+    assert service.acquire() and service.start()
+    before_rename = service._before_rename()
+    target = service.root() / "Recipes" / "x.txt"
+    before_rename(Path("src"), target)
+    assert service._service.self_moves.is_expected(target)
+
+
+def test_folders_and_descriptions(service: AppService) -> None:
+    folders = {folder.key: folder for folder in service.folders()}
+    assert folders["Finance"].files == 1
+    assert folders["Recipes"].description == "recipe cooking baking oven"
+    assert service.describe("recipes", "  cakes ") == "Recipes"
+    assert {f.key: f.description for f in service.folders()}["Recipes"] == "cakes"
+
+
+def test_set_root_validates(service: AppService, tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        service.set_root(tmp_path / "missing")
+    new_root = tmp_path / "Other shelf"
+    new_root.mkdir()
+    assert service.set_root(new_root) == new_root.resolve()
+    assert service.root() == new_root.resolve()
+
+
+def test_actions_need_a_root(paths: AppPaths) -> None:
+    with pytest.raises(ConfigError, match="Choose the folder"):
+        AppService(paths).folders()
+
+
+def repository_conn(service: AppService):
+    return service._connect()

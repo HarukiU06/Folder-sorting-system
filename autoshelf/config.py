@@ -5,6 +5,7 @@ It must never be inside the watched root or inside iCloud Drive, because syncing
 live SQLite file corrupts it.
 """
 
+import math
 import os
 import sqlite3
 from dataclasses import dataclass, field, fields
@@ -24,6 +25,34 @@ DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-
 # model scores on a different scale, so change these together with the model.
 DEFAULT_AUTO_THRESHOLD = 0.40
 DEFAULT_AUTO_MARGIN = 0.10
+
+
+@dataclass(frozen=True)
+class ConfidenceLevel:
+    """A named (threshold, margin) pair for the "cautious <-> automatic" slider."""
+
+    name: str
+    threshold: float
+    margin: float
+
+
+CONFIDENCE_LEVELS = (
+    ConfidenceLevel("Very cautious", 0.50, 0.15),
+    ConfidenceLevel("Cautious", 0.45, 0.12),
+    ConfidenceLevel("Balanced", DEFAULT_AUTO_THRESHOLD, DEFAULT_AUTO_MARGIN),
+    ConfidenceLevel("Automatic", 0.35, 0.08),
+    ConfidenceLevel("Very automatic", 0.30, 0.06),
+)
+
+
+def confidence_level(threshold: float, margin: float) -> int | None:
+    """Index of the preset in CONFIDENCE_LEVELS with these values, or None if custom."""
+    for index, level in enumerate(CONFIDENCE_LEVELS):
+        if math.isclose(level.threshold, threshold) and math.isclose(level.margin, margin):
+            return index
+    return None
+
+
 DEFAULT_IGNORE_PATTERNS = (
     "~$*",
     "*.tmp",
@@ -132,6 +161,8 @@ class Settings:
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     auto_threshold: float = DEFAULT_AUTO_THRESHOLD
     auto_margin: float = DEFAULT_AUTO_MARGIN
+    paused: bool = False  # automatic sorting paused (files wait until resumed)
+    notifications: bool = True  # notify when a file needs a decision
 
 
 def load_settings(conn: sqlite3.Connection) -> Settings:

@@ -140,7 +140,9 @@ def choose(
     folder by at least ``margin``. A folder's own parents and subfolders are not
     rivals: they naturally score alike. Qualifying folders always lie on one branch,
     and the deepest one wins, so a file goes to the most specific folder that is a
-    clear match, or to its parent when the subfolders are too close to call.
+    clear match. If a subfolder is good enough but too close to another folder (e.g.
+    two sibling subfolders fit equally), the user is asked rather than the file being
+    put in the parent. A parent is chosen only when its subfolders all score too low.
     """
     ranked = tuple(sorted(scores, key=lambda item: item.score, reverse=True))
     if not ranked:
@@ -151,11 +153,13 @@ def choose(
     qualifying = [item for item in ranked if _qualifies(item, ranked, threshold, margin)]
     if qualifying:
         choice = max(qualifying, key=lambda item: (depth(item.folder), item.score))
-        rival = _best_rival(choice, ranked)
-        versus = f", next {rival.folder!r} {rival.score:.2f}" if rival else ""
-        explanation = f"best match {choice.folder!r} {choice.score:.2f}{versus}"
-        explanation += _why_not_deeper(choice, ranked, threshold)
-        return Classification(ranked, choice, explanation, threshold, margin)
+        contested = _contested_subfolder(choice, ranked, threshold)
+        if contested is None:
+            rival = _best_rival(choice, ranked)
+            versus = f", next {rival.folder!r} {rival.score:.2f}" if rival else ""
+            explanation = f"best match {choice.folder!r} {choice.score:.2f}{versus}"
+            return Classification(ranked, choice, explanation, threshold, margin)
+        return Classification(ranked, None, _too_close(contested, ranked), threshold, margin)
 
     best = ranked[0]
     if best.score < threshold:
@@ -164,25 +168,33 @@ def choose(
             f"below the {threshold:.2f} needed to move it automatically"
         )
     else:
-        rival = _best_rival(best, ranked)
-        explanation = (
-            f"not sure: {best.folder!r} ({best.score:.2f}) is too close to "
-            f"{rival.folder!r} ({rival.score:.2f})"
-        )
+        explanation = _too_close(best, ranked)
     return Classification(ranked, None, explanation, threshold, margin)
 
 
-def _why_not_deeper(choice: FolderScore, ranked: Sequence[FolderScore], threshold: float) -> str:
-    """Explain why a subfolder that scored higher than ``choice`` wasn't picked."""
-    best = ranked[0]
-    if best is choice or not best.folder.casefold().startswith(choice.folder.casefold() + "/"):
-        return ""
-    if best.score < threshold:
-        return f"; its subfolder {best.folder!r} only scored {best.score:.2f}"
-    rival = _best_rival(best, ranked)
+def _is_below(item: FolderScore, folder: str) -> bool:
+    return item.folder.casefold().startswith(folder.casefold() + "/")
+
+
+def _contested_subfolder(
+    choice: FolderScore, ranked: Sequence[FolderScore], threshold: float
+) -> FolderScore | None:
+    """A subfolder of ``choice`` that is good enough but lost on the margin, if any.
+
+    Such a file fits two folders about equally (usually two sibling subfolders), so
+    the user is asked instead of the file going into the parent.
+    """
+    return next(
+        (item for item in ranked if _is_below(item, choice.folder) and item.score >= threshold),
+        None,
+    )
+
+
+def _too_close(item: FolderScore, ranked: Sequence[FolderScore]) -> str:
+    rival = _best_rival(item, ranked)
     return (
-        f"; its subfolders {best.folder!r} ({best.score:.2f}) and {rival.folder!r} "
-        f"({rival.score:.2f}) are too close to choose between"
+        f"not sure: {item.folder!r} ({item.score:.2f}) is too close to "
+        f"{rival.folder!r} ({rival.score:.2f})"
     )
 
 

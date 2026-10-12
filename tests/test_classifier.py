@@ -91,21 +91,24 @@ def test_falls_back_to_the_parent_when_the_subfolder_is_below_threshold() -> Non
     assert decide(ML=0.55, ML__Unsupervised=0.38, ML__Deep=0.20, Finance=0.1) == "ML"
 
 
-def test_falls_back_to_the_parent_when_subfolders_are_too_close() -> None:
-    assert decide(ML=0.60, ML__Unsupervised=0.58, ML__Deep=0.56, Finance=0.2) == "ML"
+def test_subfolders_that_fit_equally_well_ask_instead_of_using_the_parent() -> None:
+    classification = choose(
+        scores(ML=0.60, ML__Unsupervised=0.58, ML__Deep=0.56, Finance=0.2), THRESHOLD, MARGIN
+    )
+    assert classification.choice is None
+    assert "'ML/Unsupervised' (0.58) is too close to 'ML/Deep' (0.56)" in (
+        classification.explanation
+    )
 
 
-def test_parent_choice_explains_why_not_the_higher_scoring_subfolder() -> None:
-    close = choose(scores(ML=0.52, ML__Unsup=0.59, ML__Deep=0.52, Fin=0.2), THRESHOLD, MARGIN)
-    assert close.choice.folder == "ML"
-    assert "'ML/Unsup' (0.59) and 'ML/Deep' (0.52) are too close" in close.explanation
+def test_tie_between_subfolders_asks_even_when_one_outscores_the_parent() -> None:
+    assert decide(ML=0.52, ML__Unsup=0.59, ML__Deep=0.52, Fin=0.2) is None
 
-    low = choose(scores(ML=0.55, ML__Unsup=0.38, Fin=0.1), THRESHOLD, MARGIN)
-    assert low.choice.folder == "ML"
-    assert low.explanation == "best match 'ML' 0.55, next 'Fin' 0.10"
 
-    weak = choose(scores(ML__Unsup=0.39, ML=0.45, Fin=0.1), THRESHOLD, MARGIN)
-    assert "its subfolder" not in weak.explanation
+def test_parent_fallback_explanation_is_plain() -> None:
+    classification = choose(scores(ML=0.55, ML__Unsupervised=0.38, Fin=0.1), THRESHOLD, MARGIN)
+    assert classification.choice.folder == "ML"
+    assert classification.explanation == "best match 'ML' 0.55, next 'Fin' 0.10"
 
 
 def test_unrelated_rival_of_the_parent_blocks_the_whole_branch() -> None:

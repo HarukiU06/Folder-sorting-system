@@ -118,8 +118,9 @@ most similar files already inside it. The more files a folder holds, the more th
 - A file is moved automatically only if its best folder scores at least the **threshold**
   (default 0.40) and beats every unrelated folder by the **margin** (default 0.10).
 - A folder's own subfolders and parents are not counted as rivals. AutoShelf picks the
-  deepest folder that is a clear match; if two subfolders are too close to call, the file
-  goes to their parent.
+  deepest folder that is a clear match. If a file fits two folders about equally (even two
+  subfolders of the same parent), it asks. A parent folder is used only when none of its
+  subfolders is a good enough match.
 - Otherwise the file goes to `_Inbox/` with its top suggestions. Every decision, with the
   top three folders and their scores, is kept in the history.
 - Files you put into folders yourself (or with `assign`) become examples, so sorting gets

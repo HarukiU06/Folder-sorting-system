@@ -4,7 +4,7 @@
 A personal Windows desktop app that watches one root folder (inside iCloud Drive), reads each new file's **filename and text**, and moves it into the correct **user-created** subfolder. When it isn't confident, it asks the user. It learns from corrections. The full spec is in `SPEC.md`; read it before starting any phase.
 
 ## Stack
-- Python 3.12+, PySide6 (UI + system tray), watchdog, sentence-transformers (local embeddings), SQLite (stdlib `sqlite3`), numpy, pytest.
+- Python 3.13 (create the venv with `py -3.13`; 3.12+ is supported), PySide6 (UI + system tray), watchdog, sentence-transformers (local embeddings), SQLite (stdlib `sqlite3`), numpy, pytest.
 - Extractors: PyMuPDF, python-docx, python-pptx, openpyxl, ebooklib, striprtf, beautifulsoup4, mutagen, Pillow.
 - Optional LLM behind a provider interface (Claude API / Ollama), **off by default**. Keys go in `keyring`, never in files.
 - Dependencies are managed in `pyproject.toml`. Use a virtual env (`.venv`).
@@ -47,7 +47,7 @@ tests/
 - Commit at the end of each phase with a clear message, and update the README with how to run.
 
 ## Commands
-- Install: `python -m venv .venv && .venv\Scripts\activate && pip install -e ".[dev]"`
+- Install: `py -3.13 -m venv .venv && .venv\Scripts\activate && pip install -e ".[dev]"`
 - Run the CLI watcher (dry run): `python -m autoshelf watch --root "<path>" --dry-run`
 - Run the app: `python -m autoshelf`
 - Tests: `pytest -q`

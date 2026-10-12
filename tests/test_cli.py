@@ -1,11 +1,14 @@
 from pathlib import Path
 
 import pytest
+from fakes import FakeEmbedder
 from helpers import make
 
 from autoshelf import __version__
 from autoshelf.actions.mover import move_file
-from autoshelf.cli import main
+from autoshelf.cli import format_history_entry, main
+from autoshelf.db import repository
+from autoshelf.ml import embedder as embedder_module
 
 
 def test_no_command_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
@@ -83,3 +86,154 @@ def test_extract_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
 def test_extract_command_missing_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["extract", str(tmp_path / "missing.pdf")]) == 1
     assert "not a file" in capsys.readouterr().err
+
+
+# --- Phase 3: folders, classification and the Inbox ---------------------------------
+
+
+@pytest.fixture
+def fake_model(monkeypatch: pytest.MonkeyPatch) -> FakeEmbedder:
+    """Replace the language model with the fake one for commands that load it."""
+    embedder = FakeEmbedder()
+    monkeypatch.setattr(embedder_module, "load_embedder", lambda name, cache_dir: embedder)
+    return embedder
+
+
+@pytest.fixture
+def shelf(root: Path) -> Path:
+    make(root / "Finance" / "invoice 2024.txt", "invoice total tax due")
+    (root / "Recipes" / "Baking").mkdir(parents=True)
+    return root
+
+
+def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
+    code = main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+@pytest.mark.parametrize("command", ["folders", "inbox", "index", "classify"])
+def test_commands_need_a_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    extra = [str(make(tmp_path / "a.txt"))] if command == "classify" else []
+    code, _, err = run(capsys, command, *extra)
+    assert code == 2
+    assert "--root" in err
+
+
+def test_config_sets_and_shows_settings(shelf: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(
+        capsys, "config", "--root", str(shelf), "--threshold", "0.5", "--margin", "0.05"
+    )
+    assert code == 0
+    assert f"Root folder:      {shelf}" in out
+    assert "Auto threshold:   0.50" in out
+
+    code, out, _ = run(capsys, "folders")  # uses the configured root
+    assert code == 0
+    assert "Finance" in out
+
+
+def test_config_rejects_out_of_range_values(capsys: pytest.CaptureFixture[str]) -> None:
+    code, _, err = run(capsys, "config", "--threshold", "1.5")
+    assert code == 1
+    assert "between 0 and 1" in err
+
+
+def test_folders_lists_counts_and_descriptions(
+    shelf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(capsys, "describe", "--root", str(shelf), "recipes/baking", "bread and cakes")
+    code, out, _ = run(capsys, "folders", "--root", str(shelf))
+    assert code == 0
+    assert "Finance" in out and "1 file" in out
+    assert "Recipes/Baking" in out and "bread and cakes" in out
+
+
+def test_folders_when_there_are_none(root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(capsys, "folders", "--root", str(root))
+    assert code == 0
+    assert "No folders yet" in out
+
+
+def test_describe_shows_sets_and_clears(shelf: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert "no description yet" in run(capsys, "describe", "--root", str(shelf), "Finance")[1]
+    assert (
+        "Described Finance"
+        in run(capsys, "describe", "--root", str(shelf), "Finance", "invoices and taxes")[1]
+    )
+    assert "invoices and taxes" in run(capsys, "describe", "--root", str(shelf), "finance")[1]
+    assert "Cleared" in run(capsys, "describe", "--root", str(shelf), "Finance", "")[1]
+
+
+def test_describe_unknown_folder_is_an_error(
+    shelf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = run(capsys, "describe", "--root", str(shelf), "Taxes", "tax stuff")
+    assert code == 1
+    assert "never creates folders" in err
+    assert not (shelf / "Taxes").exists()
+
+
+def test_classify_shows_the_decision_without_moving(
+    shelf: Path, fake_model: FakeEmbedder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(capsys, "config", "--threshold", "0.3", "--margin", "0.1")
+    run(capsys, "describe", "--root", str(shelf), "Finance", "invoice tax")
+    path = make(shelf / "invoice 2025.txt", "invoice total tax due")
+
+    code, out, _ = run(capsys, "classify", "--root", str(shelf), str(path))
+
+    assert code == 0
+    assert "Decision:  move to 'Finance' automatically" in out
+    assert "closest: invoice 2024.txt" in out
+    assert path.exists()
+
+
+def test_index_reports_counts(
+    shelf: Path, fake_model: FakeEmbedder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _ = run(capsys, "index", "--root", str(shelf))
+    assert code == 0
+    assert "Indexed 1 files in 3 folders" in out
+
+
+def test_inbox_lists_waiting_files_with_suggestions(
+    shelf: Path, fake_model: FakeEmbedder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert "Nothing is waiting" in run(capsys, "inbox", "--root", str(shelf))[1]
+    make(shelf / "_Inbox" / "tax notes.txt", "tax invoice")
+
+    code, out, _ = run(capsys, "inbox", "--root", str(shelf))
+
+    assert code == 0
+    assert "tax notes.txt" in out
+    assert "suggestions: Finance (" in out
+
+
+def test_assign_by_name_moves_the_file(
+    conn, shelf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make(shelf / "_Inbox" / "bread 食パン.txt", "flour yeast")
+
+    code, out, _ = run(capsys, "assign", "--root", str(shelf), "bread 食パン.txt", "Recipes/Baking")
+
+    assert code == 0
+    assert (shelf / "Recipes" / "Baking" / "bread 食パン.txt").exists()
+    assert "autoshelf undo" in out
+    assert "[user]" in run(capsys, "history")[1]
+
+
+def test_assign_missing_file_is_an_error(shelf: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, _, err = run(capsys, "assign", "--root", str(shelf), "nope.pdf", "Finance")
+    assert code == 1
+    assert "no file" in err
+
+
+def test_history_shows_reason_and_confidence(conn, root: Path) -> None:
+    (root / "Finance").mkdir()
+    move_file(
+        conn, make(root / "a.pdf"), root / "Finance", root=root, reason="auto", confidence=0.61
+    )
+    assert "[auto 0.61]" in format_history_entry(repository.list_history(conn)[0])

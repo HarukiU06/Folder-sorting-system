@@ -16,9 +16,13 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Environment :: Win32 (MS Windows)",
 ]
-# Heavy dependencies (sentence-transformers, PySide6) are added in the phase that uses them.
+# PySide6 is added in Phase 4. sentence-transformers pulls in PyTorch (the CPU build on
+# Windows); the model itself is downloaded on first use.
 dependencies = [
     "watchdog>=6.0",
+    # classification (Phase 3)
+    "numpy>=2.5",
+    "sentence-transformers>=6.1",
     # text extraction (Phase 2)
     "pymupdf>=1.28",
     "python-docx>=1.2",

@@ -134,6 +134,97 @@ def get_file_content(conn: sqlite3.Connection, file_id: int) -> tuple[str | None
     return (None, None) if row is None else (row["title"], row["text_excerpt"])
 
 
+def set_file_status(conn: sqlite3.Connection, file_id: int, status: str) -> None:
+    """Set a file's status ('new', 'sorted', 'inbox' or 'ignored')."""
+    conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
+
+
+# --- file vectors -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredVector:
+    """A row of ``file_vectors``: an embedding and what it was made from."""
+
+    model: str
+    size: int
+    mtime: float
+    source: str
+    vector: bytes
+
+
+def get_vector(conn: sqlite3.Connection, file_id: int) -> StoredVector | None:
+    """Return the stored embedding of a file, if any."""
+    row = conn.execute(
+        "SELECT model, size, mtime, source, vector FROM file_vectors WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return StoredVector(row["model"], row["size"], row["mtime"], row["source"], row["vector"])
+
+
+def set_vector(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    model: str,
+    size: int,
+    mtime: float,
+    source: str,
+    vector: bytes,
+) -> None:
+    """Store (or replace) a file's embedding."""
+    conn.execute(
+        "INSERT INTO file_vectors (file_id, model, size, mtime, source, vector)"
+        " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (file_id) DO UPDATE SET model = excluded.model,"
+        " size = excluded.size, mtime = excluded.mtime, source = excluded.source,"
+        " vector = excluded.vector",
+        (file_id, model, size, mtime, source, vector),
+    )
+
+
+# --- folders and corrections ----------------------------------------------------
+
+
+def folder_descriptions(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return every non-empty folder description, keyed by casefolded folder key."""
+    rows = conn.execute("SELECT path, description FROM folders WHERE description != ''")
+    return {row["path"].casefold(): row["description"] for row in rows}
+
+
+def set_folder_description(conn: sqlite3.Connection, folder: str, description: str) -> None:
+    """Set the description of a folder (its key relative to the root, "/"-separated)."""
+    conn.execute(
+        "INSERT INTO folders (path, description) VALUES (?, ?)"
+        " ON CONFLICT (path) DO UPDATE SET path = excluded.path,"
+        " description = excluded.description",
+        (folder, description),
+    )
+
+
+def record_correction(
+    conn: sqlite3.Connection,
+    *,
+    file_id: int | None,
+    from_folder: str | None,
+    to_folder: str,
+    source: str,
+) -> int:
+    """Record that the user put a file in ``to_folder`` (a learning example)."""
+    cursor = conn.execute(
+        "INSERT INTO corrections (file_id, from_folder, to_folder, source, ts)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (file_id, from_folder, to_folder, source, now_iso()),
+    )
+    return cursor.lastrowid
+
+
+def list_corrections(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return every correction, oldest first."""
+    return conn.execute("SELECT * FROM corrections ORDER BY id").fetchall()
+
+
 # --- history ----------------------------------------------------------------
 
 UNDOABLE_ACTIONS = ("move", "rename")
@@ -264,6 +355,17 @@ def last_undoable(conn: sqlite3.Connection, count: int) -> list[HistoryEntry]:
         (*UNDOABLE_ACTIONS, count),
     )
     return [_history_from_row(row) for row in rows]
+
+
+def top_suggestion(conn: sqlite3.Connection, file_id: int) -> str | None:
+    """The best folder the classifier suggested in a file's most recent decision, if any."""
+    row = conn.execute(
+        "SELECT json_extract(details_json, '$.candidates[0].folder') AS folder FROM history"
+        " WHERE file_id = ? AND json_extract(details_json, '$.candidates[0].folder') IS NOT NULL"
+        " ORDER BY id DESC LIMIT 1",
+        (file_id,),
+    ).fetchone()
+    return None if row is None else row["folder"]
 
 
 def undos_with_stale_target(conn: sqlite3.Connection) -> list[int]:

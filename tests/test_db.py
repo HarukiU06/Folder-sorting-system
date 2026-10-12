@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from autoshelf.db import repository, schema
 from autoshelf.db.connection import connect, open_database, transaction
 from autoshelf.db.migrations import MIGRATIONS, MigrationError, current_version, migrate
 from autoshelf.db.repository import get_setting, now_iso, set_setting
@@ -17,6 +18,7 @@ EXPECTED_TABLES = {
     "history",
     "corrections",
     "settings",
+    "file_vectors",
 }
 
 
@@ -80,3 +82,59 @@ def test_settings_values_are_json(conn) -> None:
     set_setting(conn, "patterns", ["*.part"])
     assert get_setting(conn, "patterns") == ["*.part"]
     assert get_setting(conn, "missing", default=3) == 3
+
+
+def test_upgrade_from_version_1_keeps_data(paths) -> None:
+    conn = connect(paths.db_path)
+    conn.executescript("".join(["BEGIN;", schema.V1, "PRAGMA user_version = 1; COMMIT;"]))
+    set_setting(conn, "root", "C:/shelf")
+    conn.close()
+
+    conn = open_database(paths.db_path)
+    assert current_version(conn) == len(MIGRATIONS)
+    assert "file_vectors" in _tables(conn)
+    assert get_setting(conn, "root") == "C:/shelf"
+    conn.close()
+
+
+def test_vectors_are_stored_per_file_and_deleted_with_it(conn) -> None:
+    file_id = repository.upsert_file(conn, r"C:\shelf\a.pdf", sha256="x", size=1, mtime=2.0)
+    repository.set_vector(
+        conn, file_id, model="m1", size=1, mtime=2.0, source="content", vector=b"1234"
+    )
+    repository.set_vector(
+        conn, file_id, model="m2", size=1, mtime=2.0, source="name", vector=b"5678"
+    )
+
+    stored = repository.get_vector(conn, file_id)
+    assert (stored.model, stored.source, stored.vector) == ("m2", "name", b"5678")
+
+    conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    assert repository.get_vector(conn, file_id) is None
+
+
+def test_folder_descriptions_are_case_insensitive(conn) -> None:
+    repository.set_folder_description(conn, "Machine Learning/NLP", "text models")
+    repository.set_folder_description(conn, "machine learning/nlp", "language models")
+    repository.set_folder_description(conn, "Empty", "")
+    assert repository.folder_descriptions(conn) == {"machine learning/nlp": "language models"}
+
+
+def test_top_suggestion_comes_from_the_latest_decision(conn) -> None:
+    file_id = repository.upsert_file(conn, r"C:\shelf\a.pdf", sha256="x", size=1, mtime=2.0)
+    assert repository.top_suggestion(conn, file_id) is None
+    for folder in ("Finance", "Recipes"):
+        repository.insert_history(
+            conn,
+            action="move",
+            src="a",
+            dst="b",
+            reason="ask",
+            root="C:/shelf",
+            file_id=file_id,
+            details={"candidates": [{"folder": folder, "score": 0.3}]},
+        )
+    repository.insert_history(
+        conn, action="move", src="b", dst="c", reason="user", root="C:/shelf", file_id=file_id
+    )
+    assert repository.top_suggestion(conn, file_id) == "Recipes"

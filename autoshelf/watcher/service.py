@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sqlite3
 import threading
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -10,10 +11,16 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from autoshelf.actions.history import reconcile_pending
-from autoshelf.config import DEFAULT_IGNORE_PATTERNS, DEFAULT_STABLE_SECONDS
+from autoshelf.config import (
+    DEFAULT_AUTO_MARGIN,
+    DEFAULT_AUTO_THRESHOLD,
+    DEFAULT_IGNORE_PATTERNS,
+    DEFAULT_STABLE_SECONDS,
+)
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.ml.library import LibraryIndex
 from autoshelf.pipeline import Outcome, OutcomeKind, Pipeline
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
@@ -23,6 +30,9 @@ log = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 0.5
 _MAX_NOTED_PATHS = 5000
+_PROGRESS_EVERY = 25
+
+LibraryFactory = Callable[[sqlite3.Connection], LibraryIndex]
 
 
 class _EventHandler(FileSystemEventHandler):
@@ -49,6 +59,9 @@ class WatchService:
     """Watches the root and processes files in the root and ``_Inbox`` once they are stable.
 
     Call ``start()`` then ``stop()``. ``root`` must already be validated and resolved.
+    ``make_library(conn)`` builds the classifier's library index on the worker thread
+    (loading the language model there, not on the caller's thread). Without it, or if it
+    fails, every new file waits in ``_Inbox``.
     """
 
     def __init__(
@@ -61,6 +74,9 @@ class WatchService:
         ignore_patterns: Iterable[str] = DEFAULT_IGNORE_PATTERNS,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         on_outcome: Callable[[Outcome], None] | None = None,
+        make_library: LibraryFactory | None = None,
+        threshold: float = DEFAULT_AUTO_THRESHOLD,
+        margin: float = DEFAULT_AUTO_MARGIN,
     ) -> None:
         self.root = root
         self.db_path = db_path
@@ -70,6 +86,9 @@ class WatchService:
         self.tracker = StabilityTracker(stable_seconds)
         self.self_moves = SelfMoveRegistry()
         self._on_outcome = on_outcome
+        self._make_library = make_library
+        self.threshold = threshold
+        self.margin = margin
         self._stop = threading.Event()
         self._observer: Observer | None = None
         self._worker: threading.Thread | None = None
@@ -144,6 +163,28 @@ class WatchService:
                 if entry.is_file():
                     self.offer(entry)
 
+    def _open_library(self, conn: sqlite3.Connection) -> LibraryIndex | None:
+        """Load the classifier and index the files already in category folders."""
+        if self._make_library is None:
+            return None
+        try:
+            library = self._make_library(conn)
+            stats = library.refresh(progress=_log_progress)
+        except Exception as exc:
+            log.error("Sorting by content is unavailable (%s); new files will wait in _Inbox", exc)
+            log.debug("Library failure", exc_info=True)
+            return None
+        log.info(
+            "Ready: %d folders, %d files in them indexed (%d read just now%s)",
+            stats.folders,
+            stats.files,
+            stats.embedded,
+            f", {stats.unreadable} unreadable" if stats.unreadable else "",
+        )
+        if stats.folders == 0:
+            log.info("No folders yet: create folders in the root and new files will be sorted")
+        return library
+
     def _run_worker(self) -> None:
         conn = open_database(self.db_path)
         pipeline = Pipeline(
@@ -152,6 +193,9 @@ class WatchService:
             dry_run=self.dry_run,
             ignore_patterns=self.ignore_patterns,
             self_moves=self.self_moves,
+            library=self._open_library(conn),
+            threshold=self.threshold,
+            margin=self.margin,
         )
         try:
             while not self._stop.wait(self.poll_interval):
@@ -182,6 +226,8 @@ class WatchService:
                 self._display(outcome.dst),
                 outcome.message,
             )
+        elif outcome.kind is OutcomeKind.WAITING:
+            log.info("%s %s", name, outcome.message)
         elif outcome.kind is OutcomeKind.SKIPPED:
             log.info("Left %s where it is: %s", name, outcome.message)
         else:
@@ -213,3 +259,8 @@ class WatchService:
             return f"'{path.relative_to(self.root)}'"
         except ValueError:
             return f"'{path}'"
+
+
+def _log_progress(done: int, total: int) -> None:
+    if done == total or done % _PROGRESS_EVERY == 0:
+        log.info("Reading files already in your folders: %d/%d", done, total)

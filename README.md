@@ -5,10 +5,9 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–2 are done: a command-line watcher that safely moves
-> new files into `_Inbox/` with full history and undo, and reads each file's text and metadata.
-> There is no classifier yet (Phase 3), so every new file is treated as "not sure, ask the
-> user" and waits in `_Inbox/`.
+> **Status:** early development. Phases 1–3 are done, as a command-line tool: a watcher that
+> reads each new file and either moves it into the right folder (when it is sure) or into
+> `_Inbox/` for you to decide, with full history and undo. The desktop app comes in Phase 4.
 
 ## Safety rules
 
@@ -18,6 +17,7 @@ AutoShelf moves real files, so:
 - it only works inside the root you choose, and refuses paths that lead outside it;
 - it records every move in its history **before** doing it, so every move can be undone;
 - it never creates category folders (it only creates its own `_Inbox/` when first needed);
+- it only moves a file on its own when one folder is a clear match; otherwise it asks;
 - it waits until a file has stopped changing for 3 seconds and no program is still writing it;
 - it ignores temporary and partial files (`~$*`, `*.tmp`, `*.crdownload`, `*.part`,
   `*.download`, `desktop.ini`, `.DS_Store`, `Thumbs.db`) and hidden or system files;
@@ -46,6 +46,10 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
+This installs PyTorch (the CPU build, about 1 GB in the venv). The first command that sorts
+or classifies files also downloads the language model (about 470 MB) into
+`%APPDATA%\AutoShelf\cache\models`; after that everything runs offline, on your PC.
+
 The commands below call the venv's Python directly, so they work without activating it.
 (If you do run `.venv\Scripts\Activate.ps1` and PowerShell blocks it, run
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once; after activating, plain `python`
@@ -57,12 +61,32 @@ Try it on a throwaway folder first, never on your real files:
 
 ```powershell
 New-Item -ItemType Directory -Force "C:\workspace\AutoShelf-sandbox\Finance"
+New-Item -ItemType Directory -Force "C:\workspace\AutoShelf-sandbox\Recipes"
+
+# Remember the root, so the other commands don't need --root
+.venv\Scripts\python.exe -m autoshelf config --root "C:\workspace\AutoShelf-sandbox"
+
+# Optional but helpful, especially for folders that are still empty
+.venv\Scripts\python.exe -m autoshelf describe Finance "invoices, receipts, bank statements, taxes"
+.venv\Scripts\python.exe -m autoshelf describe Recipes "cooking recipes and baking"
+.venv\Scripts\python.exe -m autoshelf folders
 
 # Dry run: watch and report what would happen, without moving anything
-.venv\Scripts\python.exe -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox" --dry-run
+.venv\Scripts\python.exe -m autoshelf watch --dry-run
 
-# Real run: new files in the root are moved into _Inbox\ (Ctrl+C to stop)
-.venv\Scripts\python.exe -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox"
+# Real run: new files are sorted into your folders, or into _Inbox\ (Ctrl+C to stop)
+.venv\Scripts\python.exe -m autoshelf watch
+```
+
+While it runs, drop files into the root (or into `_Inbox\`, e.g. from your iPhone). Then:
+
+```powershell
+# Which folder would this file go to, and why? (reads the file, moves nothing)
+.venv\Scripts\python.exe -m autoshelf classify "C:\path\to\any file.pdf"
+
+# Files waiting for you, with suggestions; answer one
+.venv\Scripts\python.exe -m autoshelf inbox
+.venv\Scripts\python.exe -m autoshelf assign "scan_0034.pdf" "Finance"
 
 # See what happened, and undo it
 .venv\Scripts\python.exe -m autoshelf history
@@ -70,11 +94,9 @@ New-Item -ItemType Directory -Force "C:\workspace\AutoShelf-sandbox\Finance"
 .venv\Scripts\python.exe -m autoshelf undo --last 5   # undo the 5 most recent moves
 ```
 
-To see what AutoShelf reads from any file (it only reads, never changes it):
-
-```powershell
-.venv\Scripts\python.exe -m autoshelf extract "C:\workspace\AutoShelf-sandbox\Lecture notes.pdf"
-```
+Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
+files already in your folders ahead of time (the watcher also does this when it starts),
+and `config` shows or changes settings. Every command that needs the root accepts `--root`.
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
 unchanged before it is processed. A file you undo is put back where it was and left alone
@@ -83,6 +105,35 @@ moved (`--force` overrides), was moved elsewhere, or if its original folder no l
 
 The log file is `%APPDATA%\AutoShelf\logs\autoshelf.log`. Set `AUTOSHELF_HOME` to use a
 different data folder (handy for experiments).
+
+## How it decides
+
+Each of your folders is described by its name (for example "Machine Learning /
+Unsupervised"), the description you gave it, and the files already in it. A new file's
+name and text are turned into a vector by a small multilingual language model, so English
+and Japanese files and folder names can be compared with each other. Each folder gets a
+score from how similar the file is to the folder's name and description, and to the three
+most similar files already inside it. The more files a folder holds, the more those count.
+
+- A file is moved automatically only if its best folder scores at least the **threshold**
+  (default 0.40) and beats every unrelated folder by the **margin** (default 0.10).
+- A folder's own subfolders and parents are not counted as rivals. AutoShelf picks the
+  deepest folder that is a clear match; if two subfolders are too close to call, the file
+  goes to their parent.
+- Otherwise the file goes to `_Inbox/` with its top suggestions. Every decision, with the
+  top three folders and their scores, is kept in the history.
+- Files you put into folders yourself (or with `assign`) become examples, so sorting gets
+  better as your folders fill up.
+- iCloud "online-only" files in your folders are judged by their names only, so AutoShelf
+  never makes iCloud download your whole library.
+
+Raise the threshold or margin to be more cautious, lower them to sort more automatically:
+`autoshelf config --threshold 0.45 --margin 0.12`. The defaults are tuned for the default
+model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`); a different model
+(`config --model`) scores on a different scale and needs its own values.
+
+A dry run moves nothing and records no history, but it does save the vectors of the files
+already in your folders, so the next start is faster.
 
 ## What AutoShelf reads
 

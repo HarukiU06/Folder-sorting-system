@@ -1,9 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from helpers import make, set_windows_attributes, windows_only
 
 from autoshelf.config import DEFAULT_IGNORE_PATTERNS
+from autoshelf.fsutil import is_online_only
 from autoshelf.layout import Zone, zone_of
 from autoshelf.watcher.ignore import ignore_reason, matching_pattern
 
@@ -88,3 +90,23 @@ def test_zone_of(root: Path, relative: str, zone: Zone) -> None:
 def test_zone_outside_root(root: Path, tmp_path: Path) -> None:
     assert zone_of(tmp_path / "elsewhere.pdf", root) is Zone.OUTSIDE
     assert zone_of(root, root) is Zone.OUTSIDE
+
+
+@pytest.mark.parametrize(
+    ("attributes", "online_only"),
+    [
+        (0x0, False),
+        (0x20, False),  # archive: an ordinary local file
+        (0x1000, True),  # offline
+        (0x40000, True),  # recall on open
+        (0x400000, True),  # recall on data access (iCloud "online-only")
+        (0x400000 | 0x20, True),
+    ],
+)
+def test_online_only_attributes(attributes: int, online_only: bool) -> None:
+    st = SimpleNamespace(st_file_attributes=attributes)
+    assert is_online_only(st) is online_only
+
+
+def test_local_file_is_not_online_only(tmp_path: Path) -> None:
+    assert not is_online_only(make(tmp_path / "a.txt").stat())

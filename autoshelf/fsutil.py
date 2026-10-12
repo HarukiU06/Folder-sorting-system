@@ -1,6 +1,7 @@
 """Small filesystem helpers: hashing, containment checks, hidden files and lock probing."""
 
 import hashlib
+import os
 import stat
 import sys
 from pathlib import Path
@@ -34,6 +35,21 @@ def is_hidden_or_system(path: Path) -> bool:
         return True
     attributes = getattr(path.lstat(), "st_file_attributes", 0)
     return bool(attributes & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
+
+
+# Attributes of cloud placeholders such as iCloud "online-only" files. Their metadata
+# can be read freely, but reading their content makes the cloud provider download them.
+FILE_ATTRIBUTE_OFFLINE = 0x1000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_ONLINE_ONLY = (
+    FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+
+def is_online_only(st: os.stat_result) -> bool:
+    """Return True if a stat result describes a cloud file whose content isn't on disk."""
+    return bool(getattr(st, "st_file_attributes", 0) & _ONLINE_ONLY)
 
 
 if sys.platform == "win32":

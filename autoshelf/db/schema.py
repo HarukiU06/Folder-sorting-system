@@ -103,3 +103,17 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 """
+
+V2 = """
+-- One embedding per file, made by the model named in ``model`` from the file as it was
+-- at ``size``/``mtime``. A vector from another model or an older version of the file is
+-- rebuilt. ``source`` 'name' means only the name was used (an iCloud online-only file).
+CREATE TABLE file_vectors (
+    file_id INTEGER PRIMARY KEY REFERENCES files (id) ON DELETE CASCADE,
+    model   TEXT    NOT NULL,
+    size    INTEGER NOT NULL,
+    mtime   REAL    NOT NULL,
+    source  TEXT    NOT NULL CHECK (source IN ('content', 'name')),
+    vector  BLOB    NOT NULL
+);
+"""

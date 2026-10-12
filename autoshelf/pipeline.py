@@ -1,36 +1,44 @@
 """The ingestion pipeline (SPEC section 4.1) for one file that has become stable.
 
 Steps: check location and ignore rules, hash, look for exact duplicates, extract text,
-decide, act. Rules (Phase 5) and classification (Phase 3) slot in before ``decide``.
-Until the classifier exists, every dropped file is sent to ``_Inbox`` for the user to
-decide, which is the spec's "when unsure, ask" path.
+classify, act. A clear match is moved straight into its folder. Anything else goes to
+``_Inbox`` (or, if it is already there, stays) for the user to decide: "when unsure,
+ask". Rules (Phase 5) slot in before classification.
 """
 
 import logging
+import os
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+import numpy as np
+
 from autoshelf.actions.mover import MoveError, free_destination, move_file
-from autoshelf.config import DEFAULT_IGNORE_PATTERNS
+from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
 from autoshelf.fsutil import sha256_file
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.ml.classifier import Classification
+from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
+__all__ = ["TEXT_EXCERPT_CHARS", "Decision", "Outcome", "OutcomeKind", "Pipeline"]
+
 log = logging.getLogger(__name__)
 
-# How much extracted text is stored with each file for previews (the Inbox, Phase 4).
-TEXT_EXCERPT_CHARS = 1000
+REASON_AUTO = "auto"  # moved by the classifier
+REASON_ASK = "ask"  # sent to _Inbox for the user to decide
 
 
 class OutcomeKind(StrEnum):
     MOVED = "moved"
     WOULD_MOVE = "would move"
+    WAITING = "waiting"  # left in _Inbox for the user to decide
     SKIPPED = "skipped"
     FAILED = "failed"
 
@@ -46,26 +54,25 @@ class Outcome:
     history_id: int | None = None
     duplicates: tuple[Path, ...] = ()
     extraction: Extraction | None = None
+    classification: Classification | None = None
 
 
 @dataclass(frozen=True)
 class Decision:
-    """Where a file should go. ``target_dir`` None means leave it where it is."""
+    """Where a file should go. ``target_dir`` None means it stays where it is (in _Inbox)."""
 
     target_dir: Path | None
     reason: str
+    message: str
     confidence: float | None = None
 
 
-def decide(zone: Zone, root: Path) -> Decision:
-    """Phase 1 stand-in for the classifier: every dropped file needs the user's decision."""
-    if zone is Zone.INBOX:
-        return Decision(None, "waiting in _Inbox for your decision")
-    return Decision(inbox_dir(root), "no classifier yet, so it waits in _Inbox for you")
-
-
 class Pipeline:
-    """Processes stable files from the root and ``_Inbox``. Use from a single thread."""
+    """Processes stable files from the root and ``_Inbox``. Use from a single thread.
+
+    Without a ``library`` (e.g. the language model couldn't be loaded) every file waits
+    in ``_Inbox`` for the user.
+    """
 
     def __init__(
         self,
@@ -76,6 +83,9 @@ class Pipeline:
         ignore_patterns: Iterable[str] = DEFAULT_IGNORE_PATTERNS,
         self_moves: SelfMoveRegistry | None = None,
         extractor: Callable[[Path], Extraction] = extract,
+        library: LibraryIndex | None = None,
+        threshold: float = DEFAULT_AUTO_THRESHOLD,
+        margin: float = DEFAULT_AUTO_MARGIN,
     ) -> None:
         self.conn = conn
         self.root = root
@@ -83,6 +93,9 @@ class Pipeline:
         self.ignore_patterns = tuple(ignore_patterns)
         self.self_moves = self_moves or SelfMoveRegistry()
         self.extractor = extractor
+        self.library = library
+        self.threshold = threshold
+        self.margin = margin
 
     def process(self, path: Path) -> Outcome:
         """Run the pipeline for one file. Never raises; failures come back as FAILED."""
@@ -107,30 +120,38 @@ class Pipeline:
             return Outcome(OutcomeKind.SKIPPED, path, f"ignored: {reason}")
 
         digest = sha256_file(path)
+        st = path.stat()
         known = repository.get_file_by_path(self.conn, path)
-        if known is not None and known.status == "ignored" and known.sha256 == digest:
-            return Outcome(OutcomeKind.SKIPPED, path, "left in place: you undid its last move")
+        if known is not None and known.sha256 == digest:
+            if known.status == "ignored":
+                return Outcome(OutcomeKind.SKIPPED, path, "left in place: you undid its last move")
+            if zone is Zone.INBOX and known.status == "inbox":
+                return Outcome(OutcomeKind.SKIPPED, path, "waiting in _Inbox for your decision")
         duplicates = self._duplicates_of(path, digest)
         extraction = self.extractor(path)
+        vector, classification = self._classify(path, extraction)
+        decision = self._decide(zone, classification)
+        if decision.target_dir is not None and not self._can_receive(decision.target_dir):
+            decision = self._fallback_to_inbox(zone, decision)
 
-        decision = decide(zone, self.root)
+        def outcome(kind: OutcomeKind, message: str, **extra) -> Outcome:
+            return Outcome(
+                kind,
+                path,
+                message,
+                duplicates=duplicates,
+                extraction=extraction,
+                classification=classification,
+                **extra,
+            )
+
         if decision.target_dir is None:
-            return Outcome(
-                OutcomeKind.SKIPPED,
-                path,
-                decision.reason,
-                duplicates=duplicates,
-                extraction=extraction,
-            )
+            if not self.dry_run:
+                self._record_waiting(path, digest, st, extraction, vector)
+            return outcome(OutcomeKind.WAITING, decision.message)
         if self.dry_run:
-            return Outcome(
-                OutcomeKind.WOULD_MOVE,
-                path,
-                decision.reason,
-                dst=self._planned_destination(decision.target_dir, path.name),
-                duplicates=duplicates,
-                extraction=extraction,
-            )
+            dst = self._planned_destination(decision.target_dir, path.name)
+            return outcome(OutcomeKind.WOULD_MOVE, decision.message, dst=dst)
 
         self._ensure_inbox_if_target(decision.target_dir)
         result = move_file(
@@ -141,22 +162,79 @@ class Pipeline:
             reason=decision.reason,
             confidence=decision.confidence,
             sha256=digest,
+            details=classification.to_details() if classification else None,
             before_rename=self._expect_self_move,
         )
-        repository.set_file_content(
-            self.conn,
-            result.file_id,
-            title=extraction.title,
-            text_excerpt=extraction.text[:TEXT_EXCERPT_CHARS] or None,
+        store_content(self.conn, result.file_id, extraction)
+        if vector is not None:
+            self._store_vector(result.file_id, vector, st)
+        return outcome(
+            OutcomeKind.MOVED, decision.message, dst=result.dst, history_id=result.history_id
         )
-        return Outcome(
-            OutcomeKind.MOVED,
-            path,
-            decision.reason,
-            dst=result.dst,
-            history_id=result.history_id,
-            duplicates=duplicates,
-            extraction=extraction,
+
+    def _classify(
+        self, path: Path, extraction: Extraction
+    ) -> tuple[np.ndarray | None, Classification | None]:
+        """Embed the file and score the folders. Returns (None, None) without a library."""
+        if self.library is None:
+            return None, None
+        try:
+            self.library.refresh()  # pick up folders and files the user added meanwhile
+            vector = self.library.vectorize(extraction, path.name)
+            classification = self.library.classify(
+                vector, threshold=self.threshold, margin=self.margin
+            )
+        except Exception:
+            log.exception("Couldn't classify %s; it will wait in _Inbox", path)
+            return None, None
+        return vector, classification
+
+    def _decide(self, zone: Zone, classification: Classification | None) -> Decision:
+        if classification is None:
+            why = "it can't be sorted by content right now"
+        elif classification.choice is not None:
+            choice = classification.choice
+            target = self.root.joinpath(*choice.folder.split("/"))
+            return Decision(target, REASON_AUTO, classification.explanation, choice.score)
+        else:
+            why = classification.explanation
+        best = classification.scores[0].score if classification and classification.scores else None
+        if zone is Zone.INBOX:
+            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}", best)
+        return Decision(inbox_dir(self.root), REASON_ASK, why, best)
+
+    def _can_receive(self, target_dir: Path) -> bool:
+        """True if files can be moved to ``target_dir`` (``_Inbox`` is created when needed)."""
+        return target_dir == inbox_dir(self.root) or target_dir.is_dir()
+
+    def _fallback_to_inbox(self, zone: Zone, decision: Decision) -> Decision:
+        """The chosen folder vanished after scoring: ask instead. Folders are never created."""
+        why = f"its folder {decision.target_dir.name!r} no longer exists"
+        if zone is Zone.INBOX:
+            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}")
+        return Decision(inbox_dir(self.root), REASON_ASK, why)
+
+    def _record_waiting(
+        self,
+        path: Path,
+        digest: str,
+        st: os.stat_result,
+        extraction: Extraction,
+        vector: np.ndarray | None,
+    ) -> None:
+        """Remember a file that stays in _Inbox, so it isn't classified again and again."""
+        file_id = repository.upsert_file(
+            self.conn, path, sha256=digest, size=st.st_size, mtime=st.st_mtime
+        )
+        repository.set_file_status(self.conn, file_id, "inbox")
+        store_content(self.conn, file_id, extraction)
+        if vector is not None:
+            self._store_vector(file_id, vector, st)
+
+    def _store_vector(self, file_id: int, vector: np.ndarray, st: os.stat_result) -> None:
+        # A rename keeps size and mtime, so the vector stays valid at the new path.
+        store_vector(
+            self.conn, file_id, vector, model=self.library.model, size=st.st_size, mtime=st.st_mtime
         )
 
     def _duplicates_of(self, path: Path, digest: str) -> tuple[Path, ...]:

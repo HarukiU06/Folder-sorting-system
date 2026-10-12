@@ -6,9 +6,12 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from fakes import FakeEmbedder
 from helpers import make
 
 from autoshelf.config import AppPaths
+from autoshelf.db import repository
+from autoshelf.ml.library import LibraryIndex
 from autoshelf.pipeline import Outcome
 from autoshelf.watcher.service import WatchService
 
@@ -109,3 +112,36 @@ def test_dry_run_moves_nothing(root: Path, run_service) -> None:
     assert outcomes[0].kind == "would move"
     assert (root / "report.pdf").exists()
     assert not (root / "_Inbox").exists()
+
+
+def test_clear_match_is_sorted_into_its_folder(root: Path, conn, run_service) -> None:
+    make(root / "Recipes" / "curry.txt", "recipe curry onion simmer")
+    repository.set_folder_description(conn, "Recipes", "recipe cooking baking")
+    (root / "Finance").mkdir()
+
+    recorder = run_service(
+        make_library=lambda c: LibraryIndex(c, root, FakeEmbedder()), threshold=0.3, margin=0.1
+    )
+    make(root / "banana bread recipe.txt", "recipe baking banana oven")
+    make(root / "random.txt", "call mom")
+
+    recorder.wait_for(lambda outcomes: len(outcomes) >= 2)
+
+    assert (root / "Recipes" / "banana bread recipe.txt").exists()
+    assert (root / "_Inbox" / "random.txt").exists()
+
+
+def test_failing_library_means_every_file_waits_in_inbox(
+    root: Path, run_service, caplog: pytest.LogCaptureFixture
+) -> None:
+    (root / "Recipes").mkdir()
+
+    def broken(conn):
+        raise RuntimeError("no model for you")
+
+    recorder = run_service(make_library=broken)
+    make(root / "banana bread recipe.txt", "recipe")
+    recorder.wait_for(outcome_for("banana bread recipe.txt"))
+
+    assert (root / "_Inbox" / "banana bread recipe.txt").exists()
+    assert "Sorting by content is unavailable (no model for you)" in caplog.text

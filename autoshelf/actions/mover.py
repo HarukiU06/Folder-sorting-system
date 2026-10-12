@@ -14,6 +14,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePath
+from typing import Any
 
 from autoshelf.db import repository
 from autoshelf.fsutil import is_within, sha256_file
@@ -81,12 +82,14 @@ def move_file(
     confidence: float | None = None,
     batch_id: str | None = None,
     undo_of: int | None = None,
+    details: dict[str, Any] | None = None,
     before_rename: BeforeRename | None = None,
 ) -> MoveResult:
     """Move ``src`` into the existing folder ``dst_dir``, safely and with a history record.
 
     ``before_rename(src, dst)`` is called right before each rename attempt; the watcher
-    uses it to recognise its own file events. Raises MoveError if the move is refused or
+    uses it to recognise its own file events. ``details`` (e.g. the classifier's top
+    candidates) is stored with the history row. Raises MoveError if the move is refused or
     fails, in which case the file stays where it was and the history row is ``failed``.
     """
     root = Path(root).resolve(strict=True)
@@ -116,6 +119,7 @@ def move_file(
         confidence=confidence,
         batch_id=batch_id,
         undo_of=undo_of,
+        details=details,
     )
     try:
         dst = _rename_with_retries(conn, history_id, source, dst, candidates, before_rename)

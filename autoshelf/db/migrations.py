@@ -5,7 +5,7 @@ import sqlite3
 from autoshelf.db import schema
 
 # Index i holds the script that upgrades the database from version i to i + 1.
-MIGRATIONS: tuple[str, ...] = (schema.V1,)
+MIGRATIONS: tuple[str, ...] = (schema.V1, schema.V2)
 
 
 class MigrationError(Exception):

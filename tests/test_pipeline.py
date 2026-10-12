@@ -2,11 +2,13 @@ from pathlib import Path
 
 import pytest
 import samples
+from fakes import FakeEmbedder
 from helpers import make
 
 from autoshelf.actions.undo import undo
 from autoshelf.db import repository
-from autoshelf.pipeline import TEXT_EXCERPT_CHARS, OutcomeKind, Pipeline
+from autoshelf.ml.library import LibraryIndex
+from autoshelf.pipeline import REASON_ASK, REASON_AUTO, TEXT_EXCERPT_CHARS, OutcomeKind, Pipeline
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
 
@@ -48,12 +50,14 @@ def test_dry_run_touches_nothing(conn, root: Path) -> None:
     assert repository.get_file_by_path(conn, src) is None
 
 
-def test_file_in_inbox_stays_put(conn, root: Path, pipeline: Pipeline) -> None:
+def test_file_in_inbox_without_a_classifier_waits(conn, root: Path, pipeline: Pipeline) -> None:
     path = make(root / "_Inbox" / "from iPhone.pdf")
     outcome = pipeline.process(path)
-    assert outcome.kind is OutcomeKind.SKIPPED
+    assert outcome.kind is OutcomeKind.WAITING
     assert path.exists()
     assert repository.list_history(conn) == []
+    assert repository.get_file_by_path(conn, path).status == "inbox"
+    assert pipeline.process(path).kind is OutcomeKind.SKIPPED  # not reconsidered every time
 
 
 def test_reprocessing_a_file_the_app_moved_to_inbox_is_a_no_op(
@@ -157,3 +161,151 @@ def test_unreadable_pdf_is_still_moved(conn, root: Path, pipeline: Pipeline, cap
     assert outcome.kind is OutcomeKind.MOVED
     assert outcome.extraction.error
     assert outcome.extraction.filename_tokens == ("scan",)
+
+
+# --- with the classifier ----------------------------------------------------------
+
+THRESHOLD = 0.3
+MARGIN = 0.1
+
+
+@pytest.fixture
+def embedder() -> FakeEmbedder:
+    return FakeEmbedder()
+
+
+@pytest.fixture
+def shelf(conn, root: Path) -> Path:
+    """Two folders with descriptions; one already holds an example file."""
+    make(root / "Finance" / "invoice 2024.txt", "invoice total tax due bank transfer")
+    (root / "Recipes").mkdir()
+    repository.set_folder_description(conn, "Finance", "invoice receipt tax bank")
+    repository.set_folder_description(conn, "Recipes", "recipe cooking baking oven")
+    return root
+
+
+@pytest.fixture
+def smart(conn, shelf: Path, embedder: FakeEmbedder) -> Pipeline:
+    library = LibraryIndex(conn, shelf, embedder)
+    return Pipeline(conn, shelf, library=library, threshold=THRESHOLD, margin=MARGIN)
+
+
+def test_clear_match_is_moved_into_its_folder(conn, shelf: Path, smart: Pipeline) -> None:
+    src = make(shelf / "invoice 2025.txt", "invoice total tax due")
+
+    outcome = smart.process(src)
+
+    assert outcome.kind is OutcomeKind.MOVED
+    assert outcome.dst == shelf / "Finance" / "invoice 2025.txt"
+    entry = repository.get_history(conn, outcome.history_id)
+    assert entry.reason == REASON_AUTO
+    assert entry.confidence == pytest.approx(outcome.classification.choice.score)
+    assert entry.details["candidates"][0]["folder"] == "Finance"
+    assert repository.get_file_by_path(conn, outcome.dst).status == "sorted"
+
+
+def test_unclear_file_goes_to_inbox_with_its_suggestions(
+    conn, shelf: Path, smart: Pipeline
+) -> None:
+    outcome = smart.process(make(shelf / "notes.txt", "call mom buy milk"))
+
+    assert outcome.kind is OutcomeKind.MOVED
+    assert outcome.dst == shelf / "_Inbox" / "notes.txt"
+    assert outcome.classification.choice is None
+    entry = repository.get_history(conn, outcome.history_id)
+    assert entry.reason == REASON_ASK
+    assert {c["folder"] for c in entry.details["candidates"]} == {"Finance", "Recipes"}
+    assert "not sure" in entry.details["explanation"]
+
+
+def test_moved_file_keeps_its_vector_and_becomes_an_example(
+    conn, shelf: Path, smart: Pipeline, embedder: FakeEmbedder
+) -> None:
+    outcome = smart.process(make(shelf / "invoice 2025.txt", "invoice total tax due"))
+    embedded = embedder.embedded
+
+    stats = smart.library.refresh()
+
+    assert stats.files == 2
+    assert embedder.embedded == embedded  # reused, not recomputed
+    assert outcome.dst in {e.path for e in smart.library.files_in("Finance")}
+
+
+def test_file_dropped_into_inbox_from_iphone_is_sorted(shelf: Path, smart: Pipeline) -> None:
+    src = make(shelf / "_Inbox" / "banana bread recipe.txt", "recipe baking oven banana")
+    outcome = smart.process(src)
+    assert outcome.kind is OutcomeKind.MOVED
+    assert outcome.dst == shelf / "Recipes" / src.name
+
+
+def test_unclear_file_in_inbox_waits_and_is_not_reclassified(
+    conn, shelf: Path, smart: Pipeline, embedder: FakeEmbedder
+) -> None:
+    src = make(shelf / "_Inbox" / "notes.txt", "call mom buy milk")
+
+    first = smart.process(src)
+    embedded = embedder.embedded
+    second = smart.process(src)
+
+    assert first.kind is OutcomeKind.WAITING
+    assert "not sure" in first.message
+    assert src.exists()
+    assert repository.list_history(conn) == []
+    assert second.kind is OutcomeKind.SKIPPED
+    assert embedder.embedded == embedded
+
+
+def test_dry_run_classifies_but_records_nothing(conn, shelf: Path, embedder) -> None:
+    library = LibraryIndex(conn, shelf, embedder)
+    dry = Pipeline(conn, shelf, dry_run=True, library=library, threshold=THRESHOLD, margin=MARGIN)
+    src = make(shelf / "invoice 2025.txt", "invoice total tax due")
+
+    outcome = dry.process(src)
+
+    assert outcome.kind is OutcomeKind.WOULD_MOVE
+    assert outcome.dst == shelf / "Finance" / "invoice 2025.txt"
+    assert src.exists()
+    assert repository.list_history(conn) == []
+    assert repository.get_file_by_path(conn, src) is None
+
+
+def test_folder_that_vanished_after_scoring_means_inbox(
+    conn, shelf: Path, smart: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = make(shelf / "invoice 2025.txt", "invoice total tax due")
+    original = smart._decide
+
+    def decide_then_delete(zone, classification):
+        decision = original(zone, classification)
+        (shelf / "Finance" / "invoice 2024.txt").unlink()
+        (shelf / "Finance").rmdir()  # the user deletes the folder at the worst moment
+        return decision
+
+    monkeypatch.setattr(smart, "_decide", decide_then_delete)
+    outcome = smart.process(src)
+
+    assert outcome.dst == shelf / "_Inbox" / "invoice 2025.txt"
+    assert "no longer exists" in outcome.message
+    assert not (shelf / "Finance").exists()  # never recreated
+
+
+def test_classifier_failure_sends_the_file_to_inbox(
+    shelf: Path, smart: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args, **kwargs):
+        raise RuntimeError("model crashed")
+
+    monkeypatch.setattr(smart.library, "vectorize", broken)
+    outcome = smart.process(make(shelf / "invoice 2025.txt", "invoice total tax due"))
+    assert outcome.kind is OutcomeKind.MOVED
+    assert outcome.dst == shelf / "_Inbox" / "invoice 2025.txt"
+
+
+def test_new_folder_is_picked_up_without_restarting(conn, shelf: Path, smart: Pipeline) -> None:
+    smart.process(make(shelf / "warmup.txt", "anything"))  # first refresh happens here
+    (shelf / "Travel").mkdir()
+    repository.set_folder_description(conn, "Travel", "trip hotel flight itinerary")
+
+    outcome = smart.process(make(shelf / "kyoto.txt", "trip itinerary hotel flight kyoto"))
+
+    assert outcome.dst == shelf / "Travel" / "kyoto.txt"

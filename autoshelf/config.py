@@ -17,6 +17,13 @@ HOME_ENV_VAR = "AUTOSHELF_HOME"
 DB_FILENAME = "autoshelf.db"
 
 DEFAULT_STABLE_SECONDS = 3.0
+# Multilingual, so Japanese and English files (and folder names) can be compared.
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# A file is moved automatically only if its best folder scores at least the threshold and
+# beats every unrelated folder by the margin. Tuned for DEFAULT_EMBEDDING_MODEL: another
+# model scores on a different scale, so change these together with the model.
+DEFAULT_AUTO_THRESHOLD = 0.40
+DEFAULT_AUTO_MARGIN = 0.10
 DEFAULT_IGNORE_PATTERNS = (
     "~$*",
     "*.tmp",
@@ -53,6 +60,10 @@ class AppPaths:
     @property
     def cache_dir(self) -> Path:
         return self.home / "cache"
+
+    @property
+    def model_dir(self) -> Path:
+        return self.cache_dir / "models"
 
 
 def default_home() -> Path:
@@ -118,6 +129,9 @@ class Settings:
     root: str | None = None
     stable_seconds: float = DEFAULT_STABLE_SECONDS
     ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    auto_threshold: float = DEFAULT_AUTO_THRESHOLD
+    auto_margin: float = DEFAULT_AUTO_MARGIN
 
 
 def load_settings(conn: sqlite3.Connection) -> Settings:

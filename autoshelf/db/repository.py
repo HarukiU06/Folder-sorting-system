@@ -119,6 +119,21 @@ def set_file_location(
         )
 
 
+def set_file_content(
+    conn: sqlite3.Connection, file_id: int, *, title: str | None, text_excerpt: str | None
+) -> None:
+    """Store what extraction found: the title and the start of the text (for previews)."""
+    conn.execute(
+        "UPDATE files SET title = ?, text_excerpt = ? WHERE id = ?", (title, text_excerpt, file_id)
+    )
+
+
+def get_file_content(conn: sqlite3.Connection, file_id: int) -> tuple[str | None, str | None]:
+    """Return the stored (title, text_excerpt) of a file."""
+    row = conn.execute("SELECT title, text_excerpt FROM files WHERE id = ?", (file_id,)).fetchone()
+    return (None, None) if row is None else (row["title"], row["text_excerpt"])
+
+
 # --- history ----------------------------------------------------------------
 
 UNDOABLE_ACTIONS = ("move", "rename")

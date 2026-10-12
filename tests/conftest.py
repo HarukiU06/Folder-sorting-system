@@ -27,6 +27,7 @@ def reset_logging() -> Iterator[None]:
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
+    logger.setLevel(logging.NOTSET)
 
 
 @pytest.fixture

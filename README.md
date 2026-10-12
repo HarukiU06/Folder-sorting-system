@@ -5,9 +5,10 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phase 1 is done: a command-line watcher that safely moves new
-> files into `_Inbox/`, with full history and undo. There is no classifier yet (Phase 3), so
-> every new file is treated as "not sure, ask the user" and waits in `_Inbox/`.
+> **Status:** early development. Phases 1–2 are done: a command-line watcher that safely moves
+> new files into `_Inbox/` with full history and undo, and reads each file's text and metadata.
+> There is no classifier yet (Phase 3), so every new file is treated as "not sure, ask the
+> user" and waits in `_Inbox/`.
 
 ## Safety rules
 
@@ -69,6 +70,12 @@ New-Item -ItemType Directory -Force "C:\workspace\AutoShelf-sandbox\Finance"
 .venv\Scripts\python.exe -m autoshelf undo --last 5   # undo the 5 most recent moves
 ```
 
+To see what AutoShelf reads from any file (it only reads, never changes it):
+
+```powershell
+.venv\Scripts\python.exe -m autoshelf extract "C:\workspace\AutoShelf-sandbox\Lecture notes.pdf"
+```
+
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
 unchanged before it is processed. A file you undo is put back where it was and left alone
 from then on. Undo refuses (and changes nothing) if the file has been edited since it was
@@ -76,6 +83,24 @@ moved (`--force` overrides), was moved elsewhere, or if its original folder no l
 
 The log file is `%APPDATA%\AutoShelf\logs\autoshelf.log`. Set `AUTOSHELF_HOME` to use a
 different data folder (handy for experiments).
+
+## What AutoShelf reads
+
+Only the filename and text, never images or audio content (no OCR, no transcription). Up to
+20,000 characters of text are read per file.
+
+| Files | What is read |
+|---|---|
+| PDF | page text, title, author, subject, keywords |
+| Word `.docx`, PowerPoint `.pptx`, Excel `.xlsx` | paragraphs, tables, slides and notes, cells; document properties |
+| EPUB, HTML, RTF, Jupyter `.ipynb` | chapter/page text, titles; notebook cells without outputs |
+| Text, Markdown, CSV, JSON, code | the text (UTF-8, UTF-16, or the Windows code page such as Shift-JIS) |
+| ZIP | the names of the files inside |
+| Audio and video | tags such as title, artist, album |
+| Images | embedded EXIF/PNG text such as title, description, keywords |
+| Anything else | the filename only |
+
+A file that can't be parsed (corrupt, password-protected) is still handled using its name.
 
 ## Development
 

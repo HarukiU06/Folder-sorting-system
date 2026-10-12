@@ -35,6 +35,7 @@ class MoveResult:
     """A completed move."""
 
     history_id: int
+    file_id: int
     src: Path
     dst: Path
 
@@ -125,7 +126,7 @@ def move_file(
     repository.set_history_state(conn, history_id, "done")
     repository.set_file_location(conn, file_id, dst, status_after_move(dst, root, action))
     log.debug("History #%d: %s %s -> %s", history_id, action, source, dst)
-    return MoveResult(history_id=history_id, src=source, dst=dst)
+    return MoveResult(history_id=history_id, file_id=file_id, src=source, dst=dst)
 
 
 def _rename_with_retries(

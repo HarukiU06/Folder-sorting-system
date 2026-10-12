@@ -186,6 +186,8 @@ class WatchService:
             log.info("Left %s where it is: %s", name, outcome.message)
         else:
             log.warning("Could not process %s: %s", name, outcome.message)
+        if outcome.extraction is not None:
+            log.info("  %s", outcome.extraction.summary())
         for duplicate in outcome.duplicates:
             log.info(
                 "  %s is an exact duplicate of %s (flagged only; nothing is deleted)",

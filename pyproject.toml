@@ -16,8 +16,21 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Environment :: Win32 (MS Windows)",
 ]
-# Heavy dependencies (sentence-transformers, PySide6, extractors) are added in the phase that uses them.
-dependencies = ["watchdog>=4.0"]
+# Heavy dependencies (sentence-transformers, PySide6) are added in the phase that uses them.
+dependencies = [
+    "watchdog>=4.0",
+    # text extraction (Phase 2)
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "openpyxl>=3.1",
+    "ebooklib>=0.18",
+    "striprtf>=0.0.26",
+    "beautifulsoup4>=4.12",
+    # text metadata of media files
+    "mutagen>=1.47",
+    "pillow>=10.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
@@ -38,3 +51,4 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["SIM905"]  # long extension lists read better as one split string

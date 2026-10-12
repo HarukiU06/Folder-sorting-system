@@ -69,3 +69,17 @@ def test_undo_last(conn, root: Path, capsys: pytest.CaptureFixture[str]) -> None
 def test_undo_requires_a_target() -> None:
     with pytest.raises(SystemExit):
         main(["undo"])
+
+
+def test_extract_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = make(tmp_path / "PCA_notes.md", "Principal components explain variance.")
+    assert main(["extract", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "Extractor: text" in out
+    assert "Filename:  PCA, notes" in out
+    assert "Principal components explain variance." in out
+
+
+def test_extract_command_missing_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["extract", str(tmp_path / "missing.pdf")]) == 1
+    assert "not a file" in capsys.readouterr().err

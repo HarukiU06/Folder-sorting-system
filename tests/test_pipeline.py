@@ -1,11 +1,12 @@
 from pathlib import Path
 
 import pytest
+import samples
 from helpers import make
 
 from autoshelf.actions.undo import undo
 from autoshelf.db import repository
-from autoshelf.pipeline import OutcomeKind, Pipeline
+from autoshelf.pipeline import TEXT_EXCERPT_CHARS, OutcomeKind, Pipeline
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
 
@@ -123,3 +124,36 @@ def test_inbox_that_is_a_file_fails_cleanly(conn, root: Path, pipeline: Pipeline
     outcome = pipeline.process(src)
     assert outcome.kind is OutcomeKind.FAILED
     assert src.exists()
+
+
+def test_moved_file_stores_title_and_text_excerpt(conn, root: Path, pipeline: Pipeline) -> None:
+    src = samples.docx(
+        root / "report.docx",
+        title="Quarterly report",
+        heading="Budget",
+        paragraph="spending " * 400,
+        cells=["Revenue"],
+    )
+    outcome = pipeline.process(src)
+
+    assert outcome.extraction.title == "Quarterly report"
+    record = repository.get_file_by_path(conn, outcome.dst)
+    title, excerpt = repository.get_file_content(conn, record.id)
+    assert title == "Quarterly report"
+    assert excerpt.startswith("Budget\nspending")
+    assert len(excerpt) == TEXT_EXCERPT_CHARS
+
+
+def test_dry_run_reports_extraction(conn, root: Path) -> None:
+    outcome = Pipeline(conn, root, dry_run=True).process(make(root / "notes.md", "# PCA notes"))
+    assert outcome.extraction.text == "# PCA notes"
+    assert repository.get_file_by_path(conn, root / "notes.md") is None
+
+
+def test_unreadable_pdf_is_still_moved(conn, root: Path, pipeline: Pipeline, caplog) -> None:
+    # Debug logging keeps the parser's traceback alive; that once kept the file locked.
+    caplog.set_level("DEBUG", logger="autoshelf")
+    outcome = pipeline.process(make(root / "scan.pdf", "not really a PDF"))
+    assert outcome.kind is OutcomeKind.MOVED
+    assert outcome.extraction.error
+    assert outcome.extraction.filename_tokens == ("scan",)

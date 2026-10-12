@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     undo_cmd.add_argument(
         "--force", action="store_true", help="undo even if the file changed after it was moved"
     )
+
+    extract_cmd = commands.add_parser("extract", help="show the text AutoShelf reads from a file")
+    extract_cmd.add_argument("file", type=Path, help="any file (it is only read)")
+    extract_cmd.add_argument(
+        "--chars", type=int, default=500, help="how much of the text to print (default 500)"
+    )
     return parser
 
 
@@ -74,7 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
-        handler = {"watch": _cmd_watch, "history": _cmd_history, "undo": _cmd_undo}[args.command]
+        handler = {
+            "watch": _cmd_watch,
+            "history": _cmd_history,
+            "undo": _cmd_undo,
+            "extract": _cmd_extract,
+        }[args.command]
         return handler(args, paths)
     except (ConfigError, MigrationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -143,6 +154,28 @@ def _cmd_undo(args: argparse.Namespace, paths: AppPaths) -> int:
         print("Nothing to undo.")
     for result in results:
         print(_format_undo(result))
+    return 0
+
+
+def _cmd_extract(args: argparse.Namespace, paths: AppPaths) -> int:
+    from autoshelf.extract import extract  # extractor libraries load on first use
+
+    if not args.file.is_file():
+        print(f"error: not a file: {args.file}", file=sys.stderr)
+        return 1
+    result = extract(args.file)
+    print(f"File:      {args.file}")
+    print(f"Extractor: {result.extractor}")
+    print(f"Summary:   {result.summary()}")
+    print(f"Filename:  {', '.join(result.filename_tokens) or '-'}")
+    print(f"Title:     {result.title or '-'}")
+    for key, value in sorted(result.metadata.items()):
+        print(f"{key.capitalize() + ':':<10} {value}")
+    if result.text:
+        shown = result.text[: args.chars]
+        more = len(result.text) - len(shown)
+        print(f"--- text (first {len(shown):,} of {len(result.text):,} chars) ---")
+        print(shown + ("\n..." if more else ""))
     return 0
 
 

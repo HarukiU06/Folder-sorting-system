@@ -42,27 +42,31 @@ launcher as below.
 
 ```powershell
 py -3.13 -m venv .venv
-.venv\Scripts\activate
-pip install -e ".[dev]"
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
+
+The commands below call the venv's Python directly, so they work without activating it.
+(If you do run `.venv\Scripts\Activate.ps1` and PowerShell blocks it, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once; after activating, plain `python`
+works.)
 
 ## Usage
 
 Try it on a throwaway folder first, never on your real files:
 
 ```powershell
-mkdir C:\workspace\AutoShelf-sandbox\Finance
+New-Item -ItemType Directory -Force "C:\workspace\AutoShelf-sandbox\Finance"
 
 # Dry run: watch and report what would happen, without moving anything
-python -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox" --dry-run
+.venv\Scripts\python.exe -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox" --dry-run
 
 # Real run: new files in the root are moved into _Inbox\ (Ctrl+C to stop)
-python -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox"
+.venv\Scripts\python.exe -m autoshelf watch --root "C:\workspace\AutoShelf-sandbox"
 
 # See what happened, and undo it
-python -m autoshelf history
-python -m autoshelf undo 3            # undo history entry #3
-python -m autoshelf undo --last 5     # undo the five most recent moves, newest first
+.venv\Scripts\python.exe -m autoshelf history
+.venv\Scripts\python.exe -m autoshelf undo 3          # undo history entry #3
+.venv\Scripts\python.exe -m autoshelf undo --last 5   # undo the 5 most recent moves
 ```
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
@@ -76,8 +80,8 @@ different data folder (handy for experiments).
 ## Development
 
 ```powershell
-pytest -q                          # run the tests
-ruff check . ; ruff format .       # lint and format
+.venv\Scripts\python.exe -m pytest -q                                   # run the tests
+.venv\Scripts\ruff.exe check . ; .venv\Scripts\ruff.exe format .       # lint and format
 ```
 
 Tests only use temporary folders, never your real files or `%APPDATA%`.

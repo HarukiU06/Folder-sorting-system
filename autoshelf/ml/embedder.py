@@ -137,6 +137,12 @@ def _load_model(model_name: str, cache_dir: Path):
         raise EmbedderError(f"couldn't load the language model {model_name!r}: {exc}") from exc
 
 
+def is_downloaded(model_name: str, cache_dir: Path) -> bool:
+    """True if the model is already in the cache (so loading it needs no download)."""
+    snapshots = cache_dir / ("models--" + model_name.replace("/", "--")) / "snapshots"
+    return snapshots.is_dir() and any(snapshots.iterdir())
+
+
 _loaded: dict[tuple[str, Path], SentenceTransformerEmbedder] = {}
 _loaded_lock = threading.Lock()
 

@@ -155,6 +155,7 @@ def test_status_messages_are_reported(service: AppService) -> None:
     assert service.acquire() and service.start()
     assert ready.wait(TIMEOUT)
     assert messages[0] == "Loading the language model..."
+    assert messages[1].startswith("Downloading the language model (about 470 MB")  # not cached
     assert messages[-1] == "Ready: 2 folders, 1 files in them"
 
 

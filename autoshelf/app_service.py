@@ -28,7 +28,7 @@ from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
-from autoshelf.ml.embedder import Embedder
+from autoshelf.ml.embedder import Embedder, is_downloaded
 from autoshelf.ml.library import LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
 from autoshelf.watcher.ignore import ignore_reason
@@ -47,12 +47,24 @@ def default_loader(model: str, cache_dir: Path) -> Embedder:
     return embedder.load_embedder(model, cache_dir)
 
 
+DOWNLOAD_MESSAGE = (
+    "Downloading the language model (about 470 MB, first run only); new files will be "
+    "sorted when it is ready..."
+)
+
+
 def library_factory(
-    paths: AppPaths, settings: Settings, root: Path, loader: EmbedderLoader = default_loader
+    paths: AppPaths,
+    settings: Settings,
+    root: Path,
+    loader: EmbedderLoader = default_loader,
+    on_status: Callable[[str], None] | None = None,
 ) -> Callable[[sqlite3.Connection], LibraryIndex]:
     """Build ``make_library(conn)`` for a watcher: loads the model where it is called."""
 
     def make_library(conn: sqlite3.Connection) -> LibraryIndex:
+        if on_status is not None and not is_downloaded(settings.embedding_model, paths.model_dir):
+            on_status(DOWNLOAD_MESSAGE)
         embedder = loader(settings.embedding_model, paths.model_dir)
         return LibraryIndex(conn, root, embedder, ignore_patterns=settings.ignore_patterns)
 
@@ -186,7 +198,9 @@ class AppService:
                 self.paths.db_path,
                 stable_seconds=settings.stable_seconds,
                 ignore_patterns=settings.ignore_patterns,
-                make_library=library_factory(self.paths, settings, root, self._loader),
+                make_library=library_factory(
+                    self.paths, settings, root, self._loader, on_status=self._status
+                ),
                 threshold=settings.auto_threshold,
                 margin=settings.auto_margin,
                 paused=settings.paused,

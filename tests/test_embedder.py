@@ -66,3 +66,13 @@ def test_real_model_understands_english_and_japanese() -> None:
     )
     assert float(curry @ recipe) > float(curry @ finance) + 0.2
     assert len(embedder.chunk("word " * 2000)) > 1
+
+
+def test_is_downloaded_looks_for_a_snapshot(tmp_path: Path) -> None:
+    from autoshelf.ml.embedder import is_downloaded
+
+    model = "org/some-model"
+    assert not is_downloaded(model, tmp_path)
+    snapshot = tmp_path / "models--org--some-model" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    assert is_downloaded(model, tmp_path)

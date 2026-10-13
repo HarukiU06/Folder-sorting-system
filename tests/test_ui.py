@@ -627,8 +627,179 @@ def test_main_window_has_every_screen(qtbot, service, runner) -> None:
         "Rules",
         "Tidy up",
         "Dashboard",
+        "Ask",
         "Settings",
     ]
+    assert not window.tabs.isTabVisible(window.tabs.indexOf(window.ask))  # AI is off
+    window.set_ai_enabled(True)
+    assert window.tabs.isTabVisible(window.tabs.indexOf(window.ask))
     for index in range(window.tabs.count()):
         window.tabs.setCurrentIndex(index)
         settle(qtbot, runner)
+
+
+# --- Phase 7: the optional AI -----------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_ai(service, monkeypatch: pytest.MonkeyPatch):
+    from fakes import FakeProvider
+
+    provider = FakeProvider("A short summary.")
+    monkeypatch.setattr(service, "provider", lambda: provider)
+    return provider
+
+
+def test_settings_turn_the_ai_on_and_keep_the_key_safe(
+    qtbot, service, runner, memory_keyring: dict
+) -> None:
+    from autoshelf.llm import secrets
+
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    states: list[bool] = []
+    view.ai_state.connect(states.append)
+    view.load()
+    settle(qtbot, runner)
+    assert states[-1] is False
+    assert view.key_status.text() == "Key: not saved"
+
+    view.ai_provider.setCurrentIndex(view.ai_provider.findData("claude"))
+    assert view.ai_model.currentText() == "claude-opus-5-5"
+    view.ai_model.setCurrentText("claude-haiku-5-5")
+    view._apply_ai()
+    settle(qtbot, runner)
+    assert states[-1] is True
+    settings = service.settings()
+    assert (settings.llm_provider, settings.llm_model) == ("claude", "claude-haiku-5-5")
+
+    view.api_key.setText("sk-ant-secret-9876")
+    view._save_key()
+    settle(qtbot, runner)
+    assert view.api_key.text() == ""
+    assert "saved (...9876)" in view.key_status.text()
+    assert memory_keyring[(secrets.SERVICE, secrets.USERNAME)] == "sk-ant-secret-9876"
+    assert "sk-ant-secret" not in str(service.settings())  # never in the settings
+    view._forget_key()
+    settle(qtbot, runner)
+    assert view.key_status.text() == "Key: not saved"
+
+
+def test_ask_view_shows_answers_with_sources(qtbot, service, runner, fake_ai) -> None:
+    from autoshelf.ui.ask_view import AskView
+
+    service.inbox()  # indexes the library
+    fake_ai.replies = ["Invoices go to Finance [1]."]
+    view = AskView(service, runner)
+    qtbot.addWidget(view)
+    view.question.setText("Where are my invoices?")
+    view.ask()
+    settle(qtbot, runner)
+    text = view.transcript.toPlainText()
+    assert "Invoices go to Finance [1]." in text
+    assert "invoice 2024.txt" in text
+    assert view.history[0].cited == (1,)
+
+
+def test_library_summarizes_and_renames(
+    qtbot, service, runner, shelf: Path, fake_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.library_view import LibraryView
+
+    service.inbox()
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.set_ai_enabled(True)
+    view.query.setText("invoice")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.summarize_button.isVisibleTo(view)
+    view.summarize()
+    settle(qtbot, runner)
+    assert view.summary_text.text() == "Summary: A short summary."
+
+    fake_ai.replies = ["Hosting Invoice 2024"]
+    monkeypatch.setattr(
+        "autoshelf.ui.library_view.QInputDialog.getText",
+        lambda *args, text="", **kwargs: (text, True),
+    )
+    view.rename_file()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "Hosting Invoice 2024.txt").exists()
+
+
+def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None:
+    make(shelf / "_Inbox" / "scan_0034.txt", "Quarterly Report\nrevenue grew")
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    assert view.rename_row.isVisibleTo(view)
+    assert view.rename_label.text().endswith("Quarterly Report.txt")
+    view.rename_button.click()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "_Inbox" / "Quarterly Report.txt").exists()
+
+
+def test_tidy_renames_and_suggests_folders(
+    qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.tidy_view import TidyView
+
+    make(shelf / "_Inbox" / "scan_0001.txt", "Meeting Minutes\nwe met")
+    for number in range(3):
+        make(shelf / "_Inbox" / f"pods {number}.txt", f"kubernetes pods deployment yaml {number}")
+    service.inbox()
+    view = TidyView(service, runner)
+    qtbot.addWidget(view)
+
+    view.renames.refresh()
+    settle(qtbot, runner)
+    assert view.renames.table.item(0, 1).text() == "Meeting Minutes.txt"
+    view.renames.table.selectRow(0)
+    view.renames.rename_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "_Inbox" / "Meeting Minutes.txt").exists()
+
+    view.new_folders.refresh()
+    settle(qtbot, runner)
+    assert view.new_folders.tree.topLevelItemCount() == 1
+    view.new_folders.tree.setCurrentItem(view.new_folders.tree.topLevelItem(0))
+    monkeypatch.setattr(
+        "autoshelf.ui.tidy_view.QInputDialog.getText", lambda *args, **kwargs: ("Kubernetes", True)
+    )
+    view.new_folders.create_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert len(list((shelf / "Kubernetes").iterdir())) == 3
+
+
+def test_study_dialog_makes_and_reviews_cards(
+    qtbot, service, runner, shelf: Path, fake_ai, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.study_dialog import StudyDialog
+
+    service.inbox()
+    fake_ai.replies = ['[{"q": "What is due?", "a": "Tax"}, {"q": "Bank?", "a": "Transfer"}]']
+    dialog = StudyDialog(service, runner, "Finance")
+    qtbot.addWidget(dialog)
+    settle(qtbot, runner)
+    dialog.make_cards()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert dialog.card_text.text() == "Q: What is due?"
+    dialog.flip()
+    assert dialog.card_text.text() == "A: Tax"
+    dialog.next_card()
+    assert dialog.counter.text() == "Card 2 of 2"
+
+    target = tmp_path / "finance cards.csv"
+    monkeypatch.setattr(
+        "autoshelf.ui.study_dialog.QFileDialog.getSaveFileName", lambda *a: (str(target), "")
+    )
+    dialog.export()
+    assert target.read_text(encoding="utf-8").splitlines()[0] == "What is due?,Tax"

@@ -216,6 +216,11 @@ class Settings:
     # ``watched_extensions`` are moved into the root and sorted. None by default.
     watched_folders: list[str] = field(default_factory=list)
     watched_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_WATCHED_EXTENSIONS))
+    # Optional AI ("off", "claude" or "ollama"); the Claude API key is kept in the Windows
+    # Credential Manager, never here. An empty model means the provider's default.
+    llm_provider: str = "off"
+    llm_model: str = ""
+    ollama_url: str = "http://localhost:11434"
 
 
 def load_settings(conn: sqlite3.Connection) -> Settings:

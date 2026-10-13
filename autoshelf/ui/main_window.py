@@ -6,6 +6,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget
 
 from autoshelf.app_service import AppService
+from autoshelf.ui.ask_view import AskView
 from autoshelf.ui.dashboard_view import DashboardView
 from autoshelf.ui.folders_view import FoldersView
 from autoshelf.ui.history_view import HistoryView
@@ -39,6 +40,7 @@ class MainWindow(QMainWindow):
         self.rules = RulesView(service, runner)
         self.tidy = TidyView(service, runner)
         self.dashboard = DashboardView(service, runner)
+        self.ask = AskView(service, runner)
         self.settings = SettingsView(service, runner)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.inbox, "Inbox")
@@ -48,7 +50,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.rules, "Rules")
         self.tabs.addTab(self.tidy, "Tidy up")
         self.tabs.addTab(self.dashboard, "Dashboard")
+        self.tabs.addTab(self.ask, "Ask")
         self.tabs.addTab(self.settings, "Settings")
+        self.tabs.setTabVisible(self.tabs.indexOf(self.ask), False)  # only with AI on
+        self.settings.ai_state.connect(self.set_ai_enabled)
         self.setCentralWidget(self.tabs)
         self.state = QLabel()
         self.statusBar().addPermanentWidget(self.state)
@@ -61,6 +66,13 @@ class MainWindow(QMainWindow):
         self.library.changed.connect(self._after_rules)
         self.tidy.changed.connect(self._after_move)
         self.tabs.currentChanged.connect(self._tab_changed)
+
+    def set_ai_enabled(self, enabled: bool) -> None:
+        """Show the AI features only when an AI provider is chosen in Settings."""
+        self.tabs.setTabVisible(self.tabs.indexOf(self.ask), enabled)
+        self.library.set_ai_enabled(enabled)
+        self.folders.set_ai_enabled(enabled)
+        self.tidy.set_ai_enabled(enabled)
 
     def show_message(self, text: str) -> None:
         """A transient message in the status bar."""

@@ -12,6 +12,7 @@ from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAUL
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
 from autoshelf.extract.filename import filename_tokens
+from autoshelf.features.rename import RenameProposal, is_junk_name, propose_name
 from autoshelf.features.tags import suggest_tags
 from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
 from autoshelf.ml.classifier import Classification
@@ -37,6 +38,7 @@ class InboxItem:
     classification: Classification | None  # None without a classifier
     details: dict | None = None  # why: scores, similar files, shared words (ml.explain)
     tag_suggestions: tuple[str, ...] = ()  # close runner-up folders, offered as tags
+    rename: RenameProposal | None = None  # a better name, for junk names like scan_0034.pdf
 
     @property
     def explanation(self) -> str:
@@ -169,5 +171,6 @@ def inbox_items(
             )
             details = library.explain(classification, extraction, path.name)
         suggestions = tuple(suggest_tags(classification))
-        items.append(InboxItem(path, title, excerpt, classification, details, suggestions))
+        better = propose_name(path, title, excerpt) if is_junk_name(path.name) else None
+        items.append(InboxItem(path, title, excerpt, classification, details, suggestions, better))
     return items

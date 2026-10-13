@@ -157,3 +157,16 @@ CREATE TRIGGER chunks_au AFTER UPDATE OF text ON chunks BEGIN
 END;
 CREATE INDEX file_tags_tag ON file_tags (tag_id);
 """
+
+V5 = """
+-- Study mode (SPEC 5.11): question-and-answer cards made from a file or a folder.
+CREATE TABLE flashcards (
+    id         INTEGER PRIMARY KEY,
+    file_id    INTEGER REFERENCES files (id) ON DELETE SET NULL,
+    folder     TEXT,
+    question   TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX flashcards_folder ON flashcards (folder);
+"""

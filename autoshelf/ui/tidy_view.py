@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -400,8 +401,190 @@ class OrganizePage(QWidget):
         )
 
 
+class RenamePage(QWidget):
+    """Files with meaningless names, with a better name to approve (SPEC section 5.2)."""
+
+    changed = Signal(str)
+
+    def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.runner = runner
+        self._proposals = []
+        self.status = QLabel(
+            "Files with names like scan_0034 or document(3), and a name taken from their "
+            "title or first heading. Nothing is renamed until you approve; renames can be undone."
+        )
+        self.status.setWordWrap(True)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(("Now called", "Rename to", "From its"))
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        scan = QPushButton("Look for meaningless names")
+        scan.clicked.connect(self.refresh)
+        self.ai_button = QPushButton("Ask the AI for a name")
+        self.ai_button.clicked.connect(self.ask_ai)
+        self.ai_button.setVisible(False)
+        rename = QPushButton("Rename selected")
+        rename.clicked.connect(self.rename_selected)
+        buttons = QHBoxLayout()
+        buttons.addWidget(scan)
+        buttons.addStretch(1)
+        buttons.addWidget(self.ai_button)
+        buttons.addWidget(rename)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(buttons)
+
+    def refresh(self) -> None:
+        """Look for junk names (uses what AutoShelf already read; no AI)."""
+        self.runner.run(
+            self.service.rename_suggestions, self._show, lambda exc: self.status.setText(str(exc))
+        )
+
+    def _show(self, proposals) -> None:
+        self._proposals = list(proposals)
+        self.table.setRowCount(len(self._proposals))
+        for row, proposal in enumerate(self._proposals):
+            name = QTableWidgetItem(proposal.path.name)
+            name.setFlags(name.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name.setToolTip(str(proposal.path))
+            source = QTableWidgetItem(proposal.source)
+            source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, name)
+            self.table.setItem(row, 1, QTableWidgetItem(proposal.new_name))  # editable
+            self.table.setItem(row, 2, source)
+        self.status.setText(
+            f"{len(self._proposals)} file(s) could have a better name. Edit a name if you "
+            "like, select rows, then Rename selected."
+            if self._proposals
+            else "No meaningless names found (or no title or heading to use)."
+        )
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+
+    def ask_ai(self) -> None:
+        """Let the AI propose names for the selected files."""
+        for row in self._selected_rows():
+            path = self._proposals[row].path
+
+            def done(proposal, row=row) -> None:
+                if proposal is not None:
+                    self.table.item(row, 1).setText(proposal.new_name)
+                    self.table.item(row, 2).setText("AI")
+
+            self.runner.run(
+                lambda path=path: self.service.propose_name(path, use_ai=True),
+                done,
+                lambda exc: self.status.setText(str(exc)),
+            )
+
+    def rename_selected(self) -> None:
+        """Rename the selected files to the names shown."""
+        jobs = [
+            (self._proposals[row].path, self.table.item(row, 1).text().strip())
+            for row in self._selected_rows()
+        ]
+        if not jobs:
+            self.status.setText("Select the files to rename first.")
+            return
+
+        def run():
+            return [self.service.rename(path, name) for path, name in jobs if name]
+
+        self.runner.run(
+            run,
+            lambda results: (self.changed.emit(f"Renamed {len(results)} file(s)"), self.refresh()),
+            lambda exc: QMessageBox.warning(self, "Couldn't rename", str(exc)),
+        )
+
+
+class NewFoldersPage(QWidget):
+    """Topics in the Inbox that no folder covers yet (SPEC section 5.8)."""
+
+    changed = Signal(str)
+
+    def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.runner = runner
+        self._suggestions = []
+        self.status = QLabel(
+            "Groups of files waiting in the Inbox that look alike but fit none of your "
+            "folders. AutoShelf only creates a folder when you click Create."
+        )
+        self.status.setWordWrap(True)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        scan = QPushButton("Look for new topics")
+        scan.clicked.connect(self.refresh)
+        create = QPushButton("Create folder and move these files...")
+        create.clicked.connect(self.create_selected)
+        buttons = QHBoxLayout()
+        buttons.addWidget(scan)
+        buttons.addStretch(1)
+        buttons.addWidget(create)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(self.tree, 1)
+        layout.addLayout(buttons)
+
+    def refresh(self) -> None:
+        """Group the waiting files in the background."""
+        self.status.setText("Looking at the Inbox...")
+        self.runner.run(
+            self.service.suggest_folders, self._show, lambda exc: self.status.setText(str(exc))
+        )
+
+    def _show(self, suggestions) -> None:
+        self._suggestions = list(suggestions)
+        self.tree.clear()
+        for number, item in enumerate(self._suggestions):
+            words = f"  (words: {', '.join(item.keywords)})" if item.keywords else ""
+            parent = QTreeWidgetItem([f'{len(item.paths)} files look like "{item.name}"{words}'])
+            parent.setData(0, PATH_ROLE, number)
+            for path in item.paths:
+                parent.addChild(QTreeWidgetItem([path.name]))
+            self.tree.addTopLevelItem(parent)
+            parent.setExpanded(True)
+        self.status.setText(
+            f"{len(self._suggestions)} possible new folder(s). Select one and click Create."
+            if self._suggestions
+            else "No new topics: every group of waiting files fits one of your folders."
+        )
+
+    def create_selected(self) -> None:
+        """Ask for the folder's name, create it, and move the group's files into it."""
+        item = self.tree.currentItem()
+        if item is None:
+            return
+        top = item if item.parent() is None else item.parent()
+        suggestion = self._suggestions[top.data(0, PATH_ROLE)]
+        name, ok = QInputDialog.getText(
+            self,
+            "Create a folder",
+            f"Create this folder and move the {len(suggestion.paths)} files into it?",
+            text=suggestion.name,
+        )
+        if not ok or not name.strip():
+            return
+        self.runner.run(
+            lambda: self.service.create_folder(name.strip(), list(suggestion.paths)),
+            lambda result: (
+                self.changed.emit(f"Created {result[0]} and moved {len(result[1])} file(s)"),
+                self.refresh(),
+            ),
+            lambda exc: QMessageBox.warning(self, "Couldn't create the folder", str(exc)),
+        )
+
+
 class TidyView(QWidget):
-    """Duplicates, possible versions and organizing, as three pages."""
+    """Organizing, duplicates, versions, better names and new folders, one page each."""
 
     changed = Signal(str)
 
@@ -410,11 +593,15 @@ class TidyView(QWidget):
         self.duplicates = DuplicatesPage(service, runner)
         self.versions = VersionsPage(service, runner)
         self.organize = OrganizePage(service, runner)
+        self.renames = RenamePage(service, runner)
+        self.new_folders = NewFoldersPage(service, runner)
         self.pages = QTabWidget()
         self.pages.addTab(self.organize, "Organize a folder")
         self.pages.addTab(self.duplicates, "Duplicates")
         self.pages.addTab(self.versions, "Possible versions")
-        for page in (self.duplicates, self.organize):
+        self.pages.addTab(self.renames, "Better names")
+        self.pages.addTab(self.new_folders, "New folders")
+        for page in (self.duplicates, self.organize, self.renames, self.new_folders):
             page.changed.connect(self.changed)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -423,3 +610,7 @@ class TidyView(QWidget):
     def refresh(self) -> None:
         """Reload what is cheap to reload (scans run when asked)."""
         self.organize.refresh()
+
+    def set_ai_enabled(self, enabled: bool) -> None:
+        """Offer AI-made names only when an AI provider is on."""
+        self.renames.ai_button.setVisible(enabled)

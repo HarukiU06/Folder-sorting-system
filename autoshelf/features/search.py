@@ -43,6 +43,16 @@ class SearchHit:
     snippet: str
 
 
+@dataclass(frozen=True)
+class Passage:
+    """A piece of a file's text that matches a question."""
+
+    path: Path
+    folder: str
+    text: str
+    similarity: float
+
+
 @dataclass
 class _Chunks:
     signature: tuple[int, int]
@@ -156,6 +166,40 @@ class SearchIndex:
             )
         hits.sort(key=lambda hit: (hit.keyword, hit.score), reverse=True)
         return hits[:limit]
+
+    def top_chunks(
+        self,
+        conn: sqlite3.Connection,
+        root: Path,
+        embedder: Embedder,
+        query: str,
+        *,
+        count: int = 8,
+        per_file: int = 2,
+    ) -> list[Passage]:
+        """The passages most similar to ``query`` (at most ``per_file`` from one file)."""
+        chunks = self._chunks(conn, embedder.model_id)
+        if not query.strip() or len(chunks.ids) == 0:
+            return []
+        similarities = chunks.matrix @ embedder.embed([query])[0]
+        passages: list[Passage] = []
+        taken: dict[int, int] = {}
+        for index in np.argsort(-similarities).tolist():
+            file_id = int(chunks.file_ids[index])
+            if taken.get(file_id, 0) >= per_file:
+                continue
+            path = Path(chunks.paths[file_id])
+            if zone_of(path, root) not in (Zone.CATEGORY, Zone.INBOX) or not os.path.isfile(path):
+                continue
+            taken[file_id] = taken.get(file_id, 0) + 1
+            passages.append(
+                Passage(
+                    path, folder_label(path, root), chunks.texts[index], float(similarities[index])
+                )
+            )
+            if len(passages) >= count:
+                break
+        return passages
 
     @staticmethod
     def _matching_chunks(

@@ -94,8 +94,11 @@ def upsert_file(
     """Record (or refresh) the file at ``path`` and return its id."""
     existing = get_file_by_path(conn, path)
     if existing is not None:
+        changed = existing.sha256 is not None and sha256 is not None and existing.sha256 != sha256
         conn.execute(
-            "UPDATE files SET sha256 = ?, size = ?, mtime = ? WHERE id = ?",
+            "UPDATE files SET sha256 = ?, size = ?, mtime = ?"
+            + (", summary = NULL" if changed else "")  # the old summary no longer fits
+            + " WHERE id = ?",
             (sha256, size, mtime, existing.id),
         )
         return existing.id
@@ -763,3 +766,60 @@ def corrected_pairs(conn: sqlite3.Connection, limit: int = 10) -> list[tuple[str
         (limit,),
     )
     return [(row[0], row[1], row[2]) for row in rows]
+
+
+# --- flashcards ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Flashcard:
+    """A question and its answer, made from a file (or a folder)."""
+
+    id: int
+    question: str
+    answer: str
+    folder: str | None
+    path: str | None
+
+
+def add_flashcards(
+    conn: sqlite3.Connection,
+    cards: list[tuple[str, str]],
+    *,
+    file_id: int | None,
+    folder: str | None,
+) -> list[int]:
+    """Store (question, answer) cards and return their ids."""
+    ids = []
+    with transaction(conn):
+        for question, answer in cards:
+            cursor = conn.execute(
+                "INSERT INTO flashcards (file_id, folder, question, answer, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (file_id, folder, question, answer, now_iso()),
+            )
+            ids.append(cursor.lastrowid)
+    return ids
+
+
+def list_flashcards(conn: sqlite3.Connection, folder: str | None = None) -> list[Flashcard]:
+    """Cards of one folder (any case; subfolders included), or all cards."""
+    rows = conn.execute(
+        "SELECT c.id, c.question, c.answer, c.folder, f.path FROM flashcards AS c"
+        " LEFT JOIN files AS f ON f.id = c.file_id ORDER BY c.id"
+    )
+    cards = [Flashcard(row[0], row[1], row[2], row[3], row[4]) for row in rows]
+    if folder is None:
+        return cards
+    wanted = folder.casefold()
+    return [
+        card
+        for card in cards
+        if card.folder is not None
+        and (card.folder.casefold() == wanted or card.folder.casefold().startswith(wanted + "/"))
+    ]
+
+
+def delete_flashcards(conn: sqlite3.Connection, card_ids: list[int]) -> None:
+    """Remove cards (they are AutoShelf's own data, not user files)."""
+    conn.executemany("DELETE FROM flashcards WHERE id = ?", [(card_id,) for card_id in card_ids])

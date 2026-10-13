@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -122,9 +123,17 @@ class LibraryView(QWidget):
         open_button.clicked.connect(self.open_file)
         show = QPushButton("Show in Explorer")
         show.clicked.connect(self._show_in_explorer)
+        self.summarize_button = QPushButton("Summarize")
+        self.summarize_button.setToolTip("Ask the AI for a 2-3 sentence summary")
+        self.summarize_button.clicked.connect(self.summarize)
+        self.summarize_button.setVisible(False)
+        rename = QPushButton("Rename...")
+        rename.clicked.connect(self.rename_file)
         buttons = QHBoxLayout()
         buttons.addWidget(open_button)
         buttons.addWidget(show)
+        buttons.addWidget(rename)
+        buttons.addWidget(self.summarize_button)
         buttons.addStretch(1)
 
         self.file_tags = QListWidget()
@@ -288,6 +297,52 @@ class LibraryView(QWidget):
             entry.setToolTip(str(item.path))
             self.related.addItem(entry)
         self.preview.setPlainText(info.excerpt or "")
+
+    def set_ai_enabled(self, enabled: bool) -> None:
+        """Show the AI buttons only when an AI provider is on."""
+        self.ai_enabled = enabled
+        self.summarize_button.setVisible(enabled)
+
+    def summarize(self) -> None:
+        """Ask the AI for a summary of the selected file (cached afterwards)."""
+        info = self._info
+        if info is None:
+            return
+        self.summary_text.setVisible(True)
+        self.summary_text.setText("Summarizing...")
+        self.runner.run(
+            lambda: self.service.summarize(info.path),
+            lambda text: self.summary_text.setText(f"Summary: {text}"),
+            lambda exc: self.summary_text.setText(str(exc)),
+        )
+
+    def rename_file(self) -> None:
+        """Propose a better name (title, heading, or the AI when on); rename if approved."""
+        info = self._info
+        if info is None:
+            return
+        use_ai = getattr(self, "ai_enabled", False)
+
+        def ask(proposal) -> None:
+            current = proposal.new_name if proposal else info.path.name
+            source = f" (from its {proposal.source})" if proposal else ""
+            name, ok = QInputDialog.getText(
+                self, "Rename", f"New name for {info.path.name}{source}:", text=current
+            )
+            if ok and name.strip() and name.strip() != info.path.name:
+                self.runner.run(
+                    lambda: self.service.rename(info.path, name.strip()),
+                    lambda result: (
+                        self.changed.emit(f"Renamed to {result.dst.name} (undo in History)"),
+                        self._show_rows([(result.dst, info.folder or "(root)", "")]),
+                    ),
+                    lambda exc: QMessageBox.warning(self, "Couldn't rename", str(exc)),
+                )
+
+        def failed(exc: Exception) -> None:
+            ask(None)
+
+        self.runner.run(lambda: self.service.propose_name(info.path, use_ai=use_ai), ask, failed)
 
     def _show_suggestions(self, names: list[str]) -> None:
         for button in self.suggested_buttons:

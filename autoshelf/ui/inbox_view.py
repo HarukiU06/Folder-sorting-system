@@ -88,6 +88,15 @@ class InboxView(QWidget):
         self.tag_boxes: list[QCheckBox] = []
         self.tag_row.addStretch(1)
 
+        self.rename_label = QLabel()
+        self.rename_button = QPushButton("Rename")
+        self.rename_button.clicked.connect(self._rename)
+        self.rename_row = QWidget()
+        rename_layout = QHBoxLayout(self.rename_row)
+        rename_layout.setContentsMargins(0, 0, 0, 0)
+        rename_layout.addWidget(self.rename_label, 1)
+        rename_layout.addWidget(self.rename_button)
+
         open_file = QPushButton("Open file")
         open_file.clicked.connect(self._open_file)
         show = QPushButton("Show in Explorer")
@@ -109,6 +118,7 @@ class InboxView(QWidget):
         detail.addWidget(self.name)
         detail.addWidget(self.title)
         detail.addWidget(self.why)
+        detail.addWidget(self.rename_row)
         detail.addSpacing(6)
         detail.addWidget(QLabel("Move it to:"))
         detail.addLayout(self.suggestions)
@@ -249,6 +259,11 @@ class InboxView(QWidget):
             self.tag_row.insertWidget(self.tag_row.count() - 1, box)
             self.tag_boxes.append(box)
         self.tag_label.setVisible(bool(self.tag_boxes))
+        self.rename_row.setVisible(item.rename is not None)
+        if item.rename is not None:
+            self.rename_label.setText(
+                f"Better name (from its {item.rename.source}): {item.rename.new_name}"
+            )
 
     def _move_to_other(self) -> None:
         if self.other.currentText():
@@ -275,6 +290,17 @@ class InboxView(QWidget):
             self.refresh()
 
         self.runner.run(lambda: self.service.assign(path, folder, tags), done, failed)
+
+    def _rename(self) -> None:
+        item = self._current_item()
+        if item is None or item.rename is None:
+            return
+        new_name = item.rename.new_name
+        self.runner.run(
+            lambda: self.service.rename(item.path, new_name),
+            lambda result: (self.moved.emit(f"Renamed to {result.dst.name}"), self.refresh()),
+            lambda exc: QMessageBox.warning(self, "Couldn't rename", str(exc)),
+        )
 
     def _open_file(self) -> None:
         item = self._current_item()

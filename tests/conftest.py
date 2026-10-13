@@ -42,6 +42,45 @@ def no_real_model(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.fixture(autouse=True)
+def memory_keyring() -> Iterator[dict]:
+    """Keep API keys in memory, so tests never touch the Windows Credential Manager."""
+    import keyring
+    from keyring.backend import KeyringBackend
+    from keyring.errors import PasswordDeleteError
+
+    store: dict[tuple[str, str], str] = {}
+
+    class MemoryKeyring(KeyringBackend):
+        priority = 1
+
+        def get_password(self, service, username):
+            return store.get((service, username))
+
+        def set_password(self, service, username, password):
+            store[(service, username)] = password
+
+        def delete_password(self, service, username):
+            if store.pop((service, username), None) is None:
+                raise PasswordDeleteError("not found")
+
+    previous = keyring.get_keyring()
+    keyring.set_keyring(MemoryKeyring())
+    yield store
+    keyring.set_keyring(previous)
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LLM providers must never reach the internet (or a local Ollama) from tests."""
+    from autoshelf.llm import base
+
+    def refuse(request, timeout):
+        raise AssertionError(f"tests must not use the network ({request.full_url})")
+
+    monkeypatch.setattr(base, "_urlopen", refuse)
+
+
+@pytest.fixture(autouse=True)
 def reset_logging() -> Iterator[None]:
     """Close handlers that ``cli.main`` attaches, so log files in temp dirs aren't held open."""
     yield

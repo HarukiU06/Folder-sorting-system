@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from autoshelf import llm
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
@@ -29,8 +30,13 @@ from autoshelf.config import (
 )
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
+from autoshelf.features import ask as ask_features
 from autoshelf.features import duplicates as duplicate_features
+from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
+from autoshelf.features import rename as rename_features
+from autoshelf.features import study as study_features
+from autoshelf.features import summaries as summary_features
 from autoshelf.features import tags as tag_features
 from autoshelf.features.related import Related, related_files
 from autoshelf.features.search import SearchHit, SearchIndex, folder_label
@@ -607,6 +613,201 @@ class AppService:
             item for item in settings.watched_folders if Path(item) != Path(folder)
         ]
         self.save_settings(settings)
+
+    # --- optional AI (off by default) ---------------------------------------------------
+
+    def provider(self) -> llm.Provider | None:
+        """The configured LLM provider, or None while it is off. Raises LLMError."""
+        settings = self.settings()
+        return llm.make_provider(
+            settings.llm_provider, settings.llm_model, ollama_url=settings.ollama_url
+        )
+
+    def _require_provider(self) -> llm.Provider:
+        provider = self.provider()
+        if provider is None:
+            raise llm.LLMError("Turn on an AI provider in Settings first")
+        return provider
+
+    @property
+    def ai_enabled(self) -> bool:
+        """True if an LLM provider is chosen (it may still lack a key)."""
+        return self.settings().llm_provider != llm.OFF
+
+    def save_api_key(self, key: str) -> None:
+        """Keep the Claude API key in the Windows Credential Manager."""
+        from autoshelf.llm import secrets
+
+        secrets.set_api_key(key)
+
+    def forget_api_key(self) -> None:
+        """Remove the saved Claude API key."""
+        from autoshelf.llm import secrets
+
+        secrets.delete_api_key()
+
+    def api_key_status(self) -> str:
+        """ "saved (...abcd)" or "not saved"."""
+        from autoshelf.llm import secrets
+
+        return secrets.masked(secrets.get_api_key())
+
+    def test_ai(self) -> str:
+        """Ask the provider for a one-word reply, to check it works."""
+        provider = self._require_provider()
+        reply = provider.complete(
+            "Reply with the single word OK.", [llm.Message("user", "Are you there?")], max_tokens=16
+        )
+        return f"{provider.name} ({provider.model}) answered: {reply[:60]}"
+
+    def summarize(self, path: Path, *, refresh: bool = False) -> str:
+        """A 2-3 sentence summary of a file (cached; made by the AI when missing)."""
+        provider = self._require_provider()
+        with self._connect() as conn:
+            return summary_features.file_summary(conn, provider, path, refresh=refresh)
+
+    def rename_suggestions(self) -> list[rename_features.RenameProposal]:
+        """Files with junk names and a better name for each (no AI needed)."""
+        from autoshelf.actions.inbox import waiting_files
+        from autoshelf.extract import extract
+
+        root = self._require_root()
+        with self._connect() as conn:
+            proposals = rename_features.rename_suggestions(conn, root)
+        known = {proposal.path for proposal in proposals}
+        for path in waiting_files(root, self.settings().ignore_patterns):
+            if path in known or not rename_features.is_junk_name(path.name):
+                continue
+            extraction = extract(path)  # waiting files AutoShelf hasn't read yet
+            proposal = rename_features.propose_name(path, extraction.title, extraction.text)
+            if proposal is not None:
+                proposals.append(proposal)
+        return proposals
+
+    def propose_name(
+        self, path: Path, *, use_ai: bool = False
+    ) -> rename_features.RenameProposal | None:
+        """A better name for one file, from its title or heading, or from the AI."""
+        from autoshelf.extract import extract
+
+        extraction = extract(path)
+        provider = self._require_provider() if use_ai else None
+        if use_ai:
+            stem = rename_features.clean_stem(
+                rename_features.ask_for_name(provider, path.name, extraction.title, extraction.text)
+            )
+            return rename_features.RenameProposal(path, stem + path.suffix, "AI") if stem else None
+        return rename_features.propose_name(path, extraction.title, extraction.text)
+
+    def rename(self, path: Path, new_name: str) -> MoveResult:
+        """Rename a file the user approved a new name for (undoable)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return rename_features.rename(
+                conn, path, new_name, root=root, before_rename=self._before_rename()
+            )
+
+    def suggest_folders(self) -> list[folder_features.FolderSuggestion]:
+        """Groups of waiting files that no folder covers yet, with a proposed name."""
+        root = self._require_root()
+        settings = self.settings()
+        try:
+            provider = self.provider()
+        except llm.LLMError:
+            provider = None
+        with self._connect() as conn:
+            library = self.library(conn, root)
+            return folder_features.suggest_folders(
+                conn,
+                root,
+                library,
+                provider=provider,
+                threshold=settings.auto_threshold,
+                ignore_patterns=settings.ignore_patterns,
+            )
+
+    def create_folder(self, name: str, files: list[Path] = ()) -> tuple[str, list[MoveResult]]:
+        """Create the folder the user asked for and move ``files`` into it (each undoable)."""
+        root = self._require_root()
+        key = folder_features.create_folder(root, name)
+        log.info("Created the folder %s as you asked", key)
+        moved = [self.assign(path, key) for path in files if path.is_file()]
+        return key, moved
+
+    def ask(
+        self, question: str, history: list[ask_features.Answer] | None = None
+    ) -> ask_features.Answer:
+        """Answer a question from your files, with citations (uses the AI)."""
+        root = self._require_root()
+        provider = self._require_provider()
+        embedder = self._embedder()
+        with self._connect() as conn:
+            return ask_features.ask(
+                conn, root, provider, embedder, self._search_index, question, history
+            )
+
+    def _folder_files(self, folder: str) -> list[tuple[Path, str | None, str | None]]:
+        root = self._require_root()
+        key = resolve_folder(root, folder, self.settings().ignore_patterns)
+        scan = scan_library(root, self.settings().ignore_patterns)
+        files = [
+            item.path
+            for item in scan.files
+            if item.folder == key or item.folder.startswith(key + "/")
+        ]
+        with self._connect() as conn:
+            found = []
+            for path in files:
+                record = repository.get_file_by_path(conn, path)
+                title, excerpt = (
+                    repository.get_file_content(conn, record.id) if record else (None, None)
+                )
+                found.append((path, title, excerpt))
+        return found
+
+    def reading_list(self, folder: str) -> list[study_features.ReadingItem]:
+        """The files of a folder from introductory to advanced (uses the AI)."""
+        provider = self._require_provider()
+        return study_features.reading_list(provider, self._folder_files(folder))
+
+    def make_flashcards(
+        self, *, path: Path | None = None, folder: str | None = None, count: int = 10
+    ) -> list[repository.Flashcard]:
+        """Make cards from one file, or from a whole folder (uses the AI) and keep them."""
+        provider = self._require_provider()
+        root = self._require_root()
+        if path is not None:
+            key = folder_label(path, root) or None
+            with self._connect() as conn:
+                return study_features.cards_for_file(conn, provider, path, key, count)
+        if folder is None:
+            raise ValueError("make_flashcards needs a file or a folder")
+        key = resolve_folder(root, folder, self.settings().ignore_patterns)
+        texts = [
+            "\n".join(part for part in (f"## {path.stem}", title, excerpt) if part)
+            for path, title, excerpt in self._folder_files(key)
+        ]
+        cards = study_features.make_cards(provider, key, "\n\n".join(texts), count)
+        with self._connect() as conn:
+            ids = repository.add_flashcards(
+                conn, [(card.question, card.answer) for card in cards], file_id=None, folder=key
+            )
+            stored = {card.id: card for card in repository.list_flashcards(conn)}
+        return [stored[card_id] for card_id in ids]
+
+    def flashcards(self, folder: str | None = None) -> list[repository.Flashcard]:
+        """Saved cards of a folder (and its subfolders), or all of them."""
+        with self._connect() as conn:
+            return repository.list_flashcards(conn, folder)
+
+    def delete_flashcards(self, card_ids: list[int]) -> None:
+        """Remove cards."""
+        with self._connect() as conn:
+            repository.delete_flashcards(conn, card_ids)
+
+    def export_flashcards(self, cards: list[repository.Flashcard], target: Path) -> int:
+        """Write cards to a new CSV file for Anki (never overwrites a file)."""
+        return study_features.export_csv(cards, target)
 
     # --- rules --------------------------------------------------------------------
 

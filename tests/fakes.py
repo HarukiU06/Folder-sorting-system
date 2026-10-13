@@ -36,3 +36,18 @@ class FakeEmbedder:
 
     def chunk(self, text: str) -> list[str]:
         return split_chars(text, 200)
+
+
+class FakeProvider:
+    """An LLM stand-in: returns canned replies in turn and records what it was sent."""
+
+    name = "Fake AI"
+    model = "fake-llm"
+
+    def __init__(self, *replies: str) -> None:
+        self.replies = list(replies) or ["OK"]
+        self.calls: list[tuple[str, list]] = []
+
+    def complete(self, system, messages, *, max_tokens: int = 2048) -> str:
+        self.calls.append((system, list(messages)))
+        return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]

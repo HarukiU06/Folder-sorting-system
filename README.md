@@ -5,11 +5,12 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–6 are done: a Windows tray app (and a command-line
+> **Status:** early development. Phases 1–7 are done: a Windows tray app (and a command-line
 > tool) that reads each new file and either moves it into the right folder, when it is sure,
 > or into `_Inbox/` for you to decide, with full history and undo. It learns from your
 > corrections, follows your rules, explains every decision, and helps you search and tidy
-> your library.
+> your library. Optional AI features (off by default) add summaries, better names, answers
+> from your files and study tools.
 
 ## Safety rules
 
@@ -81,6 +82,7 @@ start paused so you can look first. AutoShelf then lives in the system tray:
   files and possible versions.
 - **Dashboard:** files per folder, files added per month, how many automatic moves you
   kept, the most corrected folders, and files not opened for six months.
+- **Ask** (only with AI on): questions about your files, answered with citations.
 - **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
   which files to ignore, and other folders to watch (optional, e.g. Downloads).
 
@@ -162,7 +164,23 @@ Searching and tidying up:
 .venv\Scripts\python.exe -m autoshelf versions                      # e.g. report_v2 / report final
 .venv\Scripts\python.exe -m autoshelf stats
 
-.venv\Scripts\python.exe -m autoshelf config --watch "%USERPROFILE%\Downloads"   # opt in a folder to watch
+.venv\Scripts\python.exe -m autoshelf config --watch "$env:USERPROFILE\Downloads"   # opt in a folder to watch
+```
+
+Better names and new folders (no AI needed), and the optional AI:
+
+```powershell
+.venv\Scripts\python.exe -m autoshelf rename-suggestions          # scan_0034.pdf -> its title or first heading
+.venv\Scripts\python.exe -m autoshelf rename "<file>" ["new name"]  # undoable
+.venv\Scripts\python.exe -m autoshelf suggest-folders             # topics in _Inbox without a folder
+.venv\Scripts\python.exe -m autoshelf suggest-folders --create 1  # create it and move those files
+
+.venv\Scripts\python.exe -m autoshelf config --ai claude --api-key  # or: --ai ollama (local), --ai off
+.venv\Scripts\python.exe -m autoshelf summarize "<file>"
+.venv\Scripts\python.exe -m autoshelf ask "What do my notes say about PCA?"
+.venv\Scripts\python.exe -m autoshelf reading-list "Machine Learning"
+.venv\Scripts\python.exe -m autoshelf flashcards "Machine Learning" --count 10
+.venv\Scripts\python.exe -m autoshelf flashcards "Machine Learning" --export cards.csv   # for Anki
 ```
 
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
@@ -263,6 +281,36 @@ rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshe
   already there and subfolders are left alone, the folder must be on the same drive as
   your library (files are only ever moved, never copied and deleted), and undo puts a file
   back where it came from.
+
+## Better names and new folders
+
+- **Better names:** files called `scan_0034.pdf`, `document(3).docx`, `download.pdf` or a
+  UUID get a proposed name from their title or first heading (or, with AI on and if you
+  ask, from the AI). The Inbox shows the proposal next to the file; Tidy up → "Better names"
+  lists all of them. Nothing is renamed until you approve, a name already taken gets
+  ` (2)`, and every rename can be undone in History.
+- **New folders:** when several files waiting in the Inbox are about a topic none of your
+  folders covers, Tidy up → "New folders" proposes one ("3 files look like Kubernetes"),
+  named from the words they share (or by the AI). The folder is created only when you click
+  Create; the files are then moved into it, each move undoable.
+
+## Optional AI (off by default)
+
+In Settings → "AI (optional)" choose **Claude API** (Anthropic; paste your API key, which is
+stored in the Windows Credential Manager, never in a file) or **Ollama** (a model running
+on your own PC, e.g. `ollama pull qwen2.5`). Then:
+
+- **Summarize** a file in the Library (2–3 sentences, cached until the file changes);
+- **Ask** questions about your files: the most relevant passages are sent with your
+  question, and the answer cites them ([1], [2]...), each linking to its file;
+- **Study** a folder (Folders → Study...): a reading list from introductory to advanced,
+  and flashcards to review in the app or export as CSV for Anki;
+- AI-made file names and folder names.
+
+Privacy: with AI on, the text of the files you ask about is sent to the provider (to
+Anthropic's servers for the Claude API; it stays on your PC with Ollama). Sorting never
+uses the AI, and nothing is sent unless you ask for one of the features above. The default
+Claude model is `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` are cheaper.
 
 ## What AutoShelf reads
 

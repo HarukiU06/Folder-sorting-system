@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import getpass
 import logging
 import sqlite3
 import sys
@@ -37,8 +38,12 @@ from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
 from autoshelf.features.duplicates import DuplicateError
+from autoshelf.features.new_folders import FolderNameError
+from autoshelf.features.rename import RenameError
 from autoshelf.features.tags import TagError
 from autoshelf.layout import INBOX_DIRNAME
+from autoshelf.llm.base import LLMError
+from autoshelf.llm.secrets import SecretError
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import explain
 from autoshelf.ml.embedder import EmbedderError
@@ -136,6 +141,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="EXTS",
         help='which new files to take from watched folders, e.g. ".pdf, .docx"',
     )
+    config.add_argument(
+        "--ai", choices=["off", "claude", "ollama"], help="optional AI provider (off by default)"
+    )
+    config.add_argument("--ai-model", metavar="MODEL", help="model name ('' for the default)")
+    config.add_argument("--ollama-url", metavar="URL", help="Ollama server (default localhost)")
+    config.add_argument(
+        "--api-key",
+        action="store_true",
+        help="ask for the Claude API key and keep it in the Windows Credential Manager",
+    )
+    config.add_argument("--forget-api-key", action="store_true", help="remove the saved key")
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
     why.add_argument("id", type=int, help="history entry (see: autoshelf history)")
@@ -210,6 +226,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     with_root(commands.add_parser("stats", help="numbers about your library"))
+
+    # Optional AI (needs `config --ai claude|ollama`)
+    summarize = with_root(commands.add_parser("summarize", help="summarize a file (AI)"))
+    summarize.add_argument("file", type=Path)
+    summarize.add_argument("--refresh", action="store_true", help="make a new summary")
+    with_root(
+        commands.add_parser("rename-suggestions", help="better names for files like scan_0034")
+    )
+    rename = with_root(commands.add_parser("rename", help="rename a file (undoable)"))
+    rename.add_argument("file", type=Path)
+    rename.add_argument("new_name", nargs="?", help="the new name (default: AutoShelf's idea)")
+    rename.add_argument("--ai", action="store_true", help="let the AI propose the name")
+    suggest = with_root(
+        commands.add_parser("suggest-folders", help="topics in _Inbox that need a new folder")
+    )
+    suggest.add_argument(
+        "--create", type=int, metavar="N", help="create suggestion N and move its files there"
+    )
+    ask_cmd = with_root(commands.add_parser("ask", help="ask a question about your files (AI)"))
+    ask_cmd.add_argument("question")
+    reading = with_root(
+        commands.add_parser("reading-list", help="a folder's files, introductory first (AI)")
+    )
+    reading.add_argument("folder")
+    cards = with_root(commands.add_parser("flashcards", help="make, list or export flashcards"))
+    cards.add_argument("target", help="a file, or one of your folders")
+    cards.add_argument("--count", type=int, default=10, help="how many cards to make")
+    cards.add_argument("--list", action="store_true", help="show saved cards; make none")
+    cards.add_argument(
+        "--export", type=Path, metavar="CSV", help="write the folder's saved cards for Anki"
+    )
     return parser
 
 
@@ -257,6 +304,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "versions": _cmd_versions,
             "organize": _cmd_organize,
             "stats": _cmd_stats,
+            "summarize": _cmd_summarize,
+            "rename-suggestions": _cmd_rename_suggestions,
+            "rename": _cmd_rename,
+            "suggest-folders": _cmd_suggest_folders,
+            "ask": _cmd_ask,
+            "reading-list": _cmd_reading_list,
+            "flashcards": _cmd_flashcards,
         }[args.command]
         return handler(args, paths)
     except _NoRoot:
@@ -275,6 +329,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         rule_engine.RuleError,
         TagError,
         DuplicateError,
+        LLMError,
+        SecretError,
+        RenameError,
+        FolderNameError,
+        FileExistsError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -573,8 +632,27 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         if args.watch_extensions is not None:
             settings.watched_extensions = sorted(rule_engine.extensions(args.watch_extensions))
             changed = True
+        if args.ai is not None:
+            settings.llm_provider = args.ai
+            changed = True
+        if args.ai_model is not None:
+            settings.llm_model = args.ai_model.strip()
+            changed = True
+        if args.ollama_url is not None:
+            settings.ollama_url = args.ollama_url.strip()
+            changed = True
         if changed:
             save_settings(conn, settings)
+    if args.api_key:
+        from autoshelf.llm.secrets import set_api_key
+
+        set_api_key(getpass.getpass("Claude API key (input hidden): "))
+        print("Saved the key in the Windows Credential Manager.")
+    if args.forget_api_key:
+        from autoshelf.llm.secrets import delete_api_key
+
+        delete_api_key()
+        print("Removed the saved key.")
     if args.watch is not None or args.unwatch is not None:
         service = AppService(paths)
         if args.watch is not None:
@@ -589,6 +667,12 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
     print(f"Stable seconds:   {settings.stable_seconds:g}")
     print(f"Watched folders:  {', '.join(settings.watched_folders) or '(none)'}")
     print(f"  taking:         {', '.join(settings.watched_extensions) or '(nothing)'}")
+    from autoshelf.llm import PROVIDER_NAMES, default_model
+
+    ai = PROVIDER_NAMES.get(settings.llm_provider, settings.llm_provider)
+    if settings.llm_provider != "off":
+        ai += f", model {settings.llm_model or default_model(settings.llm_provider)}"
+    print(f"AI (optional):    {ai}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(
@@ -884,6 +968,106 @@ def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
         print(f"Not opened in 6+ months: {stats.stale_total} file(s), e.g.:")
         for item in stats.stale[:5]:
             print(f"  {item.last_used:%Y-%m-%d}  {item.path.name}")
+    return 0
+
+
+def _cmd_summarize(args: argparse.Namespace, paths: AppPaths) -> int:
+    summary = _service(args, paths).summarize(args.file.resolve(), refresh=args.refresh)
+    print(summary)
+    return 0
+
+
+def _cmd_rename_suggestions(args: argparse.Namespace, paths: AppPaths) -> int:
+    proposals = _service(args, paths).rename_suggestions()
+    if not proposals:
+        print("No files with meaningless names (or none with a title or heading to use).")
+    for proposal in proposals:
+        print(f"{proposal.path.name}  ->  {proposal.new_name}   (from its {proposal.source})")
+        print(f"    {proposal.path.parent}")
+    if proposals:
+        print('Rename one with: autoshelf rename "<file>" ["new name"]')
+    return 0
+
+
+def _cmd_rename(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    path = args.file.resolve()
+    new_name = args.new_name
+    if new_name is None:
+        proposal = service.propose_name(path, use_ai=args.ai)
+        if proposal is None:
+            print(
+                "error: no better name found; give one: autoshelf rename FILE NAME", file=sys.stderr
+            )
+            return 1
+        new_name = proposal.new_name
+    result = service.rename(path, new_name)
+    print(
+        f"Renamed {result.src.name} -> {result.dst.name} "
+        f"(undo with: autoshelf undo {result.history_id})"
+    )
+    return 0
+
+
+def _cmd_suggest_folders(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    suggestions = service.suggest_folders()
+    if not suggestions:
+        print("No new folder needed: no group of waiting files without a home.")
+        return 0
+    if args.create is not None:
+        if not 1 <= args.create <= len(suggestions):
+            print(f"error: choose a suggestion from 1 to {len(suggestions)}", file=sys.stderr)
+            return 1
+        chosen = suggestions[args.create - 1]
+        key, moved = service.create_folder(chosen.name, list(chosen.paths))
+        print(f"Created {key} and moved {len(moved)} file(s) there (each can be undone).")
+        return 0
+    for number, item in enumerate(suggestions, start=1):
+        print(f"{number}. {len(item.paths)} files look like {item.name!r}: create a folder?")
+        print(f"   words: {', '.join(item.keywords) or '-'}")
+        for path in item.paths:
+            print(f"   - {path.name}")
+    print("Create one with: autoshelf suggest-folders --create N")
+    return 0
+
+
+def _cmd_ask(args: argparse.Namespace, paths: AppPaths) -> int:
+    answer = _service(args, paths).ask(args.question)
+    print(answer.text)
+    shown = answer.cited or tuple(source.number for source in answer.sources)
+    print("\nSources:")
+    for source in answer.sources:
+        if source.number in shown:
+            print(f"  [{source.number}] {source.path}")
+    return 0
+
+
+def _cmd_reading_list(args: argparse.Namespace, paths: AppPaths) -> int:
+    for number, item in enumerate(_service(args, paths).reading_list(args.folder), start=1):
+        print(f"{number:2}. {item.path.name}" + (f"  - {item.reason}" if item.reason else ""))
+    return 0
+
+
+def _cmd_flashcards(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    target = Path(args.target)
+    is_file = target.is_file()
+    if args.list or args.export:
+        folder = None if is_file else resolve_folder(service.root(), args.target)
+        cards = service.flashcards(folder)
+        if args.export:
+            count = service.export_flashcards(cards, args.export)
+            print(f"Wrote {count} card(s) to {args.export} (import it in Anki as CSV).")
+            return 0
+    elif is_file:
+        cards = service.make_flashcards(path=target.resolve(), count=args.count)
+    else:
+        cards = service.make_flashcards(folder=args.target, count=args.count)
+    for card in cards:
+        print(f"Q: {card.question}\nA: {card.answer}\n")
+    if not cards:
+        print("No flashcards yet.")
     return 0
 
 

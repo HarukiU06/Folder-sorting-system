@@ -56,10 +56,15 @@ class FoldersView(QWidget):
 
         open_root = QPushButton("Open in Explorer")
         open_root.clicked.connect(self._open_root)
+        self.study_button = QPushButton("Study...")
+        self.study_button.setToolTip("Reading list and flashcards for the selected folder (AI)")
+        self.study_button.clicked.connect(self.study_selected)
+        self.study_button.setVisible(False)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
         buttons = QHBoxLayout()
         buttons.addWidget(self.status, 1)
+        buttons.addWidget(self.study_button)
         buttons.addWidget(open_root)
         buttons.addWidget(refresh)
 
@@ -106,6 +111,20 @@ class FoldersView(QWidget):
             lambda _: self.saved.emit(f"Saved the description of {key}"),
             self._failed,
         )
+
+    def set_ai_enabled(self, enabled: bool) -> None:
+        """Offer study mode only when an AI provider is on."""
+        self.study_button.setVisible(enabled)
+
+    def study_selected(self) -> None:
+        """Open study mode for the selected folder."""
+        from autoshelf.ui.study_dialog import StudyDialog
+
+        row = self.table.currentRow()
+        if not 0 <= row < len(self._folders):
+            self.status.setText("Select a folder to study first.")
+            return
+        StudyDialog(self.service, self.runner, self._folders[row].key, self).exec()
 
     def _open_root(self) -> None:
         self.runner.run(self.service.root, lambda root: root and open_folder(root))

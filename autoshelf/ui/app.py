@@ -58,6 +58,7 @@ class AutoShelfApp(QObject):
 
     outcome_arrived = Signal(object)  # emitted from the watcher's thread
     status_arrived = Signal(str)
+    learned_arrived = Signal(object)
 
     def __init__(self, service: AppService, *, tray: Tray | None = None) -> None:
         super().__init__()
@@ -77,8 +78,10 @@ class AutoShelfApp(QObject):
 
         service.on_outcome = self.outcome_arrived.emit
         service.on_status = self.status_arrived.emit
+        service.on_learned = self.learned_arrived.emit
         self.outcome_arrived.connect(self._on_outcome)
         self.status_arrived.connect(self._on_status)
+        self.learned_arrived.connect(lambda relocations: self.window.after_learning())
 
         self.tray.open_requested.connect(lambda: self.show_window())
         self.tray.inbox_requested.connect(self._open_inbox_from_tray)

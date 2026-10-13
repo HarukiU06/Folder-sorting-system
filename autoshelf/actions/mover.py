@@ -127,8 +127,10 @@ def move_file(
         repository.set_history_state(conn, history_id, "failed", note=str(exc))
         raise MoveError(f"Could not move {source.name}: {exc}") from exc
 
-    repository.set_history_state(conn, history_id, "done")
+    # The record follows the file before the row is marked done: while the row is pending,
+    # the library knows not to mistake this move for one the user made (actions.learning).
     repository.set_file_location(conn, file_id, dst, status_after_move(dst, root, action))
+    repository.set_history_state(conn, history_id, "done")
     log.debug("History #%d: %s %s -> %s", history_id, action, source, dst)
     return MoveResult(history_id=history_id, file_id=file_id, src=source, dst=dst)
 

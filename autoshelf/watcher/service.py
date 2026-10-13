@@ -4,7 +4,8 @@ import logging
 import os
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable
+import time
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -29,6 +30,9 @@ from autoshelf.watcher.stability import StabilityTracker
 log = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL = 0.5
+# After the user changes something in their folders, the library is rescanned once things
+# have been quiet this long (to learn from files they moved, see actions.learning).
+LEARN_DELAY_SECONDS = 2.0
 _MAX_NOTED_PATHS = 5000
 _PROGRESS_EVERY = 25
 
@@ -65,6 +69,9 @@ class WatchService:
 
     While paused, files that become ready are held, not processed; ``resume`` sorts them.
     ``on_status(message)`` reports progress such as loading the model, from any thread.
+    Changes inside category folders make the worker rescan the library shortly after,
+    so files the user moved between folders (or out of ``_Inbox``, e.g. on the iPhone)
+    are learned from; ``on_learned(relocations)`` reports them.
     """
 
     def __init__(
@@ -82,6 +89,8 @@ class WatchService:
         margin: float = DEFAULT_AUTO_MARGIN,
         paused: bool = False,
         on_status: Callable[[str], None] | None = None,
+        on_learned: Callable[[Sequence], None] | None = None,
+        learn_delay: float = LEARN_DELAY_SECONDS,
     ) -> None:
         self.root = root
         self.db_path = db_path
@@ -95,6 +104,10 @@ class WatchService:
         self.threshold = threshold
         self.margin = margin
         self._on_status = on_status
+        self._on_learned = on_learned
+        self._learn_delay = learn_delay
+        self._changed_at: float | None = None
+        self._changed_lock = threading.Lock()
         self._stop = threading.Event()
         self._paused = threading.Event()
         if paused:
@@ -160,6 +173,7 @@ class WatchService:
         zone = zone_of(path, self.root)
         if zone is Zone.CATEGORY:
             self._note_once(path, "inside a category folder: kept there as an example")
+            self._library_changed()
             return
         if zone not in PROCESSED_ZONES:
             return
@@ -177,6 +191,18 @@ class WatchService:
         self.tracker.discard(path)
         with self._held_lock:
             self._held.discard(path)
+
+    def _library_changed(self) -> None:
+        with self._changed_lock:
+            self._changed_at = time.monotonic()
+
+    def _library_refresh_due(self) -> bool:
+        """True once (per burst of changes) when the folders have been quiet for a moment."""
+        with self._changed_lock:
+            if self._changed_at is None or time.monotonic() - self._changed_at < self._learn_delay:
+                return False
+            self._changed_at = None
+            return True
 
     def _settle_history(self) -> None:
         conn = open_database(self.db_path)
@@ -225,7 +251,31 @@ class WatchService:
         if stats.folders == 0:
             log.info("No folders yet: create folders in the root and new files will be sorted")
         self._status(f"Ready: {stats.folders} folders, {stats.files} files in them")
+        self._report_learned(stats.relocations)
         return library
+
+    def _relearn(self, library: LibraryIndex | None) -> None:
+        """Rescan the folders after the user changed them, and learn from their moves."""
+        if library is None:
+            return
+        try:
+            stats = library.refresh()
+        except Exception:
+            log.exception("Couldn't rescan your folders")
+            return
+        self._report_learned(stats.relocations)
+
+    def _report_learned(self, relocations: Sequence) -> None:
+        learned = [item for item in relocations if item.correction_id is not None]
+        if learned:
+            names = ", ".join(f"{item.new_path.name} -> {item.to_folder}" for item in learned[:3])
+            more = f" and {len(learned) - 3} more" if len(learned) > 3 else ""
+            self._status(f"Learned from your moves: {names}{more}")
+        if relocations and self._on_learned is not None:
+            try:
+                self._on_learned(list(relocations))
+            except Exception:
+                log.exception("Learned callback failed")
 
     def _index_progress(self, done: int, total: int) -> None:
         if done == total or done % _PROGRESS_EVERY == 0:
@@ -263,6 +313,8 @@ class WatchService:
                         self._report(pipeline.process(path))
                     except Exception:
                         log.exception("Error while reporting on %s; still watching", path)
+                if self._library_refresh_due():
+                    self._relearn(pipeline.library)
         finally:
             conn.close()
 

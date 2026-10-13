@@ -117,3 +117,18 @@ CREATE TABLE file_vectors (
     vector  BLOB    NOT NULL
 );
 """
+
+V3 = """
+-- A correction keeps the vector of the corrected file (made by ``model``), so it still
+-- counts after the file is edited, renamed or deleted. ``history_id`` is the decision
+-- that was corrected, if there was one.
+-- ``suggestion`` is the folder AutoShelf last chose or suggested for a file: what a
+-- correction corrects.
+ALTER TABLE files ADD COLUMN suggestion TEXT;
+ALTER TABLE corrections ADD COLUMN vector BLOB;
+ALTER TABLE corrections ADD COLUMN model TEXT;
+ALTER TABLE corrections ADD COLUMN history_id INTEGER REFERENCES history (id);
+CREATE INDEX corrections_file ON corrections (file_id);
+CREATE INDEX history_file ON history (file_id);
+CREATE INDEX files_size ON files (size);
+"""

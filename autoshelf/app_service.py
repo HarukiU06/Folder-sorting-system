@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from autoshelf.actions import learning
+from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
 from autoshelf.actions.inbox import InboxItem, assign, inbox_items, resolve_folder
 from autoshelf.actions.mover import BeforeRename, MoveResult
@@ -85,6 +87,16 @@ class FolderInfo:
     description: str
 
 
+@dataclass(frozen=True)
+class RuleTest:
+    """What the rules (or, failing them, the classifier) would do with a file."""
+
+    path: Path
+    rule: repository.RuleRecord | None
+    target: str | None  # the folder it would go to; None: it would wait in _Inbox
+    message: str
+
+
 class AppService:
     """Owns the watcher for the app's lifetime and performs the user's actions."""
 
@@ -96,6 +108,7 @@ class AppService:
         self._service_lock = threading.RLock()
         self.on_outcome: Callable[[Outcome], None] | None = None
         self.on_status: Callable[[str], None] | None = None
+        self.on_learned: Callable[[list[learning.Relocation]], None] | None = None
 
     # --- settings -----------------------------------------------------------------
 
@@ -206,6 +219,7 @@ class AppService:
                 paused=settings.paused,
                 on_outcome=self._outcome,
                 on_status=self._status,
+                on_learned=self._learned,
             )
             service.start()
             self._service = service
@@ -243,6 +257,10 @@ class AppService:
     def _status(self, message: str) -> None:
         if self.on_status is not None:
             self.on_status(message)
+
+    def _learned(self, relocations: list[learning.Relocation]) -> None:
+        if self.on_learned is not None:
+            self.on_learned(relocations)
 
     def _before_rename(self) -> BeforeRename | None:
         """Tell the running watcher about the app's own moves, so it ignores them."""
@@ -341,6 +359,101 @@ class AppService:
         with self._connect() as conn:
             repository.set_folder_description(conn, key, description.strip())
         return key
+
+    # --- learning -----------------------------------------------------------------
+
+    def correct(self, history_id: int, folder: str) -> MoveResult:
+        """Move a file that AutoShelf sorted into the right folder, and learn from it."""
+        root = self._require_root()
+        key = resolve_folder(root, folder, self.settings().ignore_patterns)
+        with self._connect() as conn:
+            return learning.correct(
+                conn, history_id, key, root=root, before_rename=self._before_rename()
+            )
+
+    def corrections(self) -> list:
+        """Every recorded correction, oldest first."""
+        with self._connect() as conn:
+            return repository.list_corrections(conn)
+
+    # --- rules --------------------------------------------------------------------
+
+    def rules(self) -> list[repository.RuleRecord]:
+        """The rules in the order they are checked."""
+        with self._connect() as conn:
+            return repository.list_rules(conn)
+
+    def _checked_rule(self, name: str, kind: str, pattern: str, target: str) -> str:
+        """Validate a rule and return the key of its (existing) folder."""
+        rule_engine.check_rule(name, kind, pattern)
+        root = self._require_root()
+        return resolve_folder(root, target, self.settings().ignore_patterns)
+
+    def add_rule(
+        self, name: str, kind: str, pattern: str, target: str, *, enabled: bool = True
+    ) -> repository.RuleRecord:
+        """Add a rule after the existing ones. Raises RuleError or AssignError if invalid."""
+        key = self._checked_rule(name, kind, pattern, target)
+        with self._connect() as conn:
+            rule_id = repository.insert_rule(
+                conn,
+                name=name.strip(),
+                kind=kind,
+                pattern=pattern.strip(),
+                target_folder=key,
+                enabled=enabled,
+            )
+            return repository.get_rule(conn, rule_id)
+
+    def update_rule(self, rule: repository.RuleRecord) -> repository.RuleRecord:
+        """Save changes to a rule (validated like a new one)."""
+        key = self._checked_rule(rule.name, rule.kind, rule.pattern, rule.target_folder)
+        updated = replace(
+            rule, name=rule.name.strip(), pattern=rule.pattern.strip(), target_folder=key
+        )
+        with self._connect() as conn:
+            repository.update_rule(conn, updated)
+        return updated
+
+    def set_rule_enabled(self, rule_id: int, enabled: bool) -> None:
+        """Switch a rule on or off."""
+        with self._connect() as conn:
+            rule = repository.get_rule(conn, rule_id)
+            if rule is not None:
+                repository.update_rule(conn, replace(rule, enabled=enabled))
+
+    def delete_rule(self, rule_id: int) -> None:
+        """Remove a rule."""
+        with self._connect() as conn:
+            repository.delete_rule(conn, rule_id)
+
+    def move_rule(self, rule_id: int, offset: int) -> None:
+        """Move a rule earlier (negative ``offset``) or later in the checking order."""
+        with self._connect() as conn:
+            ids = [rule.id for rule in repository.list_rules(conn)]
+            if rule_id not in ids:
+                return
+            index = ids.index(rule_id)
+            new_index = max(0, min(len(ids) - 1, index + offset))
+            ids.insert(new_index, ids.pop(index))
+            repository.reorder_rules(conn, ids)
+
+    def test_rules(self, path: Path) -> RuleTest:
+        """Which rule would handle ``path`` (the file is only read, never moved)."""
+        from autoshelf.extract import extract
+
+        extraction = extract(path)
+        with self._connect() as conn:
+            rules = repository.list_rules(conn, enabled_only=True)
+        match = rule_engine.first_match(rules, path, extraction)
+        if match is not None:
+            rule = match.rule
+            message = (
+                f"Rule {rule.name!r} matches ({match.match}): it would go to {rule.target_folder}"
+            )
+            return RuleTest(path, rule, rule.target_folder, message)
+        message = "No rule matches this file; AutoShelf would decide by its content."
+        return RuleTest(path, None, None, message)
 
 
 def _is_waiting(conn: sqlite3.Connection, path: Path) -> bool:

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from fakes import FakeEmbedder
 from helpers import make
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from autoshelf.app_service import AppService
@@ -382,3 +383,102 @@ def test_later_launches_and_tools_can_show_or_quit_the_app(
     qtbot.waitUntil(lambda: quits == [True], timeout=WAIT_MS)
     server.close()
     assert not send(app_module.SHOW_COMMAND)
+
+
+# --- Phase 5: "Why here?", corrections and rules -------------------------------------------
+
+
+def test_history_shows_why_and_corrects_a_move(
+    qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = make(shelf / "_Inbox" / "bread.txt", "flour")
+    service.assign(src, "Finance")  # the wrong folder
+    view = HistoryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    view.table.selectRow(0)
+    assert "You chose" in view.why.toPlainText()
+    assert view.correct_button.isEnabled()
+
+    monkeypatch.setattr(
+        "autoshelf.ui.history_view.QInputDialog.getItem", lambda *args: ("Recipes", True)
+    )
+    with qtbot.waitSignal(view.undone, timeout=WAIT_MS) as moved:
+        view.correct_selected()
+        settle(qtbot, runner)
+    assert moved.args == ["Moved bread.txt to Recipes; AutoShelf will remember"]
+    assert (shelf / "Recipes" / "bread.txt").exists()
+    settle(qtbot, runner)
+    assert view.table.item(0, 4).text() == "You corrected #1"
+    assert service.corrections()[-1]["source"] == "undo"
+
+
+def test_inbox_explains_its_suggestions(qtbot, service, runner, shelf: Path) -> None:
+    make(shelf / "_Inbox" / "tax invoice.txt", "invoice tax bank")
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    text = view.why_panel.toPlainText()
+    assert "Best folders" in text
+    assert "Words in common with Finance" in text
+    assert "invoice 2024.txt" in text  # the most similar file
+
+
+def test_rules_view_adds_toggles_tests_and_deletes(
+    qtbot, service, runner, shelf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.rules_view import RuleDialog, RulesView
+
+    view = RulesView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    assert "No rules yet" in view.status.text()
+
+    monkeypatch.setattr(RuleDialog, "exec", lambda self: RuleDialog.DialogCode.Accepted)
+    monkeypatch.setattr(
+        RuleDialog, "values", lambda self: ("Invoices", "name", "invoice", "Finance", True)
+    )
+    with qtbot.waitSignal(view.changed, timeout=WAIT_MS):
+        view.add_rule()
+        settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.table.rowCount() == 1
+    assert view.table.item(0, 2).text() == "file name matches /invoice/"
+
+    view.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    settle(qtbot, runner)
+    assert not service.rules()[0].enabled
+    view.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    settle(qtbot, runner)
+
+    sample = make(tmp_path / "invoice 9.txt", "x")
+    monkeypatch.setattr(
+        "autoshelf.ui.rules_view.QFileDialog.getOpenFileName", lambda *args: (str(sample), "")
+    )
+    view.test_file()
+    settle(qtbot, runner)
+    assert "Rule 'Invoices' matches" in view.status.text()
+
+    view.table.selectRow(0)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    view.delete_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.table.rowCount() == 0
+    assert service.rules() == []
+
+
+def test_rule_dialog_offers_folders_and_kinds(qtbot) -> None:
+    from autoshelf.ui.rules_view import RuleDialog
+
+    dialog = RuleDialog(["Finance", "Recipes"])
+    qtbot.addWidget(dialog)
+    dialog.name.setText("Notebooks")
+    dialog.kind.setCurrentIndex(dialog.kind.findData("extension"))
+    dialog.pattern.setText(".ipynb")
+    dialog.target.setCurrentText("Recipes")
+    assert dialog.values() == ("Notebooks", "extension", ".ipynb", "Recipes", True)
+    assert "extensions" in dialog.hint.text()

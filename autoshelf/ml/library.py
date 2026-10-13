@@ -4,13 +4,16 @@ Files the user keeps in category folders are the classifier's labelled examples.
 ``LibraryIndex`` holds a vector for each of them, kept in step with the disk: every
 ``refresh`` rescans the folders (cheap), but only reads and embeds files that are new
 or changed. Vectors are cached in the database, so a restart doesn't recompute them.
+A new file that turns out to be a known file the user moved is adopted instead (see
+``actions.learning``), which is how corrections made in Explorer or on the iPhone are
+learned.
 """
 
 import logging
 import os
 import sqlite3
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -22,8 +25,10 @@ from autoshelf.extract import FILENAME_ONLY, Extraction, extract
 from autoshelf.extract.filename import filename_tokens, name_tokens
 from autoshelf.fsutil import is_online_only, sha256_file
 from autoshelf.layout import RESERVED_PREFIX
+from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification, FolderProfile, choose, score_folders
 from autoshelf.ml.embedder import Embedder
+from autoshelf.ml.learned import Example, adjustments
 from autoshelf.ml.vectors import document_vector, from_blob, to_blob
 from autoshelf.watcher.ignore import matching_pattern
 
@@ -150,6 +155,7 @@ class RefreshStats:
     files: int
     embedded: int
     unreadable: int
+    relocations: tuple = ()  # actions.learning.Relocation: files the user moved
 
 
 def store_content(conn: sqlite3.Connection, file_id: int, extraction: Extraction) -> None:
@@ -198,6 +204,8 @@ class LibraryIndex:
         self.folders: tuple[str, ...] = ()
         self._entries: dict[Path, IndexedFile] = {}
         self._profile_vectors: dict[str, np.ndarray] = {}
+        self._examples: list[Example] = []
+        self._documents: dict[str, str] | None = None
 
     @property
     def model(self) -> str:
@@ -235,15 +243,76 @@ class LibraryIndex:
     ) -> Classification:
         """Score every folder for ``vector`` and decide (see ``classifier.choose``).
 
+        Folders that similar files were moved away from score lower (``ml.learned``).
         ``exclude`` keeps a file that is already in a folder from matching itself.
         """
-        scores = score_folders(vector, self.profiles(), exclude=exclude)
-        return choose(scores, threshold, margin)
+        learned = adjustments(vector, self._examples)
+        scores = score_folders(
+            vector,
+            self.profiles(),
+            adjustments={key.casefold(): item.amount for key, item in learned.items()},
+            exclude=exclude,
+        )
+        return replace(choose(scores, threshold, margin), learned=learned)
+
+    def explain(
+        self,
+        classification: Classification,
+        extraction: Extraction,
+        name: str,
+        folder: str | None = None,
+    ) -> dict:
+        """The stored "why" of a decision: scores, similar files, shared words, learning.
+
+        Words are compared with ``folder``, else the chosen folder, else the best one.
+        """
+        focus = folder
+        if focus is None and classification.choice is not None:
+            focus = classification.choice.folder
+        if focus is None and classification.scores:
+            focus = classification.scores[0].folder
+        keywords: list[str] = []
+        if focus is not None:
+            documents = self.folder_documents()
+            file_text = explain.join_texts(
+                [
+                    " ".join(extraction.filename_tokens) or name,
+                    extraction.title or "",
+                    extraction.text,
+                ]
+            )
+            keywords = explain.shared_keywords(
+                file_text, documents.get(focus, ""), list(documents.values())
+            )
+        return explain.decision_details(
+            classification, keywords=keywords, learned=classification.learned, folder=focus
+        )
+
+    def folder_documents(self) -> dict[str, str]:
+        """Text describing each folder: name, description, and its files' names and text."""
+        if self._documents is None:
+            descriptions = repository.folder_descriptions(self.conn)
+            texts = {
+                key: [profile_text(key, descriptions.get(key.casefold(), ""))]
+                for key in self.folders
+            }
+            for entry in self._entries.values():
+                title, excerpt = self._content(entry.path)
+                words = " ".join(filename_tokens(entry.path.name))
+                for key in _self_and_parents(entry.folder):
+                    if key in texts:
+                        texts[key].extend(part for part in (words, title, excerpt) if part)
+            self._documents = {key: explain.join_texts(parts) for key, parts in texts.items()}
+        return self._documents
+
+    def _content(self, path: Path) -> tuple[str | None, str | None]:
+        record = repository.get_file_by_path(self.conn, path)
+        return repository.get_file_content(self.conn, record.id) if record else (None, None)
 
     def refresh(self, progress: Callable[[int, int], None] | None = None) -> RefreshStats:
         """Rescan the folders, embedding files that are new or changed since last time.
 
-        ``progress(done, total)`` is called after each file that had to be embedded.
+        ``progress(done, total)`` is called after each file that had to be looked at.
         """
         scan = scan_library(self.root, self.ignore_patterns)
         entries: dict[Path, IndexedFile] = {}
@@ -255,9 +324,18 @@ class LibraryIndex:
             else:
                 stale.append(item)
 
-        unreadable = 0
+        unreadable = embedded = 0
+        relocations = []
         for done, item in enumerate(stale, start=1):
-            entry = self._embed(item)
+            digest = None if item.online_only else _hash_or_none(item.path)
+            relocation = self._adopt(item, digest)
+            entry = None
+            if relocation is not None:
+                relocations.append(relocation)
+                entry = self._stored_entry(item)  # moved as it was: its vector still fits
+            if entry is None or not entry.is_current(item):
+                entry = self._embed(item, digest)
+                embedded += entry is not None
             if entry is None:
                 unreadable += 1
             else:
@@ -267,12 +345,45 @@ class LibraryIndex:
 
         self.folders = scan.folders
         self._entries = entries
+        self._examples = self._load_examples()
+        self._documents = None
         return RefreshStats(
             folders=len(scan.folders),
             files=len(entries),
-            embedded=len(stale) - unreadable,
+            embedded=embedded,
             unreadable=unreadable,
+            relocations=tuple(relocations),
         )
+
+    def _adopt(self, item: LibraryFile, digest: str | None):
+        """If ``item`` is a known file the user moved here, take over its record."""
+        if repository.get_file_by_path(self.conn, item.path) is not None:
+            return None  # known at this path already: it just changed
+        from autoshelf.actions.learning import adopt_moved_file  # actions build on ml
+
+        try:
+            return adopt_moved_file(
+                self.conn,
+                self.root,
+                item.path,
+                size=item.size,
+                online_only=item.online_only,
+                digest=digest,
+            )
+        except sqlite3.Error:
+            log.exception("Couldn't check whether %s was moved", item.path)
+            return None
+
+    def _load_examples(self) -> list[Example]:
+        return [
+            Example(
+                item.from_folder,
+                item.to_folder,
+                from_blob(item.vector),
+                Path(item.path).name if item.path else "",
+            )
+            for item in repository.learning_examples(self.conn, self.model)
+        ]
 
     def files_in(self, folder: str) -> list[IndexedFile]:
         """Indexed files in ``folder`` and its subfolders."""
@@ -329,7 +440,7 @@ class LibraryIndex:
             from_blob(stored.vector),
         )
 
-    def _embed(self, item: LibraryFile) -> IndexedFile | None:
+    def _embed(self, item: LibraryFile, digest: str | None = None) -> IndexedFile | None:
         """Read and embed one file (by name only if it is online-only) and store it."""
         try:
             if item.online_only:
@@ -337,7 +448,7 @@ class LibraryIndex:
                 extraction = Extraction(FILENAME_ONLY, tuple(filename_tokens(item.path.name)))
                 digest, source = None, NAME_ONLY
             else:
-                digest, source = sha256_file(item.path), CONTENT
+                digest, source = digest or sha256_file(item.path), CONTENT
                 extraction = self.extractor(item.path)
         except OSError as exc:
             log.warning("Couldn't read %s for the index: %s", item.path, exc)
@@ -359,3 +470,16 @@ class LibraryIndex:
                 source=source,
             )
         return IndexedFile(item.path, item.folder, item.size, item.mtime, source, vector)
+
+
+def _self_and_parents(key: str) -> list[str]:
+    """ "A/B/C" -> ["A/B/C", "A/B", "A"]: a file also describes the folders above it."""
+    parts = key.split("/")
+    return ["/".join(parts[:size]) for size in range(len(parts), 0, -1)]
+
+
+def _hash_or_none(path: Path) -> str | None:
+    try:
+        return sha256_file(path)
+    except OSError:
+        return None

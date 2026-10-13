@@ -1,4 +1,4 @@
-"""The main window: Inbox, History, Folders and Settings tabs."""
+"""The main window: Inbox, History, Folders, Rules and Settings tabs."""
 
 from pathlib import Path
 
@@ -10,6 +10,7 @@ from autoshelf.ui.folders_view import FoldersView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
+from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.tasks import TaskRunner
 
@@ -31,11 +32,13 @@ class MainWindow(QMainWindow):
         self.inbox = InboxView(service, runner)
         self.history = HistoryView(service, runner)
         self.folders = FoldersView(service, runner)
+        self.rules = RulesView(service, runner)
         self.settings = SettingsView(service, runner)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.inbox, "Inbox")
         self.tabs.addTab(self.history, "History")
         self.tabs.addTab(self.folders, "Folders")
+        self.tabs.addTab(self.rules, "Rules")
         self.tabs.addTab(self.settings, "Settings")
         self.setCentralWidget(self.tabs)
         self.state = QLabel()
@@ -45,6 +48,7 @@ class MainWindow(QMainWindow):
         self.inbox.count_changed.connect(self._show_count)
         self.history.undone.connect(self._after_move)
         self.folders.saved.connect(self._after_description)
+        self.rules.changed.connect(self._after_rules)
         self.tabs.currentChanged.connect(self._tab_changed)
 
     def show_message(self, text: str) -> None:
@@ -70,7 +74,14 @@ class MainWindow(QMainWindow):
         self.inbox.refresh()
         self.history.refresh()
         self.folders.refresh()
+        self.rules.refresh()
         self.settings.load()
+
+    def after_learning(self) -> None:
+        """The user moved files in their folders (e.g. answered the Inbox on the iPhone)."""
+        self.inbox.refresh()
+        self.history.refresh()
+        self.folders.refresh()
 
     def _after_move(self, message: str) -> None:
         self.show_message(message)
@@ -81,6 +92,10 @@ class MainWindow(QMainWindow):
     def _after_description(self, message: str) -> None:
         self.show_message(message)
         self.inbox.refresh()  # suggestions depend on descriptions
+
+    def _after_rules(self, message: str) -> None:
+        if message:
+            self.show_message(message)
 
     def _show_count(self, count: int) -> None:
         self.tabs.setTabText(
@@ -93,6 +108,8 @@ class MainWindow(QMainWindow):
             self.history.refresh()
         elif widget is self.folders:
             self.folders.refresh()
+        elif widget is self.rules:
+            self.rules.refresh()
         elif widget is self.settings:
             self.settings.load()
 

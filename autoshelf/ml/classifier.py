@@ -8,16 +8,18 @@ A folder's score mixes two cosine similarities with the file's vector:
   (subfolders included).
 
 Neighbours get more weight as a folder fills up, so an empty folder is judged by its
-name and description alone. The decision rule is in ``choose``.
+name and description alone. Corrections can lower a folder's score (``ml.learned``).
+The decision rule is in ``choose``.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD
+from autoshelf.ml.learned import Adjustment
 
 NEIGHBORS = 3  # k in the top-k mean of neighbour similarities
 FULL_POOL = 3  # files a folder needs before its neighbours get their full weight
@@ -51,6 +53,17 @@ class FolderScore:
     profile_similarity: float
     neighbor_similarity: float | None = None
     neighbors: tuple[Neighbor, ...] = ()
+    learned: float = 0.0  # added from past corrections (zero or negative)
+
+    def to_details(self) -> dict:
+        """A JSON-ready summary: the score and the parts it was made of."""
+        details = {"folder": self.folder, "score": round(self.score, 4)}
+        details["name"] = round(self.profile_similarity, 4)
+        if self.neighbor_similarity is not None:
+            details["files"] = round(self.neighbor_similarity, 4)
+        if self.learned:
+            details["learned"] = round(self.learned, 4)
+        return details
 
 
 @dataclass(frozen=True)
@@ -62,6 +75,7 @@ class Classification:
     explanation: str
     threshold: float = DEFAULT_AUTO_THRESHOLD
     margin: float = DEFAULT_AUTO_MARGIN
+    learned: Mapping[str, Adjustment] = field(default_factory=dict)  # penalties, by folder
 
     def top(self, count: int = 3) -> tuple[FolderScore, ...]:
         """The ``count`` best-scoring folders."""
@@ -70,36 +84,41 @@ class Classification:
     def to_details(self) -> dict:
         """A JSON-ready summary for the history table."""
         return {
-            "candidates": [
-                {"folder": item.folder, "score": round(item.score, 4)} for item in self.top()
-            ],
+            "candidates": [item.to_details() for item in self.top()],
+            "choice": self.choice.folder if self.choice else None,
             "explanation": self.explanation,
         }
+
+    def score_of(self, folder: str) -> FolderScore | None:
+        """The score of one folder (any case)."""
+        wanted = folder.casefold()
+        return next((item for item in self.scores if item.folder.casefold() == wanted), None)
 
 
 def score_folders(
     vector: np.ndarray,
     profiles: Iterable[FolderProfile],
     *,
-    boosts: Mapping[str, float] | None = None,
+    adjustments: Mapping[str, float] | None = None,
     exclude: Path | None = None,
 ) -> list[FolderScore]:
     """Score every folder for ``vector``, best first.
 
-    ``boosts`` adds a per-folder amount (learned from corrections in Phase 5).
-    ``exclude`` leaves one file out of the neighbour pools, so a file already in a
-    folder can be classified without matching itself.
+    ``adjustments`` adds a per-folder amount, keyed by casefolded folder key (learned
+    from corrections). ``exclude`` leaves one file out of the neighbour pools, so a file
+    already in a folder can be classified without matching itself.
     """
-    boosts = boosts or {}
+    adjustments = adjustments or {}
     scores = [
-        _score(vector, profile, boosts.get(profile.key, 0.0), exclude) for profile in profiles
+        _score(vector, profile, adjustments.get(profile.key.casefold(), 0.0), exclude)
+        for profile in profiles
     ]
     scores.sort(key=lambda item: item.score, reverse=True)
     return scores
 
 
 def _score(
-    vector: np.ndarray, profile: FolderProfile, boost: float, exclude: Path | None
+    vector: np.ndarray, profile: FolderProfile, learned: float, exclude: Path | None
 ) -> FolderScore:
     profile_similarity = float(profile.vector @ vector)
     pool, paths = profile.pool, profile.pool_paths
@@ -107,15 +126,18 @@ def _score(
         keep = [i for i, path in enumerate(paths) if path != exclude]
         pool, paths = pool[keep], tuple(paths[i] for i in keep)
     if len(pool) == 0:
-        return FolderScore(profile.key, profile_similarity + boost, profile_similarity)
+        score = profile_similarity + learned
+        return FolderScore(profile.key, score, profile_similarity, learned=learned)
 
     similarities = pool @ vector
     nearest = np.argsort(-similarities)[:NEIGHBORS]
     neighbor_similarity = float(similarities[nearest].mean())
     weight = NEIGHBOR_WEIGHT * min(len(pool), FULL_POOL) / FULL_POOL
-    score = (1 - weight) * profile_similarity + weight * neighbor_similarity + boost
+    score = (1 - weight) * profile_similarity + weight * neighbor_similarity + learned
     neighbors = tuple(Neighbor(paths[i], float(similarities[i])) for i in nearest)
-    return FolderScore(profile.key, score, profile_similarity, neighbor_similarity, neighbors)
+    return FolderScore(
+        profile.key, score, profile_similarity, neighbor_similarity, neighbors, learned
+    )
 
 
 def is_related(a: str, b: str) -> bool:

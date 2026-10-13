@@ -129,6 +129,8 @@ def test_details_for_history_list_the_top_three() -> None:
     details = choose(scores(A=0.9, B=0.5, C=0.3, D=0.1), THRESHOLD, MARGIN).to_details()
     assert [c["folder"] for c in details["candidates"]] == ["A", "B", "C"]
     assert details["candidates"][0]["score"] == 0.9
+    assert details["candidates"][0]["name"] == 0.9
+    assert details["choice"] == "A"
     assert details["explanation"]
 
 
@@ -191,11 +193,14 @@ def test_exclude_keeps_a_file_from_matching_itself() -> None:
     assert score.neighbor_similarity is None
 
 
-def test_boost_is_added_per_folder() -> None:
+def test_learned_adjustment_is_added_per_folder() -> None:
     profiles = [
-        FolderProfile("A", unit(1, 0), np.empty((0, 2), np.float32)),
-        FolderProfile("B", unit(1, 0), np.empty((0, 2), np.float32)),
+        FolderProfile("Alpha", unit(1, 0), np.empty((0, 2), np.float32)),
+        FolderProfile("Beta", unit(1, 0), np.empty((0, 2), np.float32)),
     ]
-    ranked = score_folders(unit(1, 0), profiles, boosts={"B": 0.25})
-    assert ranked[0].folder == "B"
-    assert ranked[0].score == pytest.approx(1.25)
+    ranked = score_folders(unit(1, 0), profiles, adjustments={"alpha": -0.25})
+    assert [item.folder for item in ranked] == ["Beta", "Alpha"]
+    assert ranked[1].score == pytest.approx(0.75)
+    assert ranked[1].learned == pytest.approx(-0.25)
+    assert ranked[1].to_details()["learned"] == -0.25
+    assert "learned" not in ranked[0].to_details()

@@ -6,10 +6,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from autoshelf.actions import learning
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
+from autoshelf.extract.filename import filename_tokens
 from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, scan_library
@@ -32,6 +34,7 @@ class InboxItem:
     title: str | None
     excerpt: str | None
     classification: Classification | None  # None without a classifier
+    details: dict | None = None  # why: scores, similar files, shared words (ml.explain)
 
     @property
     def explanation(self) -> str:
@@ -88,8 +91,9 @@ def assign(
     """Move a waiting file into the folder the user chose, and learn from it.
 
     The move is recorded in history (reason "user") and undoable. A correction row
-    notes the classifier's earlier suggestion and the user's choice. The file's vector
-    moves with it, so it immediately becomes an example for its new folder.
+    notes the classifier's earlier suggestion and the user's choice, with the file's
+    vector. The vector also moves with the file, so it immediately becomes an example
+    for its new folder.
     """
     if zone_of(path, root) not in PROCESSED_ZONES:
         raise AssignError(
@@ -98,7 +102,7 @@ def assign(
         )
     key = resolve_folder(root, folder, ignore_patterns)
     known = repository.get_file_by_path(conn, path)
-    suggested = repository.top_suggestion(conn, known.id) if known else None
+    suggested = known.suggestion if known else None
     try:
         result = move_file(
             conn,
@@ -110,9 +114,16 @@ def assign(
         )
     except MoveError as exc:
         raise AssignError(str(exc)) from exc
-    repository.record_correction(
-        conn, file_id=result.file_id, from_folder=suggested, to_folder=key, source="inbox"
+    source, decision_id = learning.inbox_source(conn, result.file_id)
+    learning.record_choice(
+        conn,
+        file_id=result.file_id,
+        from_folder=suggested,
+        to_folder=key,
+        source=source,
+        history_id=decision_id,
     )
+    repository.set_suggestion(conn, result.file_id, key)
     return result
 
 
@@ -137,6 +148,7 @@ def inbox_items(
         record = repository.get_file_by_path(conn, path)
         title, excerpt = repository.get_file_content(conn, record.id) if record else (None, None)
         vector = library.stored_vector(path) if library is not None else None
+        extraction = None
         if vector is None and (library is not None or not (title or excerpt)):
             try:
                 extraction = extractor(path)
@@ -147,10 +159,12 @@ def inbox_items(
             excerpt = excerpt or extraction.text[:TEXT_EXCERPT_CHARS] or None
             if library is not None:
                 vector = library.vectorize(extraction, path.name)
-        classification = (
-            library.classify(vector, threshold=threshold, margin=margin)
-            if library is not None and vector is not None
-            else None
-        )
-        items.append(InboxItem(path, title, excerpt, classification))
+        classification = details = None
+        if library is not None and vector is not None:
+            classification = library.classify(vector, threshold=threshold, margin=margin)
+            extraction = extraction or Extraction(
+                "stored", tuple(filename_tokens(path.name)), text=excerpt or "", title=title
+            )
+            details = library.explain(classification, extraction, path.name)
+        items.append(InboxItem(path, title, excerpt, classification, details))
     return items

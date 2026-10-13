@@ -1,9 +1,10 @@
 """The ingestion pipeline (SPEC section 4.1) for one file that has become stable.
 
 Steps: check location and ignore rules, hash, look for exact duplicates, extract text,
-classify, act. A clear match is moved straight into its folder. Anything else goes to
-``_Inbox`` (or, if it is already there, stays) for the user to decide: "when unsure,
-ask". Rules (Phase 5) slot in before classification.
+check the user's rules, classify, act. A matching rule or a clear match moves the file
+straight into its folder. Anything else goes to ``_Inbox`` (or, if it is already there,
+stays) for the user to decide: "when unsure, ask". Every move is stored in history
+with why it happened (``ml.explain``).
 """
 
 import logging
@@ -16,12 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
+from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.mover import MoveError, free_destination, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
 from autoshelf.fsutil import sha256_file
 from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
 from autoshelf.watcher.ignore import ignore_reason
@@ -55,6 +58,7 @@ class Outcome:
     duplicates: tuple[Path, ...] = ()
     extraction: Extraction | None = None
     classification: Classification | None = None
+    details: dict | None = None  # why: what is stored with the move in history
 
     @property
     def needs_decision(self) -> bool:
@@ -70,12 +74,16 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Decision:
-    """Where a file should go. ``target_dir`` None means it stays where it is (in _Inbox)."""
+    """Where a file should go. ``target_dir`` None means it stays where it is (in _Inbox).
+
+    ``suggestion`` is the folder AutoShelf chose or, when asking, thinks most likely.
+    """
 
     target_dir: Path | None
     reason: str
     message: str
     confidence: float | None = None
+    suggestion: str | None = None
 
 
 class Pipeline:
@@ -141,9 +149,16 @@ class Pipeline:
         duplicates = self._duplicates_of(path, digest)
         extraction = self.extractor(path)
         vector, classification = self._classify(path, extraction)
-        decision = self._decide(zone, classification)
+        rule = rule_engine.first_match(
+            repository.list_rules(self.conn, enabled_only=True), path, extraction
+        )
+        if rule is not None:
+            decision = self._rule_decision(zone, rule)
+        else:
+            decision = self._decide(zone, classification)
         if decision.target_dir is not None and not self._can_receive(decision.target_dir):
             decision = self._fallback_to_inbox(zone, decision)
+        details = self._details(path, extraction, classification, rule)
 
         def outcome(kind: OutcomeKind, message: str, **extra) -> Outcome:
             return Outcome(
@@ -153,12 +168,13 @@ class Pipeline:
                 duplicates=duplicates,
                 extraction=extraction,
                 classification=classification,
+                details=details,
                 **extra,
             )
 
         if decision.target_dir is None:
             if not self.dry_run:
-                self._record_waiting(path, digest, st, extraction, vector)
+                self._record_waiting(path, digest, st, extraction, vector, decision.suggestion)
             return outcome(OutcomeKind.WAITING, decision.message)
         if self.dry_run:
             dst = self._planned_destination(decision.target_dir, path.name)
@@ -173,9 +189,10 @@ class Pipeline:
             reason=decision.reason,
             confidence=decision.confidence,
             sha256=digest,
-            details=classification.to_details() if classification else None,
+            details=details,
             before_rename=self._expect_self_move,
         )
+        repository.set_suggestion(self.conn, result.file_id, decision.suggestion)
         store_content(self.conn, result.file_id, extraction)
         if vector is not None:
             self._store_vector(result.file_id, vector, st)
@@ -206,13 +223,59 @@ class Pipeline:
         elif classification.choice is not None:
             choice = classification.choice
             target = self.root.joinpath(*choice.folder.split("/"))
-            return Decision(target, REASON_AUTO, classification.explanation, choice.score)
+            return Decision(
+                target, REASON_AUTO, classification.explanation, choice.score, choice.folder
+            )
         else:
             why = classification.explanation
-        best = classification.scores[0].score if classification and classification.scores else None
+        best = classification.scores[0] if classification and classification.scores else None
+        return self._ask(zone, why, best.score if best else None, best.folder if best else None)
+
+    def _ask(
+        self, zone: Zone, why: str, score: float | None = None, suggestion: str | None = None
+    ) -> Decision:
+        """Leave the file in (or send it to) _Inbox for the user to decide."""
         if zone is Zone.INBOX:
-            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}", best)
-        return Decision(inbox_dir(self.root), REASON_ASK, why, best)
+            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}", score, suggestion)
+        return Decision(inbox_dir(self.root), REASON_ASK, why, score, suggestion)
+
+    def _rule_decision(self, zone: Zone, match: rule_engine.RuleMatch) -> Decision:
+        """A rule decides, overriding the classifier; it never creates its folder."""
+        rule = match.rule
+        target = self.root.joinpath(*rule.target_folder.split("/"))
+        if not target.is_dir() or zone_of(target / "x", self.root) is not Zone.CATEGORY:
+            why = f"rule {rule.name!r} matched, but its folder {rule.target_folder!r} doesn't exist"
+            return self._ask(zone, why)
+        message = f"rule {rule.name!r} matched: {match.match}"
+        return Decision(
+            target, rule_engine.reason_for(rule), message, suggestion=rule.target_folder
+        )
+
+    def _details(
+        self,
+        path: Path,
+        extraction: Extraction,
+        classification: Classification | None,
+        rule: rule_engine.RuleMatch | None,
+    ) -> dict | None:
+        """Why the file goes where it goes, as stored with its move in history."""
+        details: dict = {}
+        if classification is not None:
+            try:
+                details = self.library.explain(classification, extraction, path.name)
+            except Exception:
+                log.exception("Couldn't explain the decision for %s", path)
+                details = classification.to_details()
+        if rule is not None:
+            details.update(
+                explain.rule_details(
+                    rule.rule.name,
+                    rule_engine.describe_condition(rule.rule.kind, rule.rule.pattern),
+                    rule.rule.target_folder,
+                    rule.match,
+                )
+            )
+        return details or None
 
     def _can_receive(self, target_dir: Path) -> bool:
         """True if files can be moved to ``target_dir`` (``_Inbox`` is created when needed)."""
@@ -220,10 +283,7 @@ class Pipeline:
 
     def _fallback_to_inbox(self, zone: Zone, decision: Decision) -> Decision:
         """The chosen folder vanished after scoring: ask instead. Folders are never created."""
-        why = f"its folder {decision.target_dir.name!r} no longer exists"
-        if zone is Zone.INBOX:
-            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}")
-        return Decision(inbox_dir(self.root), REASON_ASK, why)
+        return self._ask(zone, f"its folder {decision.target_dir.name!r} no longer exists")
 
     def _record_waiting(
         self,
@@ -232,12 +292,14 @@ class Pipeline:
         st: os.stat_result,
         extraction: Extraction,
         vector: np.ndarray | None,
+        suggestion: str | None,
     ) -> None:
         """Remember a file that stays in _Inbox, so it isn't classified again and again."""
         file_id = repository.upsert_file(
             self.conn, path, sha256=digest, size=st.st_size, mtime=st.st_mtime
         )
         repository.set_file_status(self.conn, file_id, "inbox")
+        repository.set_suggestion(self.conn, file_id, suggestion)
         store_content(self.conn, file_id, extraction)
         if vector is not None:
             self._store_vector(file_id, vector, st)

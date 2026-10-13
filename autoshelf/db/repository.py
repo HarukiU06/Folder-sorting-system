@@ -48,6 +48,7 @@ class FileRecord:
     ext: str | None
     status: str
     added_at: str
+    suggestion: str | None = None  # the folder AutoShelf last chose or suggested
 
 
 def _file_from_row(row: sqlite3.Row) -> FileRecord:
@@ -60,6 +61,7 @@ def _file_from_row(row: sqlite3.Row) -> FileRecord:
         ext=row["ext"],
         status=row["status"],
         added_at=row["added_at"],
+        suggestion=row["suggestion"],
     )
 
 
@@ -139,6 +141,11 @@ def set_file_status(conn: sqlite3.Connection, file_id: int, status: str) -> None
     conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
 
 
+def set_suggestion(conn: sqlite3.Connection, file_id: int, folder: str | None) -> None:
+    """Remember the folder AutoShelf chose or suggested for a file (None: no idea)."""
+    conn.execute("UPDATE files SET suggestion = ? WHERE id = ?", (folder, file_id))
+
+
 # --- file vectors -------------------------------------------------------------
 
 
@@ -210,19 +217,188 @@ def record_correction(
     from_folder: str | None,
     to_folder: str,
     source: str,
+    vector: bytes | None = None,
+    model: str | None = None,
+    history_id: int | None = None,
 ) -> int:
-    """Record that the user put a file in ``to_folder`` (a learning example)."""
+    """Record that the user put a file in ``to_folder`` (a learning example).
+
+    ``from_folder`` is where AutoShelf had put (or suggested putting) the file, and
+    ``vector`` the file's embedding by ``model``, kept so the example outlives the file.
+    """
     cursor = conn.execute(
-        "INSERT INTO corrections (file_id, from_folder, to_folder, source, ts)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (file_id, from_folder, to_folder, source, now_iso()),
+        "INSERT INTO corrections (file_id, from_folder, to_folder, source, ts, vector, model,"
+        " history_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (file_id, from_folder, to_folder, source, now_iso(), vector, model, history_id),
     )
     return cursor.lastrowid
 
 
 def list_corrections(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Return every correction, oldest first."""
-    return conn.execute("SELECT * FROM corrections ORDER BY id").fetchall()
+    """Return every correction, oldest first, with the file's last known path."""
+    return conn.execute(
+        "SELECT c.*, f.path AS path FROM corrections AS c LEFT JOIN files AS f ON f.id = c.file_id"
+        " ORDER BY c.id"
+    ).fetchall()
+
+
+@dataclass(frozen=True)
+class LearningExample:
+    """A file the user moved away from a folder AutoShelf had chosen or suggested."""
+
+    from_folder: str
+    to_folder: str
+    vector: bytes
+    path: str | None
+
+
+def learning_examples(conn: sqlite3.Connection, model: str) -> list[LearningExample]:
+    """Corrections that moved a file away from a folder, with vectors made by ``model``."""
+    rows = conn.execute(
+        "SELECT c.from_folder, c.to_folder, c.vector, f.path FROM corrections AS c"
+        " LEFT JOIN files AS f ON f.id = c.file_id"
+        " WHERE c.model = ? AND c.vector IS NOT NULL AND c.from_folder IS NOT NULL"
+        " AND c.from_folder != c.to_folder COLLATE NOCASE ORDER BY c.id",
+        (model,),
+    )
+    return [
+        LearningExample(row["from_folder"], row["to_folder"], row["vector"], row["path"])
+        for row in rows
+    ]
+
+
+# --- rules --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuleRecord:
+    """A row of the ``rules`` table. Lower ``priority`` values are checked first."""
+
+    id: int
+    name: str
+    priority: int
+    enabled: bool
+    kind: str
+    pattern: str
+    target_folder: str
+
+
+def _rule_from_row(row: sqlite3.Row) -> RuleRecord:
+    return RuleRecord(
+        id=row["id"],
+        name=row["name"],
+        priority=row["priority"],
+        enabled=bool(row["enabled"]),
+        kind=row["kind"],
+        pattern=row["pattern"],
+        target_folder=row["target_folder"],
+    )
+
+
+def list_rules(conn: sqlite3.Connection, *, enabled_only: bool = False) -> list[RuleRecord]:
+    """Return the rules in the order they are checked."""
+    where = " WHERE enabled = 1" if enabled_only else ""
+    rows = conn.execute(f"SELECT * FROM rules{where} ORDER BY priority, id")
+    return [_rule_from_row(row) for row in rows]
+
+
+def get_rule(conn: sqlite3.Connection, rule_id: int) -> RuleRecord | None:
+    """Return one rule."""
+    row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    return None if row is None else _rule_from_row(row)
+
+
+def insert_rule(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    kind: str,
+    pattern: str,
+    target_folder: str,
+    enabled: bool = True,
+) -> int:
+    """Add a rule after all existing ones and return its id."""
+    with transaction(conn):
+        last = conn.execute("SELECT MAX(priority) FROM rules").fetchone()[0]
+        cursor = conn.execute(
+            "INSERT INTO rules (name, priority, enabled, kind, pattern, target_folder)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (name, (last or 0) + 1, int(enabled), kind, pattern, target_folder),
+        )
+    return cursor.lastrowid
+
+
+def update_rule(conn: sqlite3.Connection, rule: RuleRecord) -> None:
+    """Store every field of ``rule`` (matched by id)."""
+    conn.execute(
+        "UPDATE rules SET name = ?, priority = ?, enabled = ?, kind = ?, pattern = ?,"
+        " target_folder = ? WHERE id = ?",
+        (
+            rule.name,
+            rule.priority,
+            int(rule.enabled),
+            rule.kind,
+            rule.pattern,
+            rule.target_folder,
+            rule.id,
+        ),
+    )
+
+
+def delete_rule(conn: sqlite3.Connection, rule_id: int) -> None:
+    """Remove a rule (rules are settings, not user files)."""
+    conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+
+
+def reorder_rules(conn: sqlite3.Connection, rule_ids: list[int]) -> None:
+    """Give the rules priorities 1, 2, 3, ... in the order of ``rule_ids``."""
+    with transaction(conn):
+        for priority, rule_id in enumerate(rule_ids, start=1):
+            conn.execute("UPDATE rules SET priority = ? WHERE id = ?", (priority, rule_id))
+
+
+# --- files that moved outside AutoShelf -------------------------------------------------
+
+
+def find_files_by_size(conn: sqlite3.Connection, size: int) -> list[FileRecord]:
+    """Return every recorded file of this size."""
+    rows = conn.execute("SELECT * FROM files WHERE size = ? ORDER BY id", (size,))
+    return [_file_from_row(row) for row in rows]
+
+
+def has_pending_history(conn: sqlite3.Connection, file_id: int) -> bool:
+    """True if a move of this file is in progress (its history row isn't settled yet)."""
+    row = conn.execute(
+        "SELECT 1 FROM history WHERE file_id = ? AND state = 'pending' LIMIT 1", (file_id,)
+    ).fetchone()
+    return row is not None
+
+
+def relocate_file(
+    conn: sqlite3.Connection, file_id: int, old_path: str | Path, new_path: str | Path, status: str
+) -> bool:
+    """Point a record at ``new_path``, but only if it still says ``old_path``.
+
+    Call inside a transaction. Returns False if another process got there first, so
+    a move noticed twice is only acted on once. A stale record still claiming
+    ``new_path`` is dropped (database metadata only, never a file).
+    """
+    cursor = conn.execute(
+        "UPDATE files SET path = ?, status = ? WHERE id = ? AND path = ?",
+        (str(new_path), status, file_id, str(old_path)),
+    )
+    if cursor.rowcount != 1:
+        return False
+    conn.execute("DELETE FROM files WHERE path = ? AND id != ?", (str(new_path), file_id))
+    return True
+
+
+def get_vector_blob(conn: sqlite3.Connection, file_id: int) -> tuple[str, bytes] | None:
+    """The (model, vector) stored for a file, if any."""
+    row = conn.execute(
+        "SELECT model, vector FROM file_vectors WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    return None if row is None else (row["model"], row["vector"])
 
 
 # --- history ----------------------------------------------------------------
@@ -366,6 +542,22 @@ def top_suggestion(conn: sqlite3.Connection, file_id: int) -> str | None:
         (file_id,),
     ).fetchone()
     return None if row is None else row["folder"]
+
+
+def last_decision(conn: sqlite3.Connection, file_id: int) -> HistoryEntry | None:
+    """The most recent move of a file made by AutoShelf's own decision (auto, ask or a rule)."""
+    row = conn.execute(
+        "SELECT * FROM history WHERE file_id = ? AND action = 'move'"
+        " AND (reason IN ('auto', 'ask') OR reason LIKE 'Rule:%') ORDER BY id DESC LIMIT 1",
+        (file_id,),
+    ).fetchone()
+    return None if row is None else _history_from_row(row)
+
+
+def list_batch(conn: sqlite3.Connection, batch_id: str) -> list[HistoryEntry]:
+    """Every row of one batch, oldest first."""
+    rows = conn.execute("SELECT * FROM history WHERE batch_id = ? ORDER BY id", (batch_id,))
+    return [_history_from_row(row) for row in rows]
 
 
 def undos_with_stale_target(conn: sqlite3.Connection) -> list[int]:

@@ -1,4 +1,4 @@
-"""The History screen: every move, why it happened, and Undo."""
+"""The History screen: every move, why it happened ("Why here?"), Undo and corrections."""
 
 from datetime import datetime
 from pathlib import Path
@@ -8,10 +8,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -21,7 +23,9 @@ from PySide6.QtWidgets import (
 from autoshelf.actions.undo import UndoError
 from autoshelf.app_service import AppService
 from autoshelf.db.repository import UNDOABLE_ACTIONS, HistoryEntry
+from autoshelf.layout import INBOX_DIRNAME, RESERVED_PREFIX
 from autoshelf.ui.tasks import TaskRunner
+from autoshelf.ui.why_panel import WhyPanel
 
 COLUMNS = ("When", "File", "From", "To", "Why", "Score", "State")
 _REASONS = {"auto": "Sorted automatically", "ask": "Not sure: sent to Inbox", "user": "You chose"}
@@ -33,6 +37,8 @@ def describe_reason(entry: HistoryEntry) -> str:
     """A readable version of a history row's reason."""
     if entry.action == "undo":
         return f"Undo of #{entry.undo_of}" if entry.undo_of else "Undo"
+    if entry.reason == "user" and entry.details.get("corrects"):
+        return f"You corrected #{entry.details['corrects']}"
     return _REASONS.get(entry.reason, entry.reason)
 
 
@@ -53,6 +59,18 @@ def folder_of(path: str | None, root: str | None) -> str:
 def can_undo(entry: HistoryEntry) -> bool:
     """True if Undo is offered for this row."""
     return entry.state == "done" and entry.action in UNDOABLE_ACTIONS
+
+
+def can_correct(entry: HistoryEntry) -> bool:
+    """True if the row put a file into one of the user's folders (so it can be corrected)."""
+    if entry.state != "done" or entry.action != "move":
+        return False
+    folder = folder_of(entry.dst, entry.root)
+    return not (
+        folder in ("?", "(root)", INBOX_DIRNAME)
+        or folder.startswith(RESERVED_PREFIX)
+        or Path(folder).is_absolute()
+    )
 
 
 class HistoryView(QWidget):
@@ -79,6 +97,11 @@ class HistoryView(QWidget):
 
         self.undo_button = QPushButton("Undo selected")
         self.undo_button.clicked.connect(self.undo_selected)
+        self.correct_button = QPushButton("Move to another folder...")
+        self.correct_button.setToolTip(
+            "Put the file where it belongs; AutoShelf learns from the correction"
+        )
+        self.correct_button.clicked.connect(self.correct_selected)
         self.count = QSpinBox()
         self.count.setRange(1, 100)
         self.count.setValue(5)
@@ -89,6 +112,7 @@ class HistoryView(QWidget):
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.undo_button)
+        buttons.addWidget(self.correct_button)
         buttons.addSpacing(20)
         buttons.addWidget(undo_last)
         buttons.addWidget(self.count)
@@ -96,8 +120,15 @@ class HistoryView(QWidget):
         buttons.addStretch(1)
         buttons.addWidget(refresh)
 
+        self.why = WhyPanel()
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self.why)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(splitter, 1)
         layout.addLayout(buttons)
         self._update_buttons()
 
@@ -142,6 +173,45 @@ class HistoryView(QWidget):
     def _update_buttons(self) -> None:
         entry = self._selected()
         self.undo_button.setEnabled(entry is not None and can_undo(entry))
+        self.correct_button.setEnabled(entry is not None and can_correct(entry))
+        if entry is None:
+            self.why.clear_details()
+            return
+        name = Path(entry.dst or entry.src or "?").name
+        headline = (
+            f"#{entry.id} {describe_reason(entry)}: {name} -> {folder_of(entry.dst, entry.root)}"
+        )
+        root = Path(entry.root) if entry.root else None
+        self.why.show_details(entry.details, root, headline)
+
+    def correct_selected(self) -> None:
+        """Ask for the right folder and move the selected file there (AutoShelf learns)."""
+        entry = self._selected()
+        if entry is None or not can_correct(entry):
+            return
+        current = folder_of(entry.dst, entry.root)
+
+        def ask(folders) -> None:
+            choices = [folder.key for folder in folders if folder.key != current]
+            if not choices:
+                QMessageBox.information(self, "No other folder", "There is no other folder yet.")
+                return
+            name = Path(entry.dst).name
+            folder, ok = QInputDialog.getItem(
+                self, "Move to another folder", f"Where does {name} belong?", choices, 0, False
+            )
+            if ok and folder:
+                self.runner.run(
+                    lambda: self.service.correct(entry.id, folder),
+                    lambda result: self._corrected(name, folder),
+                    lambda exc: QMessageBox.warning(self, "Couldn't move the file", str(exc)),
+                )
+
+        self.runner.run(self.service.folders, ask)
+
+    def _corrected(self, name: str, folder: str) -> None:
+        self.undone.emit(f"Moved {name} to {folder}; AutoShelf will remember")
+        self.refresh()
 
     def undo_selected(self) -> None:
         """Undo the selected row."""

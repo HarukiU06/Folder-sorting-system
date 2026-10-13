@@ -5,9 +5,10 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–4 are done: a Windows tray app (and a command-line
+> **Status:** early development. Phases 1–5 are done: a Windows tray app (and a command-line
 > tool) that reads each new file and either moves it into the right folder, when it is sure,
-> or into `_Inbox/` for you to decide, with full history and undo.
+> or into `_Inbox/` for you to decide, with full history and undo. It learns from your
+> corrections, follows your rules, and explains every decision.
 
 ## Safety rules
 
@@ -68,8 +69,11 @@ start paused so you can look first. AutoShelf then lives in the system tray:
 - **Inbox:** files it wasn't sure about, with its best three guesses as buttons, any other
   folder, a text preview and why it's waiting. One click puts the file away (and teaches
   AutoShelf for next time).
-- **History:** every move with its reason and score; undo one, or the last N.
+- **History:** every move with its reason and score, and a "Why?" panel; undo one, undo the
+  last N, or move a file AutoShelf put in the wrong folder to the right one ("Move to another
+  folder", which AutoShelf learns from).
 - **Folders:** your folders with file counts; double-click a description to edit it.
+- **Rules:** rules that send matching files straight to a folder (see below).
 - **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
   and which files to ignore.
 
@@ -119,6 +123,21 @@ While it runs, drop files into the root (or into `_Inbox\`, e.g. from your iPhon
 .venv\Scripts\python.exe -m autoshelf undo --last 5   # undo the 5 most recent moves
 ```
 
+Rules, learning and explanations:
+
+```powershell
+# Rules are checked first, in order; the first match decides
+.venv\Scripts\python.exe -m autoshelf rules add Invoices --name-matches "invoice|receipt" --to Finance
+.venv\Scripts\python.exe -m autoshelf rules add Notebooks --extension .ipynb --to "Machine Learning"
+.venv\Scripts\python.exe -m autoshelf rules add Syllabus --text-contains Syllabus --to University
+.venv\Scripts\python.exe -m autoshelf rules                      # list (also: remove/enable/disable/up/down ID)
+.venv\Scripts\python.exe -m autoshelf rules test "C:\path\to\a file.pdf"
+
+.venv\Scripts\python.exe -m autoshelf why 3                      # why history entry #3 went where it went
+.venv\Scripts\python.exe -m autoshelf correct 3 Travel           # it belongs in Travel: move it and learn
+.venv\Scripts\python.exe -m autoshelf learned                    # the corrections AutoShelf learns from
+```
+
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
 files already in your folders ahead of time (the watcher also does this when it starts),
 and `config` shows or changes settings. Every command that needs the root accepts `--root`.
@@ -160,6 +179,40 @@ model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`); a differe
 
 A dry run moves nothing and records no history, but it does save the vectors of the files
 already in your folders, so the next start is faster.
+
+## Rules
+
+Rules override the AI. Each one says "when the file name matches / the extension is / the
+text contains …, move it to this folder". They are checked from top to bottom before
+AutoShelf reads a file's meaning, and the first one that matches decides. A rule-based move
+is logged as "Rule: *name*" and can be undone like any other. Rules never create folders: if
+a rule's folder is gone, the file waits in the Inbox. Edit them on the Rules tab (where you
+can also test them on any file) or with `autoshelf rules`.
+
+## Learning from your corrections
+
+AutoShelf learns whenever you:
+
+- pick a folder for a file in the Inbox;
+- move a file it sorted into another folder ("Move to another folder" in History, or
+  `autoshelf correct`), or undo an automatic move and then choose a folder;
+- move a file between your folders, or out of `_Inbox`, in Explorer or in the iPhone Files
+  app. AutoShelf notices when it next looks at your folders (within seconds while it runs,
+  or at the next start), recognising the file by its content, or, for iCloud online-only
+  files, by name and size. Its own moves never count.
+
+The corrected file now lives in its right folder, so it counts as an example there. On top
+of that, AutoShelf remembers which folder the file was moved *away* from: later files with
+similar content score a little lower for that folder (by up to 0.20 after repeated
+corrections). Nothing is retrained; every effect shows up in the "Why?" panel.
+
+## Why did it go here?
+
+Every decision is stored with its explanation: the three best folders and how each score was
+made (similarity to the folder's name and description, to the files in it, and anything
+learned), the most similar files already in the chosen folder, the words the file has in
+common with that folder (ranked by TF-IDF; for Japanese, kanji and katakana words), or the
+rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshelf why ID`.
 
 ## What AutoShelf reads
 

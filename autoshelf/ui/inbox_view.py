@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 from autoshelf.actions.inbox import InboxItem
 from autoshelf.app_service import AppService
 from autoshelf.ui.tasks import TaskRunner
+from autoshelf.ui.why_panel import WhyPanel
 from autoshelf.ui.widgets import show_in_explorer
 
 MAX_SUGGESTIONS = 3
@@ -92,6 +94,10 @@ class InboxView(QWidget):
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("No text preview for this file.")
+        self.why_panel = WhyPanel()
+        self.pages = QTabWidget()
+        self.pages.addTab(self.preview, "Preview")
+        self.pages.addTab(self.why_panel, "Why?")
 
         detail = QVBoxLayout(self.detail)
         detail.addWidget(self.name)
@@ -102,8 +108,7 @@ class InboxView(QWidget):
         detail.addLayout(self.suggestions)
         detail.addLayout(other_row)
         detail.addLayout(file_row)
-        detail.addWidget(QLabel("Preview:"))
-        detail.addWidget(self.preview, 1)
+        detail.addWidget(self.pages, 1)
 
         self.empty = QLabel(EMPTY_TEXT)
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -212,6 +217,8 @@ class InboxView(QWidget):
         self.title.setVisible(bool(item.title))
         self.why.setText(f"Why it's here: {item.explanation}")
         self.preview.setPlainText(item.excerpt or "")
+        root = item.path.parent.parent  # the file is in <root>/_Inbox
+        self.why_panel.show_details(item.details, root)
         for button in self.suggestion_buttons:
             self.suggestions.removeWidget(button)
             button.deleteLater()

@@ -229,3 +229,11 @@ def test_cli_search_tags_and_related(
 
     assert main(["related", kmeans]) == 0
     assert "backprop.md" in capsys.readouterr().out
+
+
+def test_search_results_carry_cached_summaries(conn, shelf: Path, library, embedder) -> None:
+    record = repository.get_file_by_path(conn, shelf / "Machine Learning" / "kmeans.md")
+    repository.set_summary(conn, record.id, "Notes on k-means.")
+    hits = SearchIndex().search(conn, shelf, embedder, "clustering centroids")
+    assert hits[0].summary == "Notes on k-means."
+    assert all(hit.summary is None for hit in hits[1:])

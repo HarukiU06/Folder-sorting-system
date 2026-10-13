@@ -121,14 +121,21 @@ def test_start_with_windows_uses_the_run_key(fake_run_key: dict) -> None:
     assert fake_run_key == {}
 
 
-def test_packaged_app_starts_itself(monkeypatch) -> None:
+def test_packaged_app_starts_the_tray_app(monkeypatch, tmp_path) -> None:
     import sys
 
     from autoshelf import startup
 
+    folder = tmp_path / "AutoShelf"
+    folder.mkdir()
+    app = folder / "AutoShelf.exe"
+    app.write_bytes(b"")
+    cli = folder / "autoshelf-cli.exe"
+    cli.write_bytes(b"")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", r"C:\Program Files\AutoShelf\AutoShelf.exe")
-    assert startup.startup_command() == r'"C:\Program Files\AutoShelf\AutoShelf.exe" --background'
+    for executable in (app, cli):  # changed in the app, or with the command line
+        monkeypatch.setattr(sys, "executable", str(executable))
+        assert startup.startup_command() == f'"{app}" --background'
 
 
 def test_cli_startup_and_background(fake_run_key: dict, monkeypatch, capsys) -> None:

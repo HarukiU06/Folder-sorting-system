@@ -645,6 +645,19 @@ def set_summary(conn: sqlite3.Connection, file_id: int, summary: str | None) -> 
     conn.execute("UPDATE files SET summary = ? WHERE id = ?", (summary, file_id))
 
 
+def summaries(conn: sqlite3.Connection, file_ids: list[int]) -> dict[int, str]:
+    """Cached summaries of these files (only those that have one)."""
+    found: dict[int, str] = {}
+    for start in range(0, len(file_ids), 500):
+        part = file_ids[start : start + 500]
+        marks = ", ".join("?" * len(part))
+        rows = conn.execute(
+            f"SELECT id, summary FROM files WHERE summary IS NOT NULL AND id IN ({marks})", part
+        )
+        found.update({row[0]: row[1] for row in rows})
+    return found
+
+
 def get_summary(conn: sqlite3.Connection, file_id: int) -> str | None:
     """A file's cached summary, if any."""
     row = conn.execute("SELECT summary FROM files WHERE id = ?", (file_id,)).fetchone()

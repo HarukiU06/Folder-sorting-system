@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +41,7 @@ class SearchHit:
     similarity: float  # best chunk's similarity to the query
     keyword: bool  # contains every word of the query
     snippet: str
+    summary: str | None = None  # the cached AI summary, if one was made
 
 
 @dataclass(frozen=True)
@@ -141,8 +142,10 @@ class SearchIndex:
             if file_id not in best or similarities[index] > similarities[best[file_id]]:
                 best[file_id] = index
         hits = []
+        file_ids: dict[Path, int] = {}
         for file_id, index in best.items():
             path = Path(chunks.paths[file_id])
+            file_ids[path] = file_id
             if zone_of(path, root) not in (Zone.CATEGORY, Zone.INBOX) or not os.path.isfile(path):
                 continue
             file_chunks = np.flatnonzero(chunks.file_ids == file_id)
@@ -171,7 +174,9 @@ class SearchIndex:
                 )
             )
         hits.sort(key=lambda hit: (hit.keyword, hit.score), reverse=True)
-        return hits[:limit]
+        hits = hits[:limit]
+        cached = repository.summaries(conn, [file_ids[hit.path] for hit in hits])
+        return [replace(hit, summary=cached.get(file_ids[hit.path])) for hit in hits]
 
     def top_chunks(
         self,

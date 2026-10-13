@@ -854,6 +854,8 @@ def _cmd_search(args: argparse.Namespace, paths: AppPaths) -> int:
         where = hit.folder or "(root)"
         exact = "  [contains the words]" if hit.keyword else ""
         print(f"{hit.score:5.2f}  {hit.path.name}  in {where}{exact}")
+        if hit.summary:
+            print(f"       Summary: {hit.summary}")
         print(f"       {hit.snippet}")
     return 0
 

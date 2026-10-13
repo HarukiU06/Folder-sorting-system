@@ -12,6 +12,7 @@ from typing import Protocol
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "AutoShelf"
 BACKGROUND_FLAG = "--background"
+APP_EXE = "AutoShelf.exe"  # the packaged tray app (next to autoshelf-cli.exe)
 
 
 class StartupError(Exception):
@@ -66,7 +67,10 @@ def startup_command() -> str:
     """The command Windows runs at sign-in: the packaged app, or pythonw with this package."""
     executable = Path(sys.executable)
     if getattr(sys, "frozen", False):
-        return f'"{executable}" {BACKGROUND_FLAG}'
+        # Always the tray app, also when the setting is changed from autoshelf-cli.exe
+        # (a console program would open a window at every sign-in).
+        app = executable.with_name(APP_EXE)
+        return f'"{app if app.exists() else executable}" {BACKGROUND_FLAG}'
     windowed = executable.with_name("pythonw.exe")
     interpreter = windowed if windowed.exists() else executable
     return f'"{interpreter}" -m autoshelf {BACKGROUND_FLAG}'

@@ -204,7 +204,8 @@ class LibraryView(QWidget):
                 (
                     hit.path,
                     hit.folder or "(root)",
-                    ("[has the words] " if hit.keyword else "") + hit.snippet,
+                    ("[has the words] " if hit.keyword else "")
+                    + (f"Summary: {hit.summary}" if hit.summary else hit.snippet),
                 )
                 for hit in hits
             ]

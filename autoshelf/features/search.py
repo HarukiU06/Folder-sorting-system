@@ -58,6 +58,7 @@ class _Chunks:
     signature: tuple[int, int]
     ids: np.ndarray
     file_ids: np.ndarray
+    idxs: np.ndarray  # 0 is the header chunk (name, title, metadata)
     texts: list[str]
     matrix: np.ndarray
     paths: dict[int, str]
@@ -106,6 +107,7 @@ class SearchIndex:
             signature=signature,
             ids=np.array([row["id"] for row in rows], dtype=np.int64),
             file_ids=np.array([row["file_id"] for row in rows], dtype=np.int64),
+            idxs=np.array([row["idx"] for row in rows], dtype=np.int64),
             texts=[row["text"] for row in rows],
             matrix=np.stack(vectors) if vectors else np.empty((0, 0), dtype=np.float32),
             paths={row["file_id"]: row["path"] for row in rows},
@@ -151,6 +153,10 @@ class SearchIndex:
             if similarity < MIN_SIMILARITY and not keyword:
                 continue
             snippet_index = index
+            body = [i for i in file_chunks if chunks.idxs[i] > 0]
+            if chunks.idxs[index] == 0 and body:
+                # The name matched best; show the most similar piece of the text itself.
+                snippet_index = max(body, key=lambda i: similarities[i])
             if keyword:
                 first = matching[0]
                 snippet_index = next(i for i in file_chunks if int(chunks.ids[i]) in first)

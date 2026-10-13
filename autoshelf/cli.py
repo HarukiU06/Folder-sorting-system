@@ -47,6 +47,7 @@ from autoshelf.llm.secrets import SecretError
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import explain
 from autoshelf.ml.embedder import EmbedderError
+from autoshelf.startup import StartupError
 
 log = logging.getLogger("autoshelf.cli")
 
@@ -65,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="store_true", help="show debug output")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="start the app in the tray without opening its window (used at sign-in)",
+    )
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     def with_root(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -152,6 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="ask for the Claude API key and keep it in the Windows Credential Manager",
     )
     config.add_argument("--forget-api-key", action="store_true", help="remove the saved key")
+    config.add_argument(
+        "--startup", choices=["on", "off"], help="start AutoShelf when you sign in to Windows"
+    )
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
     why.add_argument("id", type=int, help="history entry (see: autoshelf history)")
@@ -275,7 +284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         from autoshelf.ui.app import run_app  # imports Qt; only needed for the app
 
-        return run_app(verbose=args.verbose)
+        return run_app(verbose=args.verbose, show=not args.background)
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
@@ -334,6 +343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         RenameError,
         FolderNameError,
         FileExistsError,
+        StartupError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -643,6 +653,10 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
             changed = True
         if changed:
             save_settings(conn, settings)
+    if args.startup is not None:
+        from autoshelf import startup
+
+        startup.set_enabled(args.startup == "on")
     if args.api_key:
         from autoshelf.llm.secrets import set_api_key
 
@@ -673,6 +687,9 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
     if settings.llm_provider != "off":
         ai += f", model {settings.llm_model or default_model(settings.llm_provider)}"
     print(f"AI (optional):    {ai}")
+    from autoshelf import startup
+
+    print(f"Start with Windows: {'on' if startup.is_enabled() else 'off'}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(

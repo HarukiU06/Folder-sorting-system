@@ -84,7 +84,7 @@ class LibraryView(QWidget):
         self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.results.setWordWrap(True)
+        self.results.setWordWrap(False)
         header = self.results.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -240,7 +240,6 @@ class LibraryView(QWidget):
                 item.setData(PATH_ROLE, str(path))
                 item.setToolTip(str(path) if column < 2 else text)
                 self.results.setItem(row, column, item)
-        self.results.resizeRowsToContents()
         if rows:
             self.results.selectRow(0)
         else:

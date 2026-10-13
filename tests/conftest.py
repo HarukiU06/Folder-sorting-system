@@ -70,6 +70,27 @@ def memory_keyring() -> Iterator[dict]:
 
 
 @pytest.fixture(autouse=True)
+def fake_run_key(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """A fake registry Run key, so tests never make AutoShelf start with Windows."""
+    from autoshelf import startup
+
+    values: dict[str, str] = {}
+
+    class FakeRunKey:
+        def get(self, name):
+            return values.get(name)
+
+        def set(self, name, command):
+            values[name] = command
+
+        def delete(self, name):
+            values.pop(name, None)
+
+    monkeypatch.setattr(startup, "default_run_key", FakeRunKey)
+    return values
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """LLM providers must never reach the internet (or a local Ollama) from tests."""
     from autoshelf.llm import base

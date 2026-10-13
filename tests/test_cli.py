@@ -15,7 +15,7 @@ def test_no_command_starts_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(ui_app, "run_app", lambda **kwargs: calls.append(kwargs) or 0)
     assert main(["-v"]) == 0
-    assert calls == [{"verbose": True}]
+    assert calls == [{"verbose": True, "show": True}]
 
 
 def test_help(capsys: pytest.CaptureFixture[str]) -> None:

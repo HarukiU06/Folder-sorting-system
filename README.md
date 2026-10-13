@@ -1,16 +1,24 @@
 # AutoShelf
 
+[![tests](https://github.com/HarukiU06/Folder-sorting-system/actions/workflows/tests.yml/badge.svg)](https://github.com/HarukiU06/Folder-sorting-system/actions/workflows/tests.yml)
+
 A personal Windows desktop app that watches one root folder (for example inside iCloud Drive),
 reads each new file's **name and text**, and moves it into the right folder **that you created**.
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–7 are done: a Windows tray app (and a command-line
-> tool) that reads each new file and either moves it into the right folder, when it is sure,
-> or into `_Inbox/` for you to decide, with full history and undo. It learns from your
-> corrections, follows your rules, explains every decision, and helps you search and tidy
-> your library. Optional AI features (off by default) add summaries, better names, answers
-> from your files and study tools.
+> **Status:** all eight phases of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> command-line tool) that reads each new file and either moves it into the right folder, when
+> it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
+> your corrections, follows your rules, explains every decision, and helps you search and
+> tidy your library. Optional AI features (off by default) add summaries, better names,
+> answers from your files and study tools.
+
+| Inbox | Why did it go there? | Search |
+|---|---|---|
+| ![Inbox](docs/screenshots/inbox.png) | ![History](docs/screenshots/history.png) | ![Library](docs/screenshots/library.png) |
+| **Tidy up** | **Dashboard** | **Settings** |
+| ![Tidy up](docs/screenshots/tidy.png) | ![Dashboard](docs/screenshots/dashboard.png) | ![Settings](docs/screenshots/settings.png) |
 
 ## Safety rules
 
@@ -86,11 +94,34 @@ start paused so you can look first. AutoShelf then lives in the system tray:
 - **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
   which files to ignore, and other folders to watch (optional, e.g. Downloads).
 
-When a file needs your decision, a notification asks "Where should *file* go?"; click it to
-open the Inbox. The tray menu can pause sorting: new files then wait until you resume.
+When a file needs your decision, a notification asks "Where should *file* go?" with the best
+guesses; click it to open the Inbox with that file selected. (Notifications have no buttons
+of their own: answering from inside a notification needs the app to be registered with
+Windows by an installer, and AutoShelf installs nothing.) The tray menu can pause sorting: new files then wait until you resume.
 Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.
+
+### Start with Windows
+
+Settings → "Start AutoShelf when I sign in to Windows" (or `autoshelf config --startup on`)
+adds an entry to your user's startup programs (the registry's `Run` key; no administrator
+rights). AutoShelf then starts in the tray without opening its window. Turn it off the same
+way. `autoshelf --background` starts it like that by hand.
+
+## Building the app (no Python needed to run it)
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[build]"
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+```
+
+This makes `dist\AutoShelf\` (about 850 MB, mostly PyTorch) with `AutoShelf.exe`, the tray app,
+and `autoshelf-cli.exe`, the command line. Copy the whole folder anywhere and run
+`AutoShelf.exe`; the language model is downloaded on first start, as when running from
+source. The build uses a hand-written PyInstaller spec (`packaging\autoshelf.spec`) and
+builds one folder rather than one file, so it starts quickly and its libraries stay
+replaceable.
 
 ## Command line
 
@@ -335,10 +366,22 @@ A file that can't be parsed (corrupt, password-protected) is still handled using
 ```powershell
 .venv\Scripts\python.exe -m pytest -q                                   # run the tests
 .venv\Scripts\ruff.exe check . ; .venv\Scripts\ruff.exe format .       # lint and format
+.venv\Scripts\python.exe scripts\make_screenshots.py --model-cache "$env:APPDATA\AutoShelf\cache\models"
 ```
 
-Tests only use temporary folders, never your real files or `%APPDATA%`.
+Tests only use temporary folders, never your real files or `%APPDATA%`. They also replace
+the language model with a fake one, keep API keys in memory instead of the Windows
+Credential Manager, use a fake registry for "Start with Windows", and refuse any network
+access. GitHub Actions runs the same lint and tests on Windows with Python 3.12 and 3.13
+(`.github/workflows/tests.yml`). The screenshots are made from a demo library in a
+temporary folder.
 
 ## License
 
-MIT
+AutoShelf's own code is MIT-licensed (see [LICENSE](LICENSE)). It uses, among others:
+PySide6 / Qt (LGPL-3.0), PyMuPDF (AGPL-3.0), ebooklib (AGPL-3.0), mutagen (GPL-2.0-or-later),
+PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
+openpyxl, Pillow, beautifulsoup4, striprtf and keyring (BSD, MIT, Apache-2.0 or similar).
+The packaged app in `dist\AutoShelf\` bundles all of them, so sharing that folder means
+following their licenses too, notably the AGPL and GPL ones (for example by pointing to this
+repository's source).

@@ -614,6 +614,20 @@ class AppService:
         ]
         self.save_settings(settings)
 
+    # --- start with Windows -------------------------------------------------------------
+
+    def starts_with_windows(self) -> bool:
+        """True if AutoShelf starts (in the tray) when the user signs in."""
+        from autoshelf import startup
+
+        return startup.is_enabled()
+
+    def set_start_with_windows(self, enabled: bool) -> None:
+        """Add or remove AutoShelf's entry in the user's startup programs."""
+        from autoshelf import startup
+
+        startup.set_enabled(enabled)
+
     # --- optional AI (off by default) ---------------------------------------------------
 
     def provider(self) -> llm.Provider | None:

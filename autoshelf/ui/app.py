@@ -368,5 +368,6 @@ def run_app(*, verbose: bool = False, show: bool = True) -> int:
 
 
 def main() -> None:
-    """Entry point of the ``autoshelf-app`` command."""
-    sys.exit(run_app())
+    """Entry point of the ``autoshelf-app`` command (and of the packaged AutoShelf.exe)."""
+    background = "--background" in sys.argv[1:]
+    sys.exit(run_app(verbose="--verbose" in sys.argv[1:], show=not background))

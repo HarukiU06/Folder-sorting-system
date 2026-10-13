@@ -108,12 +108,15 @@ class SettingsView(QWidget):
         self.paused.toggled.connect(self._paused_changed)
         self.notifications = QCheckBox("Notify me when a file needs my decision")
         self.notifications.toggled.connect(self._notifications_changed)
+        self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
+        self.startup.toggled.connect(self._startup_changed)
         sorting_box = QGroupBox("Sorting")
         sorting = QVBoxLayout(sorting_box)
         sorting.addLayout(slider_row)
         sorting.addWidget(self.level_text)
         sorting.addWidget(self.paused)
         sorting.addWidget(self.notifications)
+        sorting.addWidget(self.startup)
 
         # Files
         self.stable = QDoubleSpinBox()
@@ -248,6 +251,13 @@ class SettingsView(QWidget):
 
         self.runner.run(self.service.settings, loaded)
 
+        def startup_loaded(enabled: bool) -> None:
+            self.startup.blockSignals(True)
+            self.startup.setChecked(enabled)
+            self.startup.blockSignals(False)
+
+        self.runner.run(self.service.starts_with_windows, startup_loaded, lambda exc: None)
+
     def show_settings(self, settings: Settings) -> None:
         """Fill in the widgets without triggering any changes."""
         self._settings = settings
@@ -318,6 +328,13 @@ class SettingsView(QWidget):
     def _notifications_changed(self, enabled: bool) -> None:
         self._update(None, False, notifications=enabled)
         self.notifications_toggled.emit(enabled)
+
+    def _startup_changed(self, enabled: bool) -> None:
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "Couldn't change the startup setting", str(exc))
+            self.load()
+
+        self.runner.run(lambda: self.service.set_start_with_windows(enabled), None, failed)
 
     def _apply_files(self) -> None:
         patterns = [line.strip() for line in self.patterns.toPlainText().splitlines()]

@@ -157,8 +157,10 @@ class DashboardView(QWidget):
             self.values["accuracy"].setText(f"{stats.accuracy:.0%}")
             kept = stats.auto_moves - stats.auto_corrected
             self.accuracy_note.setText(
-                f"{kept} of {stats.auto_moves} automatic moves were kept; the rest you undid or "
-                "moved to another folder."
+                f"All {kept} automatic moves were kept."
+                if kept == stats.auto_moves
+                else f"{kept} of {stats.auto_moves} automatic moves were kept; the rest you "
+                "undid or moved to another folder."
             )
         self.per_folder.set_items(stats.files_per_folder)
         self.per_month.set_items(stats.added_per_month)

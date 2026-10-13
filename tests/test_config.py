@@ -103,3 +103,45 @@ def test_balanced_preset_is_the_default() -> None:
     assert confidence_level(0.42, 0.11) is None
     thresholds = [level.threshold for level in CONFIDENCE_LEVELS]
     assert thresholds == sorted(thresholds, reverse=True)  # cautious -> automatic
+
+
+# --- start with Windows (Phase 8) ---------------------------------------------------------
+
+
+def test_start_with_windows_uses_the_run_key(fake_run_key: dict) -> None:
+    from autoshelf import startup
+
+    assert not startup.is_enabled()
+    startup.set_enabled(True)
+    command = fake_run_key[startup.VALUE_NAME]
+    assert command.endswith("-m autoshelf --background")
+    assert "pythonw.exe" in command or "python" in command.casefold()
+    assert startup.is_enabled()
+    startup.set_enabled(False)
+    assert fake_run_key == {}
+
+
+def test_packaged_app_starts_itself(monkeypatch) -> None:
+    import sys
+
+    from autoshelf import startup
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Program Files\AutoShelf\AutoShelf.exe")
+    assert startup.startup_command() == r'"C:\Program Files\AutoShelf\AutoShelf.exe" --background'
+
+
+def test_cli_startup_and_background(fake_run_key: dict, monkeypatch, capsys) -> None:
+    from autoshelf import cli
+    from autoshelf.ui import app as ui_app
+
+    assert cli.main(["config", "--startup", "on"]) == 0
+    assert "Start with Windows: on" in capsys.readouterr().out
+    assert fake_run_key
+    assert cli.main(["config", "--startup", "off"]) == 0
+    assert fake_run_key == {}
+
+    calls = []
+    monkeypatch.setattr(ui_app, "run_app", lambda **kwargs: calls.append(kwargs) or 0)
+    assert cli.main(["--background"]) == 0
+    assert calls == [{"verbose": False, "show": False}]

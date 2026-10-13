@@ -37,7 +37,21 @@ def open_database(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Run the enclosed statements atomically."""
+    """Run the enclosed statements atomically.
+
+    Inside another transaction this becomes a savepoint, so functions that need
+    atomicity can be combined into a larger atomic step.
+    """
+    if conn.in_transaction:
+        conn.execute("SAVEPOINT nested")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK TO nested")
+            conn.execute("RELEASE nested")
+            raise
+        conn.execute("RELEASE nested")
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn

@@ -5,10 +5,11 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** early development. Phases 1–5 are done: a Windows tray app (and a command-line
+> **Status:** early development. Phases 1–6 are done: a Windows tray app (and a command-line
 > tool) that reads each new file and either moves it into the right folder, when it is sure,
 > or into `_Inbox/` for you to decide, with full history and undo. It learns from your
-> corrections, follows your rules, and explains every decision.
+> corrections, follows your rules, explains every decision, and helps you search and tidy
+> your library.
 
 ## Safety rules
 
@@ -72,10 +73,16 @@ start paused so you can look first. AutoShelf then lives in the system tray:
 - **History:** every move with its reason and score, and a "Why?" panel; undo one, undo the
   last N, or move a file AutoShelf put in the wrong folder to the right one ("Move to another
   folder", which AutoShelf learns from).
+- **Library:** search your files by meaning or by exact words, browse tags, and see a
+  file's details, tags and related files.
 - **Folders:** your folders with file counts; double-click a description to edit it.
 - **Rules:** rules that send matching files straight to a folder (see below).
+- **Tidy up:** organize a messy folder (preview, then one undoable batch), find identical
+  files and possible versions.
+- **Dashboard:** files per folder, files added per month, how many automatic moves you
+  kept, the most corrected folders, and files not opened for six months.
 - **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
-  and which files to ignore.
+  which files to ignore, and other folders to watch (optional, e.g. Downloads).
 
 When a file needs your decision, a notification asks "Where should *file* go?"; click it to
 open the Inbox. The tray menu can pause sorting: new files then wait until you resume.
@@ -136,6 +143,26 @@ Rules, learning and explanations:
 .venv\Scripts\python.exe -m autoshelf why 3                      # why history entry #3 went where it went
 .venv\Scripts\python.exe -m autoshelf correct 3 Travel           # it belongs in Travel: move it and learn
 .venv\Scripts\python.exe -m autoshelf learned                    # the corrections AutoShelf learns from
+```
+
+Searching and tidying up:
+
+```powershell
+.venv\Scripts\python.exe -m autoshelf search "paper explaining k-means initialization"
+.venv\Scripts\python.exe -m autoshelf related "C:\path\to\notes.pdf"     # the 5 most similar files
+.venv\Scripts\python.exe -m autoshelf tag "C:\path\to\notes.pdf" Medicine "Exam prep"
+.venv\Scripts\python.exe -m autoshelf tags Medicine                 # every file tagged Medicine
+
+.venv\Scripts\python.exe -m autoshelf organize "C:\Old stuff"           # preview: where would each file go?
+.venv\Scripts\python.exe -m autoshelf organize "C:\Old stuff" --apply   # move the confident ones (one batch)
+.venv\Scripts\python.exe -m autoshelf undo --batch <id>              # undo that whole batch
+
+.venv\Scripts\python.exe -m autoshelf duplicates                    # identical files (nothing is deleted)
+.venv\Scripts\python.exe -m autoshelf duplicates --keep "<file>"    # move its copies to _Duplicates
+.venv\Scripts\python.exe -m autoshelf versions                      # e.g. report_v2 / report final
+.venv\Scripts\python.exe -m autoshelf stats
+
+.venv\Scripts\python.exe -m autoshelf config --watch "%USERPROFILE%\Downloads"   # opt in a folder to watch
 ```
 
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
@@ -213,6 +240,29 @@ made (similarity to the folder's name and description, to the files in it, and a
 learned), the most similar files already in the chosen folder, the words the file has in
 common with that folder (ranked by TF-IDF; for Japanese, kanji and katakana words), or the
 rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshelf why ID`.
+
+## Search, tags and tidying up
+
+- **Search** finds files by meaning ("paper explaining k-means initialization") and by exact
+  words, including Japanese ones. Files containing all the words come first. The text is
+  stored in chunks with their vectors in AutoShelf's database; nothing leaves your PC.
+- **Tags:** a file lives in one folder but can have any number of tags. When a file fits
+  two folders about equally, the Inbox offers the other one as a tag. Tags are app-only
+  (the iPhone sees folders). Tag views list every file with a tag, wherever it is.
+- **Duplicates:** identical files (same content) are listed; "keep one" moves the other
+  copies into `_Duplicates/`, where you can delete them yourself. AutoShelf never deletes.
+  **Possible versions** (very similar content and names, like `report_v2` and
+  `report final`, or iCloud's `notes 2.pdf`) are only shown.
+- **Organize a folder:** the root, `_Inbox`, one of your folders, or a folder elsewhere on
+  the same drive. You get a preview with a proposed folder and confidence for each file;
+  untick rows or change targets, then apply. The moves form one batch that you can undo in
+  one go (History → "Undo its batch", or `autoshelf undo --batch ID`).
+- **Watched folders** (off by default): new files that arrive in a folder you opt in, such
+  as Downloads, are moved into your library and sorted, if their extension is on the list
+  (documents by default: `.pdf .docx .pptx .xlsx .epub .txt .md .rtf .csv .ipynb`). Files
+  already there and subfolders are left alone, the folder must be on the same drive as
+  your library (files are only ever moved, never copied and deleted), and undo puts a file
+  back where it came from.
 
 ## What AutoShelf reads
 

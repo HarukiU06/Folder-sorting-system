@@ -53,6 +53,18 @@ def reset_logging() -> Iterator[None]:
 
 
 @pytest.fixture
+def fake_model(monkeypatch: pytest.MonkeyPatch):
+    """Replace the language model with the fake one for code that loads it by name."""
+    from fakes import FakeEmbedder
+
+    from autoshelf.ml import embedder as embedder_module
+
+    model = FakeEmbedder()
+    monkeypatch.setattr(embedder_module, "load_embedder", lambda name, cache_dir: model)
+    return model
+
+
+@pytest.fixture
 def paths(app_home: Path) -> AppPaths:
     return get_app_paths(app_home)
 

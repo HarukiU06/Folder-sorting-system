@@ -1,5 +1,7 @@
 """Turn an extracted file into one embedding vector, and store vectors as bytes."""
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from autoshelf.extract import Extraction
@@ -22,15 +24,31 @@ def header_text(extraction: Extraction, name: str) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def document_vector(embedder: Embedder, extraction: Extraction, name: str) -> np.ndarray:
+@dataclass(frozen=True)
+class EmbeddedDocument:
+    """A file's vector, and the pieces it was made from (kept for search)."""
+
+    vector: np.ndarray
+    texts: tuple[str, ...]  # the header, then the body text chunks
+    vectors: np.ndarray  # one row per text
+
+
+def embed_document(embedder: Embedder, extraction: Extraction, name: str) -> EmbeddedDocument:
     """Embed a file as a weighted mean of its header and its body text chunks."""
     header = header_text(extraction, name)
     chunks = embedder.chunk(extraction.text)[:MAX_CHUNKS]
     vectors = embedder.embed([header, *chunks])
-    if not chunks:
-        return normalize(vectors[0])
-    body = vectors[1:].mean(axis=0)
-    return normalize(HEADER_WEIGHT * vectors[0] + (1 - HEADER_WEIGHT) * normalize(body))
+    if chunks:
+        body = vectors[1:].mean(axis=0)
+        vector = normalize(HEADER_WEIGHT * vectors[0] + (1 - HEADER_WEIGHT) * normalize(body))
+    else:
+        vector = normalize(vectors[0])
+    return EmbeddedDocument(vector, (header, *chunks), vectors)
+
+
+def document_vector(embedder: Embedder, extraction: Extraction, name: str) -> np.ndarray:
+    """Embed a file as one vector (see ``embed_document``)."""
+    return embed_document(embedder, extraction, name).vector
 
 
 def normalize(vector: np.ndarray) -> np.ndarray:

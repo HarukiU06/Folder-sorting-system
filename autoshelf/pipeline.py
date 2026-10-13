@@ -10,23 +10,23 @@ with why it happened (``ml.explain``).
 import logging
 import os
 import sqlite3
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-
-import numpy as np
 
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.mover import MoveError, free_destination, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
+from autoshelf.features.tags import suggest_tags
 from autoshelf.fsutil import sha256_file
 from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
+from autoshelf.ml.vectors import EmbeddedDocument
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
@@ -90,7 +90,9 @@ class Pipeline:
     """Processes stable files from the root and ``_Inbox``. Use from a single thread.
 
     Without a ``library`` (e.g. the language model couldn't be loaded) every file waits
-    in ``_Inbox`` for the user.
+    in ``_Inbox`` for the user. ``watched`` are opt-in folders outside the root: files
+    directly in them with one of ``watched_extensions`` are sorted like files dropped
+    into the root (and undo puts them back where they came from).
     """
 
     def __init__(
@@ -105,8 +107,12 @@ class Pipeline:
         library: LibraryIndex | None = None,
         threshold: float = DEFAULT_AUTO_THRESHOLD,
         margin: float = DEFAULT_AUTO_MARGIN,
+        watched: Sequence[Path] = (),
+        watched_extensions: Iterable[str] = (),
     ) -> None:
         self.conn = conn
+        self.watched = tuple(watched)
+        self.watched_extensions = {ext.casefold() for ext in watched_extensions}
         self.root = root
         self.dry_run = dry_run
         self.ignore_patterns = tuple(ignore_patterns)
@@ -128,8 +134,17 @@ class Pipeline:
             log.exception("Unexpected error while processing %s", path)
             return Outcome(OutcomeKind.FAILED, path, f"unexpected error: {exc}")
 
+    def watched_folder(self, path: Path) -> Path | None:
+        """The watched folder ``path`` is directly in, if its extension is wanted there."""
+        if path.suffix.casefold() not in self.watched_extensions:
+            return None
+        return next((folder for folder in self.watched if path.parent == folder), None)
+
     def _process(self, path: Path) -> Outcome:
         zone = zone_of(path, self.root)
+        source = self.watched_folder(path) if zone is Zone.OUTSIDE else None
+        if source is not None:
+            zone = Zone.DROP  # sorted like a file dropped into the root
         if zone not in PROCESSED_ZONES:
             return Outcome(OutcomeKind.SKIPPED, path, f"not processed in a {zone.value} location")
         if not path.is_file():
@@ -148,7 +163,7 @@ class Pipeline:
                 return Outcome(OutcomeKind.SKIPPED, path, "waiting in _Inbox for your decision")
         duplicates = self._duplicates_of(path, digest)
         extraction = self.extractor(path)
-        vector, classification = self._classify(path, extraction)
+        document, classification = self._classify(path, extraction)
         rule = rule_engine.first_match(
             repository.list_rules(self.conn, enabled_only=True), path, extraction
         )
@@ -158,6 +173,8 @@ class Pipeline:
             decision = self._decide(zone, classification)
         if decision.target_dir is not None and not self._can_receive(decision.target_dir):
             decision = self._fallback_to_inbox(zone, decision)
+        if source is not None:
+            decision = replace(decision, message=f"from {source.name}: {decision.message}")
         details = self._details(path, extraction, classification, rule)
 
         def outcome(kind: OutcomeKind, message: str, **extra) -> Outcome:
@@ -174,7 +191,7 @@ class Pipeline:
 
         if decision.target_dir is None:
             if not self.dry_run:
-                self._record_waiting(path, digest, st, extraction, vector, decision.suggestion)
+                self._record_waiting(path, digest, st, extraction, document, decision.suggestion)
             return outcome(OutcomeKind.WAITING, decision.message)
         if self.dry_run:
             dst = self._planned_destination(decision.target_dir, path.name)
@@ -191,31 +208,32 @@ class Pipeline:
             sha256=digest,
             details=details,
             before_rename=self._expect_self_move,
+            allowed_source=source,
         )
         repository.set_suggestion(self.conn, result.file_id, decision.suggestion)
         store_content(self.conn, result.file_id, extraction)
-        if vector is not None:
-            self._store_vector(result.file_id, vector, st)
+        if document is not None:
+            self._store_vector(result.file_id, document, st)
         return outcome(
             OutcomeKind.MOVED, decision.message, dst=result.dst, history_id=result.history_id
         )
 
     def _classify(
         self, path: Path, extraction: Extraction
-    ) -> tuple[np.ndarray | None, Classification | None]:
+    ) -> tuple[EmbeddedDocument | None, Classification | None]:
         """Embed the file and score the folders. Returns (None, None) without a library."""
         if self.library is None:
             return None, None
         try:
             self.library.refresh()  # pick up folders and files the user added meanwhile
-            vector = self.library.vectorize(extraction, path.name)
+            document = self.library.embed(extraction, path.name)
             classification = self.library.classify(
-                vector, threshold=self.threshold, margin=self.margin
+                document.vector, threshold=self.threshold, margin=self.margin
             )
         except Exception:
             log.exception("Couldn't classify %s; it will wait in _Inbox", path)
             return None, None
-        return vector, classification
+        return document, classification
 
     def _decide(self, zone: Zone, classification: Classification | None) -> Decision:
         if classification is None:
@@ -266,6 +284,9 @@ class Pipeline:
             except Exception:
                 log.exception("Couldn't explain the decision for %s", path)
                 details = classification.to_details()
+        suggestions = suggest_tags(classification, rule.rule.target_folder if rule else None)
+        if suggestions:
+            details["tag_suggestions"] = suggestions
         if rule is not None:
             details.update(
                 explain.rule_details(
@@ -291,7 +312,7 @@ class Pipeline:
         digest: str,
         st: os.stat_result,
         extraction: Extraction,
-        vector: np.ndarray | None,
+        document: EmbeddedDocument | None,
         suggestion: str | None,
     ) -> None:
         """Remember a file that stays in _Inbox, so it isn't classified again and again."""
@@ -301,13 +322,18 @@ class Pipeline:
         repository.set_file_status(self.conn, file_id, "inbox")
         repository.set_suggestion(self.conn, file_id, suggestion)
         store_content(self.conn, file_id, extraction)
-        if vector is not None:
-            self._store_vector(file_id, vector, st)
+        if document is not None:
+            self._store_vector(file_id, document, st)
 
-    def _store_vector(self, file_id: int, vector: np.ndarray, st: os.stat_result) -> None:
+    def _store_vector(self, file_id: int, document: EmbeddedDocument, st: os.stat_result) -> None:
         # A rename keeps size and mtime, so the vector stays valid at the new path.
         store_vector(
-            self.conn, file_id, vector, model=self.library.model, size=st.st_size, mtime=st.st_mtime
+            self.conn,
+            file_id,
+            document,
+            model=self.library.model,
+            size=st.st_size,
+            mtime=st.st_mtime,
         )
 
     def _duplicates_of(self, path: Path, digest: str) -> tuple[Path, ...]:

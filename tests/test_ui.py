@@ -482,3 +482,153 @@ def test_rule_dialog_offers_folders_and_kinds(qtbot) -> None:
     dialog.target.setCurrentText("Recipes")
     assert dialog.values() == ("Notebooks", "extension", ".ipynb", "Recipes", True)
     assert "extensions" in dialog.hint.text()
+
+
+# --- Phase 6: Library, Tidy up, Dashboard, watched folders -----------------------------------
+
+
+def test_library_searches_and_tags(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.library_view import LibraryView
+
+    service.folders()
+    service.inbox()  # indexes the library
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.query.setText("invoice tax")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+
+    assert view.results.item(0, 0).text() == "invoice 2024.txt"
+    assert view.name.text() == "invoice 2024.txt"
+    assert "In Finance" in view.facts.text()
+
+    view.new_tag.setText("Taxes 2024")
+    view._add_typed_tag()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert [view.file_tags.item(i).text() for i in range(view.file_tags.count())] == ["Taxes 2024"]
+    assert view.tag_list.item(0).text() == "Taxes 2024  (1)"
+
+    view.results.setRowCount(0)
+    view._tag_clicked(view.tag_list.item(0))
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.results.rowCount() == 1
+    view.file_tags.setCurrentRow(0)
+    view._remove_tag()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert service.tags() == []
+
+
+def test_tidy_organizes_and_undoes_a_batch(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.tidy_view import ROOT_CHOICE, TidyView
+
+    service.save_settings(replace(service.settings(), auto_threshold=0.3, auto_margin=0.1))
+    make(shelf / "tax invoice.txt", "invoice tax bank receipt")
+    view = TidyView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    page = view.organize
+    page.source.setCurrentText(ROOT_CHOICE)
+    page.preview()
+    settle(qtbot, runner)
+    assert page.table.rowCount() == 1
+    assert page.table.cellWidget(0, 3).currentText() == "Finance"
+    assert (shelf / "tax invoice.txt").exists()
+
+    page.apply()
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "tax invoice.txt").exists()
+    assert page.undo_button.isEnabled()
+    page.undo_batch()
+    settle(qtbot, runner)
+    assert (shelf / "tax invoice.txt").exists()
+
+
+def test_tidy_sets_duplicates_aside(
+    qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.tidy_view import TidyView
+
+    copy = make(shelf / "Recipes" / "copy.txt", "invoice total tax due bank")
+    view = TidyView(service, runner)
+    qtbot.addWidget(view)
+    page = view.duplicates
+    page.refresh()
+    settle(qtbot, runner)
+    group = page.tree.topLevelItem(0)
+    assert group.childCount() == 2
+    keep = next(group.child(i) for i in range(2) if "invoice 2024" in group.child(i).text(0))
+    page.tree.setCurrentItem(keep)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    page.keep_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert not copy.exists()
+    assert (shelf / "_Duplicates" / "copy.txt").exists()
+    assert page.tree.topLevelItemCount() == 0
+
+
+def test_dashboard_shows_numbers(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.dashboard_view import DashboardView
+
+    make(shelf / "_Inbox" / "waiting.txt", "x")
+    view = DashboardView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    assert view.values["files"].text() == "1"
+    assert view.values["inbox"].text() == "1"
+    assert view.per_folder.items == [("Finance", 1), ("Recipes", 0)]
+    view.resize(800, 600)
+    view.grab()  # paints the charts
+
+
+def test_settings_add_and_remove_a_watched_folder(
+    qtbot, service, runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    monkeypatch.setattr(
+        "autoshelf.ui.settings_view.QFileDialog.getExistingDirectory", lambda *a: str(downloads)
+    )
+    with qtbot.waitSignal(view.restart_needed, timeout=WAIT_MS):
+        view.add_watched()
+        settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.watched.count() == 1
+    view.watched.setCurrentRow(0)
+    with qtbot.waitSignal(view.restart_needed, timeout=WAIT_MS):
+        view.remove_watched()
+        settle(qtbot, runner)
+    assert service.settings().watched_folders == []
+    view.extensions.setText("pdf, .MD")
+    with qtbot.waitSignal(view.restart_needed, timeout=WAIT_MS):
+        view._apply_extensions()
+    assert service.settings().watched_extensions == [".md", ".pdf"]
+
+
+def test_main_window_has_every_screen(qtbot, service, runner) -> None:
+    window = MainWindow(service, runner, keep_running_on_close=False)
+    qtbot.addWidget(window)
+    names = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    assert names == [
+        "Inbox",
+        "Library",
+        "History",
+        "Folders",
+        "Rules",
+        "Tidy up",
+        "Dashboard",
+        "Settings",
+    ]
+    for index in range(window.tabs.count()):
+        window.tabs.setCurrentIndex(index)
+        settle(qtbot, runner)

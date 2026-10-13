@@ -1,4 +1,4 @@
-"""The main window: Inbox, History, Folders, Rules and Settings tabs."""
+"""The main window: one tab per screen."""
 
 from pathlib import Path
 
@@ -6,13 +6,16 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget
 
 from autoshelf.app_service import AppService
+from autoshelf.ui.dashboard_view import DashboardView
 from autoshelf.ui.folders_view import FoldersView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
+from autoshelf.ui.library_view import LibraryView
 from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.tasks import TaskRunner
+from autoshelf.ui.tidy_view import TidyView
 
 MESSAGE_MSECS = 8000
 
@@ -30,15 +33,21 @@ class MainWindow(QMainWindow):
         self.resize(1000, 660)
 
         self.inbox = InboxView(service, runner)
+        self.library = LibraryView(service, runner)
         self.history = HistoryView(service, runner)
         self.folders = FoldersView(service, runner)
         self.rules = RulesView(service, runner)
+        self.tidy = TidyView(service, runner)
+        self.dashboard = DashboardView(service, runner)
         self.settings = SettingsView(service, runner)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.inbox, "Inbox")
+        self.tabs.addTab(self.library, "Library")
         self.tabs.addTab(self.history, "History")
         self.tabs.addTab(self.folders, "Folders")
         self.tabs.addTab(self.rules, "Rules")
+        self.tabs.addTab(self.tidy, "Tidy up")
+        self.tabs.addTab(self.dashboard, "Dashboard")
         self.tabs.addTab(self.settings, "Settings")
         self.setCentralWidget(self.tabs)
         self.state = QLabel()
@@ -49,6 +58,8 @@ class MainWindow(QMainWindow):
         self.history.undone.connect(self._after_move)
         self.folders.saved.connect(self._after_description)
         self.rules.changed.connect(self._after_rules)
+        self.library.changed.connect(self._after_rules)
+        self.tidy.changed.connect(self._after_move)
         self.tabs.currentChanged.connect(self._tab_changed)
 
     def show_message(self, text: str) -> None:
@@ -110,6 +121,12 @@ class MainWindow(QMainWindow):
             self.folders.refresh()
         elif widget is self.rules:
             self.rules.refresh()
+        elif widget is self.library:
+            self.library.refresh()
+        elif widget is self.tidy:
+            self.tidy.refresh()
+        elif widget is self.dashboard:
+            self.dashboard.refresh()
         elif widget is self.settings:
             self.settings.load()
 

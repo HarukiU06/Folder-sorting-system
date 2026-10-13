@@ -132,3 +132,28 @@ CREATE INDEX corrections_file ON corrections (file_id);
 CREATE INDEX history_file ON history (file_id);
 CREATE INDEX files_size ON files (size);
 """
+
+V4 = """
+-- Search (SPEC 5.3): each file's text in chunks, with their vectors (stored together with
+-- the file's vector, by the same model). Keyword search uses trigrams, which also find
+-- words in Japanese text; queries shorter than three characters are matched with LIKE.
+DROP TRIGGER chunks_ai;
+DROP TRIGGER chunks_ad;
+DROP TRIGGER chunks_au;
+DROP TABLE chunks_fts;
+CREATE VIRTUAL TABLE chunks_fts USING fts5 (
+    text, content = 'chunks', content_rowid = 'id', tokenize = 'trigram'
+);
+INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild');
+CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts (rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER chunks_au AFTER UPDATE OF text ON chunks BEGIN
+    INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO chunks_fts (rowid, text) VALUES (new.id, new.text);
+END;
+CREATE INDEX file_tags_tag ON file_tags (tag_id);
+"""

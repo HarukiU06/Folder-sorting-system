@@ -12,6 +12,7 @@ from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAUL
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
 from autoshelf.extract.filename import filename_tokens
+from autoshelf.features.tags import suggest_tags
 from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, scan_library
@@ -35,6 +36,7 @@ class InboxItem:
     excerpt: str | None
     classification: Classification | None  # None without a classifier
     details: dict | None = None  # why: scores, similar files, shared words (ml.explain)
+    tag_suggestions: tuple[str, ...] = ()  # close runner-up folders, offered as tags
 
     @property
     def explanation(self) -> str:
@@ -166,5 +168,6 @@ def inbox_items(
                 "stored", tuple(filename_tokens(path.name)), text=excerpt or "", title=title
             )
             details = library.explain(classification, extraction, path.name)
-        items.append(InboxItem(path, title, excerpt, classification, details))
+        suggestions = tuple(suggest_tags(classification))
+        items.append(InboxItem(path, title, excerpt, classification, details, suggestions))
     return items

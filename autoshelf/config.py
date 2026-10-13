@@ -151,6 +151,55 @@ def validate_root(root: Path, paths: AppPaths) -> Path:
     return resolved
 
 
+def validate_outside_folder(folder: Path, root: Path, paths: AppPaths) -> Path:
+    """Check a folder outside the root that files may be taken from, and resolve it.
+
+    Used for watched folders and for organizing another folder: it must be a real
+    folder on the same drive as the root (moves are renames, never copy-and-delete), and
+    must not be or contain the root, AutoShelf's data folder, the home folder, a whole
+    drive or a Windows system folder.
+    """
+    try:
+        resolved = Path(folder).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise ConfigError(f"Folder does not exist: {folder}") from None
+    if not resolved.is_dir():
+        raise ConfigError(f"Not a folder: {resolved}")
+    if resolved.parent == resolved:
+        raise ConfigError(f"Refusing to use a whole drive: {resolved}")
+    if resolved == Path.home().resolve():
+        raise ConfigError("Refusing to use your whole home folder; pick a folder inside it.")
+    system_root = os.environ.get("SYSTEMROOT")
+    if system_root and resolved.is_relative_to(Path(system_root).resolve()):
+        raise ConfigError(f"Refusing to use a Windows system folder: {resolved}")
+    if resolved.is_relative_to(root) or root.is_relative_to(resolved):
+        raise ConfigError(f"{resolved} is inside the folder AutoShelf sorts, or contains it.")
+    if paths.home.is_relative_to(resolved) or resolved.is_relative_to(paths.home):
+        raise ConfigError(f"{resolved} holds AutoShelf's own data folder.")
+    if os.stat(resolved).st_dev != os.stat(root).st_dev:
+        raise ConfigError(
+            f"{resolved} is on another drive than {root}; AutoShelf only moves files within "
+            "one drive (it never copies and deletes them)."
+        )
+    return resolved
+
+
+# New files with these extensions are taken from watched folders (documents only, so
+# installers and archives in Downloads are left alone).
+DEFAULT_WATCHED_EXTENSIONS = (
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+    ".epub",
+    ".txt",
+    ".md",
+    ".rtf",
+    ".csv",
+    ".ipynb",
+)
+
+
 @dataclass
 class Settings:
     """User settings, persisted as JSON values in the ``settings`` table."""
@@ -163,6 +212,10 @@ class Settings:
     auto_margin: float = DEFAULT_AUTO_MARGIN
     paused: bool = False  # automatic sorting paused (files wait until resumed)
     notifications: bool = True  # notify when a file needs a decision
+    # Opt-in folders outside the root (e.g. Downloads): new files there with one of
+    # ``watched_extensions`` are moved into the root and sorted. None by default.
+    watched_folders: list[str] = field(default_factory=list)
+    watched_extensions: list[str] = field(default_factory=lambda: list(DEFAULT_WATCHED_EXTENSIONS))
 
 
 def load_settings(conn: sqlite3.Connection) -> Settings:

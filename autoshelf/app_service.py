@@ -24,12 +24,19 @@ from autoshelf.config import (
     Settings,
     load_settings,
     save_settings,
+    validate_outside_folder,
     validate_root,
 )
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
+from autoshelf.features import duplicates as duplicate_features
+from autoshelf.features import organize as organize_features
+from autoshelf.features import tags as tag_features
+from autoshelf.features.related import Related, related_files
+from autoshelf.features.search import SearchHit, SearchIndex, folder_label
+from autoshelf.features.stats import LibraryStats, library_stats
 from autoshelf.instance import LOCK_FILENAME, WatchLock
-from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
+from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml.embedder import Embedder, is_downloaded
 from autoshelf.ml.library import LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
@@ -73,6 +80,17 @@ def library_factory(
     return make_library
 
 
+def valid_watched(paths: AppPaths, settings: Settings, root: Path) -> list[Path]:
+    """The opted-in watched folders that are still safe to take files from."""
+    valid = []
+    for folder in settings.watched_folders:
+        try:
+            valid.append(validate_outside_folder(Path(folder), root, paths))
+        except ConfigError as exc:
+            log.warning("Not watching %s: %s", folder, exc)
+    return valid
+
+
 def watch_lock(paths: AppPaths) -> WatchLock:
     """The lock that lets only one process sort the library in ``paths``."""
     return WatchLock(paths.home / LOCK_FILENAME)
@@ -88,6 +106,21 @@ class FolderInfo:
 
 
 @dataclass(frozen=True)
+class FileInfo:
+    """One file as shown in the Library's detail panel."""
+
+    path: Path
+    folder: str
+    title: str | None
+    excerpt: str | None
+    summary: str | None
+    tags: list[str]
+    size: int
+    modified: float
+    tag_suggestions: list[str]  # from the last decision: close runner-up folders
+
+
+@dataclass(frozen=True)
 class RuleTest:
     """What the rules (or, failing them, the classifier) would do with a file."""
 
@@ -100,15 +133,23 @@ class RuleTest:
 class AppService:
     """Owns the watcher for the app's lifetime and performs the user's actions."""
 
-    def __init__(self, paths: AppPaths, *, loader: EmbedderLoader = default_loader) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        *,
+        loader: EmbedderLoader = default_loader,
+        root: Path | None = None,
+    ) -> None:
         self.paths = paths
         self._loader = loader
+        self._root_override = root  # the CLI's --root
         self._lock = watch_lock(paths)
         self._service: WatchService | None = None
         self._service_lock = threading.RLock()
         self.on_outcome: Callable[[Outcome], None] | None = None
         self.on_status: Callable[[str], None] | None = None
         self.on_learned: Callable[[list[learning.Relocation]], None] | None = None
+        self._search_index = SearchIndex()
 
     # --- settings -----------------------------------------------------------------
 
@@ -132,7 +173,7 @@ class AppService:
 
     def root(self) -> Path | None:
         """The configured root folder, if it is still a valid one."""
-        configured = self.settings().root
+        configured = self._root_override or self.settings().root
         if configured is None:
             return None
         try:
@@ -206,6 +247,7 @@ class AppService:
             if root is None:
                 return False
             settings = self.settings()
+            watched = valid_watched(self.paths, settings, root)
             service = WatchService(
                 root,
                 self.paths.db_path,
@@ -220,6 +262,8 @@ class AppService:
                 on_outcome=self._outcome,
                 on_status=self._status,
                 on_learned=self._learned,
+                watched=watched,
+                watched_extensions=settings.watched_extensions,
             )
             service.start()
             self._service = service
@@ -304,12 +348,12 @@ class AppService:
                 ignore_patterns=settings.ignore_patterns,
             )
 
-    def assign(self, path: Path, folder: str) -> MoveResult:
-        """Move a waiting file into the folder the user chose."""
+    def assign(self, path: Path, folder: str, tags: list[str] | None = None) -> MoveResult:
+        """Move a waiting file into the folder the user chose (and tag it, if asked)."""
         root = self._require_root()
         settings = self.settings()
         with self._connect() as conn:
-            return assign(
+            result = assign(
                 conn,
                 path,
                 folder,
@@ -317,6 +361,9 @@ class AppService:
                 ignore_patterns=settings.ignore_patterns,
                 before_rename=self._before_rename(),
             )
+            if tags:
+                tag_features.tag_file(conn, result.dst, tags, root)
+            return result
 
     def undo(self, history_id: int, *, force: bool = False) -> MoveResult:
         """Undo one history entry."""
@@ -375,6 +422,191 @@ class AppService:
         """Every recorded correction, oldest first."""
         with self._connect() as conn:
             return repository.list_corrections(conn)
+
+    # --- library: search, related files, tags --------------------------------------
+
+    def _embedder(self) -> Embedder:
+        settings = self.settings()
+        return self._loader(settings.embedding_model, self.paths.model_dir)
+
+    def search(self, query: str, limit: int = 30) -> list[SearchHit]:
+        """Files matching ``query`` by meaning or by exact words (loads the model)."""
+        root = self._require_root()
+        embedder = self._embedder()
+        with self._connect() as conn:
+            return self._search_index.search(conn, root, embedder, query, limit=limit)
+
+    def related(self, path: Path) -> list[Related]:
+        """The files most similar to ``path``."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return related_files(conn, root, path)
+
+    def file_info(self, path: Path) -> FileInfo:
+        """What the Library shows about one file."""
+        root = self._require_root()
+        st = path.stat()
+        with self._connect() as conn:
+            record = repository.get_file_by_path(conn, path)
+            title, excerpt = (
+                repository.get_file_content(conn, record.id) if record else (None, None)
+            )
+            summary = repository.get_summary(conn, record.id) if record else None
+            tags = repository.tags_of(conn, record.id) if record else []
+            decision = repository.last_decision(conn, record.id) if record else None
+        suggestions = decision.details.get("tag_suggestions", []) if decision else []
+        return FileInfo(
+            path,
+            folder_label(path, root),
+            title,
+            excerpt,
+            summary,
+            tags,
+            st.st_size,
+            st.st_mtime,
+            [name for name in suggestions if name not in tags],
+        )
+
+    def mark_opened(self, path: Path) -> None:
+        """Note that the user opened a file from AutoShelf (for the dashboard)."""
+        with self._connect() as conn:
+            record = repository.get_file_by_path(conn, path)
+            if record is not None:
+                repository.mark_opened(conn, record.id)
+
+    def tags(self) -> list[tuple[str, int]]:
+        """Every tag in use, with how many files have it."""
+        with self._connect() as conn:
+            return repository.tag_counts(conn)
+
+    def tagged(self, name: str) -> list[Path]:
+        """Files with a tag (a virtual folder)."""
+        with self._connect() as conn:
+            return tag_features.tagged_files(conn, name)
+
+    def tag(self, path: Path, names: list[str]) -> list[str]:
+        """Tag a file; returns the tags that were new to it."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return tag_features.tag_file(conn, path, names, root)
+
+    def untag(self, path: Path, name: str) -> bool:
+        """Remove a tag from a file."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return tag_features.untag_file(conn, path, name, root)
+
+    # --- tidying up: duplicates, versions, organize ------------------------------------
+
+    def duplicates(self) -> list[duplicate_features.DuplicateGroup]:
+        """Groups of identical files (refreshes the index first, so new files count)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            try:
+                self.library(conn, root)
+            except Exception as exc:
+                log.warning("Couldn't refresh the index: %s", exc)
+            return duplicate_features.exact_duplicates(conn, root)
+
+    def keep_one(self, keep: Path, others: list[Path]) -> list[MoveResult]:
+        """Keep one copy and move the other identical copies into _Duplicates."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return duplicate_features.keep_one(
+                conn, root, keep, others, before_rename=self._before_rename()
+            )
+
+    def versions(self) -> list[duplicate_features.VersionGroup]:
+        """Groups of files that look like versions of one document."""
+        root = self._require_root()
+        with self._connect() as conn:
+            model = self.settings().embedding_model
+            try:
+                model = self.library(conn, root).model
+            except Exception as exc:
+                log.warning("Couldn't refresh the index: %s", exc)
+            return duplicate_features.possible_versions(conn, root, model)
+
+    def check_organize_folder(self, folder: Path) -> Path:
+        """Validate a folder to organize: inside the root (not a reserved folder), or a
+        safe folder outside it on the same drive."""
+        root = self._require_root()
+        resolved = Path(folder).resolve()
+        if resolved == root or resolved.is_relative_to(root):
+            if resolved != root and zone_of(resolved / "x", root) is Zone.RESERVED:
+                raise ConfigError(f"{resolved.name} is AutoShelf's own folder")
+            return resolved
+        return validate_outside_folder(resolved, root, self.paths)
+
+    def plan_organize(
+        self, folder: Path, *, recursive: bool = False, progress=None
+    ) -> list[organize_features.Proposal]:
+        """Proposed moves for every file in ``folder`` (reads files, moves nothing)."""
+        root = self._require_root()
+        folder = self.check_organize_folder(folder)
+        settings = self.settings()
+        with self._connect() as conn:
+            try:
+                library = self.library(conn, root)
+            except Exception as exc:
+                log.warning("Only rules can propose folders: %s", exc)
+                library = None
+            return organize_features.plan(
+                conn,
+                root,
+                library,
+                folder,
+                recursive=recursive,
+                threshold=settings.auto_threshold,
+                margin=settings.auto_margin,
+                ignore_patterns=settings.ignore_patterns,
+                progress=progress,
+            )
+
+    def apply_organize(
+        self, folder: Path, proposals: list[organize_features.Proposal]
+    ) -> organize_features.OrganizeResult:
+        """Move the ticked proposals as one batch (undo it with ``undo_batch``)."""
+        root = self._require_root()
+        folder = self.check_organize_folder(folder)
+        with self._connect() as conn:
+            return organize_features.apply(
+                conn, root, proposals, folder=folder, before_rename=self._before_rename()
+            )
+
+    def undo_batch(self, batch_id: str, *, force: bool = False) -> list[MoveResult]:
+        """Undo every move of one batch, newest first."""
+        with self._connect() as conn:
+            return undo_actions.undo_batch(
+                conn, batch_id, force=force, before_rename=self._before_rename()
+            )
+
+    def stats(self) -> LibraryStats:
+        """The dashboard's numbers."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return library_stats(conn, root, self.settings().ignore_patterns)
+
+    # --- watched folders ------------------------------------------------------------------
+
+    def add_watched(self, folder: Path) -> Path:
+        """Opt a folder in: new matching files there are moved in and sorted. Restart after."""
+        root = self._require_root()
+        resolved = validate_outside_folder(folder, root, self.paths)
+        settings = self.settings()
+        known = {Path(item) for item in settings.watched_folders}
+        if resolved not in known:
+            settings.watched_folders = [*settings.watched_folders, str(resolved)]
+            self.save_settings(settings)
+        return resolved
+
+    def remove_watched(self, folder: Path) -> None:
+        """Stop watching a folder. Restart after."""
+        settings = self.settings()
+        settings.watched_folders = [
+            item for item in settings.watched_folders if Path(item) != Path(folder)
+        ]
+        self.save_settings(settings)
 
     # --- rules --------------------------------------------------------------------
 

@@ -102,11 +102,20 @@ class SentenceTransformerEmbedder:
             offsets = encoding["offset_mapping"]
         except Exception:
             return split_chars(text, FALLBACK_CHUNK_CHARS)
-        pieces = []
-        for start in range(0, len(offsets), self.chunk_tokens):
-            window = offsets[start : start + self.chunk_tokens]
-            pieces.append(text[window[0][0] : window[-1][1]].strip())
-        return [piece for piece in pieces if piece]
+        return [piece for piece in _windows(text, offsets, self.chunk_tokens) if piece]
+
+
+def _windows(text: str, offsets: Sequence[tuple[int, int]], size: int) -> list[str]:
+    """Cut text into windows of ``size`` tokens. A short last window is moved back to
+    overlap the one before, so no chunk is a meaningless scrap like "-batch."."""
+    starts = list(range(0, len(offsets), size))
+    if len(starts) > 1 and len(offsets) - starts[-1] < size // 2:
+        starts[-1] = len(offsets) - size
+    pieces = []
+    for start in starts:
+        window = offsets[start : start + size]
+        pieces.append(text[window[0][0] : window[-1][1]].strip())
+    return pieces
 
 
 def _load_model(model_name: str, cache_dir: Path):

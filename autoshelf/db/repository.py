@@ -567,3 +567,199 @@ def undos_with_stale_target(conn: sqlite3.Connection) -> list[int]:
         " WHERE u.action = 'undo' AND u.state = 'done' AND target.state = 'done'"
     )
     return [row["id"] for row in rows]
+
+
+# --- chunks (search) ------------------------------------------------------------------
+
+
+def replace_chunks(
+    conn: sqlite3.Connection, file_id: int, texts: list[str], vectors: list[bytes]
+) -> None:
+    """Store a file's text chunks and their vectors, replacing any older ones."""
+    rows = [
+        (file_id, idx, text, vector)
+        for idx, (text, vector) in enumerate(zip(texts, vectors, strict=True))
+    ]
+    with transaction(conn):
+        conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
+        conn.executemany(
+            "INSERT INTO chunks (file_id, idx, text, embedding) VALUES (?, ?, ?, ?)", rows
+        )
+
+
+def has_chunks(conn: sqlite3.Connection, file_id: int) -> bool:
+    """True if a file's text has been stored for search."""
+    row = conn.execute("SELECT 1 FROM chunks WHERE file_id = ? LIMIT 1", (file_id,)).fetchone()
+    return row is not None
+
+
+def chunks_signature(conn: sqlite3.Connection) -> tuple[int, int]:
+    """(number of chunks, highest chunk id): changes whenever chunks are added or removed."""
+    row = conn.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM chunks").fetchone()
+    return row[0], row[1]
+
+
+def searchable_chunks(conn: sqlite3.Connection, model: str) -> list[sqlite3.Row]:
+    """Every chunk whose file's vector was made by ``model``, with the file's path."""
+    return conn.execute(
+        "SELECT c.id, c.file_id, c.idx, c.text, c.embedding, f.path, f.status"
+        " FROM chunks AS c JOIN files AS f ON f.id = c.file_id"
+        " JOIN file_vectors AS v ON v.file_id = c.file_id"
+        " WHERE v.model = ? AND c.embedding IS NOT NULL ORDER BY c.file_id, c.idx",
+        (model,),
+    ).fetchall()
+
+
+def chunks_matching(conn: sqlite3.Connection, phrase: str) -> set[int]:
+    """Ids of chunks containing ``phrase`` (any case; three characters or more)."""
+    quoted = '"' + phrase.replace('"', '""') + '"'
+    rows = conn.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?", (quoted,))
+    return {row[0] for row in rows}
+
+
+def vector_model(conn: sqlite3.Connection, path: str | Path) -> str | None:
+    """The model that made the stored vector of the file at ``path``."""
+    row = conn.execute(
+        "SELECT v.model FROM file_vectors AS v JOIN files AS f ON f.id = v.file_id"
+        " WHERE f.path = ?",
+        (str(path),),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def file_vectors(conn: sqlite3.Connection, model: str) -> list[tuple[int, str, bytes]]:
+    """(file id, path, vector) of every file with a vector made by ``model``."""
+    rows = conn.execute(
+        "SELECT f.id, f.path, v.vector FROM file_vectors AS v JOIN files AS f ON f.id = v.file_id"
+        " WHERE v.model = ? ORDER BY f.id",
+        (model,),
+    )
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+def set_summary(conn: sqlite3.Connection, file_id: int, summary: str | None) -> None:
+    """Cache a file's summary."""
+    conn.execute("UPDATE files SET summary = ? WHERE id = ?", (summary, file_id))
+
+
+def get_summary(conn: sqlite3.Connection, file_id: int) -> str | None:
+    """A file's cached summary, if any."""
+    row = conn.execute("SELECT summary FROM files WHERE id = ?", (file_id,)).fetchone()
+    return None if row is None else row["summary"]
+
+
+def mark_opened(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remember that the user opened a file from AutoShelf (for the stats)."""
+    conn.execute("UPDATE files SET last_opened_at = ? WHERE id = ?", (now_iso(), file_id))
+
+
+def last_opened(conn: sqlite3.Connection) -> dict[str, str]:
+    """When files were last opened from AutoShelf, keyed by casefolded path."""
+    rows = conn.execute("SELECT path, last_opened_at FROM files WHERE last_opened_at IS NOT NULL")
+    return {row["path"].casefold(): row["last_opened_at"] for row in rows}
+
+
+def duplicate_hashes(conn: sqlite3.Connection) -> list[list[FileRecord]]:
+    """Recorded files grouped by content hash, for hashes recorded more than once."""
+    rows = conn.execute(
+        "SELECT * FROM files WHERE sha256 IN (SELECT sha256 FROM files WHERE sha256 IS NOT NULL"
+        " GROUP BY sha256 HAVING COUNT(*) > 1) ORDER BY sha256, id"
+    )
+    groups: dict[str, list[FileRecord]] = {}
+    for row in rows:
+        groups.setdefault(row["sha256"], []).append(_file_from_row(row))
+    return list(groups.values())
+
+
+# --- tags ---------------------------------------------------------------------------
+
+
+def add_tag(conn: sqlite3.Connection, file_id: int, name: str) -> str | None:
+    """Tag a file. Returns the tag as stored (an existing tag keeps its spelling), or None
+    if the file already had it."""
+    with transaction(conn):
+        conn.execute("INSERT INTO tags (name) VALUES (?) ON CONFLICT (name) DO NOTHING", (name,))
+        tag_id, stored = conn.execute(
+            "SELECT id, name FROM tags WHERE name = ?", (name,)
+        ).fetchone()
+        cursor = conn.execute(
+            "INSERT INTO file_tags (file_id, tag_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            (file_id, tag_id),
+        )
+    return stored if cursor.rowcount == 1 else None
+
+
+def remove_tag(conn: sqlite3.Connection, file_id: int, name: str) -> bool:
+    """Remove a tag from a file. Returns False if it didn't have it."""
+    with transaction(conn):
+        cursor = conn.execute(
+            "DELETE FROM file_tags WHERE file_id = ?"
+            " AND tag_id = (SELECT id FROM tags WHERE name = ?)",
+            (file_id, name),
+        )
+        conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM file_tags)")
+    return cursor.rowcount == 1
+
+
+def tags_of(conn: sqlite3.Connection, file_id: int) -> list[str]:
+    """A file's tags, alphabetically."""
+    rows = conn.execute(
+        "SELECT t.name FROM tags AS t JOIN file_tags AS ft ON ft.tag_id = t.id"
+        " WHERE ft.file_id = ? ORDER BY t.name COLLATE NOCASE",
+        (file_id,),
+    )
+    return [row[0] for row in rows]
+
+
+def tag_counts(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Every tag in use with how many files have it, alphabetically."""
+    rows = conn.execute(
+        "SELECT t.name, COUNT(*) FROM tags AS t JOIN file_tags AS ft ON ft.tag_id = t.id"
+        " GROUP BY t.id ORDER BY t.name COLLATE NOCASE"
+    )
+    return [(row[0], row[1]) for row in rows]
+
+
+def files_tagged(conn: sqlite3.Connection, name: str) -> list[FileRecord]:
+    """Every file with the tag ``name`` (any case)."""
+    rows = conn.execute(
+        "SELECT f.* FROM files AS f JOIN file_tags AS ft ON ft.file_id = f.id"
+        " JOIN tags AS t ON t.id = ft.tag_id WHERE t.name = ? ORDER BY f.path COLLATE NOCASE",
+        (name,),
+    )
+    return [_file_from_row(row) for row in rows]
+
+
+# --- statistics ---------------------------------------------------------------------
+
+
+def decision_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Moves AutoShelf decided itself: automatic ones, rule-based ones, and automatic ones
+    the user reversed (undid, or corrected in History, Explorer or on the iPhone)."""
+    auto = conn.execute(
+        "SELECT COUNT(*) FROM history WHERE action = 'move' AND reason = 'auto'"
+        " AND state IN ('done', 'undone')"
+    ).fetchone()[0]
+    rules = conn.execute(
+        "SELECT COUNT(*) FROM history WHERE action = 'move' AND reason LIKE 'Rule:%'"
+        " AND state IN ('done', 'undone')"
+    ).fetchone()[0]
+    corrected = conn.execute(
+        "SELECT COUNT(*) FROM history AS h WHERE h.action = 'move' AND h.reason = 'auto'"
+        " AND (h.state = 'undone' OR EXISTS (SELECT 1 FROM corrections AS c"
+        " WHERE c.history_id = h.id AND c.source IN ('undo', 'external')"
+        " AND (c.from_folder IS NULL OR c.from_folder != c.to_folder COLLATE NOCASE)))"
+    ).fetchone()[0]
+    return {"auto": auto, "rule": rules, "auto_corrected": corrected}
+
+
+def corrected_pairs(conn: sqlite3.Connection, limit: int = 10) -> list[tuple[str, str, int]]:
+    """(from folder, to folder, count) of corrections, most frequent first."""
+    rows = conn.execute(
+        "SELECT from_folder, to_folder, COUNT(*) AS n FROM corrections"
+        " WHERE from_folder IS NOT NULL AND from_folder != to_folder COLLATE NOCASE"
+        " GROUP BY from_folder COLLATE NOCASE, to_folder COLLATE NOCASE"
+        " ORDER BY n DESC, from_folder LIMIT ?",
+        (limit,),
+    )
+    return [(row[0], row[1], row[2]) for row in rows]

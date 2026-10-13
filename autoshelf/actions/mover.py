@@ -4,7 +4,10 @@ Guarantees (CLAUDE.md safety rules):
 
 - never overwrites: a taken name becomes ``name (2).ext``, ``name (3).ext``, ...;
 - never deletes and never creates folders;
-- refuses anything that resolves outside the root (including via links or junctions);
+- refuses anything that resolves outside the root (including via links or junctions),
+  except a folder the user explicitly opted in for this move (a watched folder, or a
+  folder they asked to organize), which must be on the same drive: a move is a rename,
+  never a copy followed by a delete;
 - writes the history row as ``pending`` *before* touching the file and marks it ``done`` after.
 """
 
@@ -84,6 +87,8 @@ def move_file(
     undo_of: int | None = None,
     details: dict[str, Any] | None = None,
     before_rename: BeforeRename | None = None,
+    allowed_source: Path | None = None,
+    allowed_target: Path | None = None,
 ) -> MoveResult:
     """Move ``src`` into the existing folder ``dst_dir``, safely and with a history record.
 
@@ -91,10 +96,16 @@ def move_file(
     uses it to recognise its own file events. ``details`` (e.g. the classifier's top
     candidates) is stored with the history row. Raises MoveError if the move is refused or
     fails, in which case the file stays where it was and the history row is ``failed``.
+
+    ``allowed_source`` is a folder outside the root that ``src`` may come from; the
+    history then records it, so the move can be undone. ``allowed_target`` is a folder
+    outside the root that ``dst_dir`` may be (undo uses it to put such a file back).
     """
     root = Path(root).resolve(strict=True)
-    source = _checked_source(Path(src), root)
-    target_dir = _checked_target_dir(Path(dst_dir), root)
+    source = _checked_source(Path(src), root, allowed_source)
+    target_dir = _checked_target_dir(Path(dst_dir), root, allowed_target)
+    if not is_within(source, root):
+        details = {**(details or {}), "source_folder": str(source.parent)}
     name = new_name or source.name
     _check_name(name)
     if target_dir / name == source:
@@ -171,7 +182,12 @@ def _next_free(candidates: Iterator[Path]) -> Path:
     raise MoveError(f"No free name left after {MAX_COLLISION_SUFFIX} tries")
 
 
-def _checked_source(src: Path, root: Path) -> Path:
+def same_drive(a: Path, b: Path) -> bool:
+    """True if two existing paths are on the same volume (so a move is a rename)."""
+    return os.stat(a).st_dev == os.stat(b).st_dev
+
+
+def _checked_source(src: Path, root: Path, allowed: Path | None) -> Path:
     if src.is_symlink():
         raise MoveError(f"Refusing to move a symbolic link: {src}")
     try:
@@ -180,12 +196,19 @@ def _checked_source(src: Path, root: Path) -> Path:
         raise MoveError(f"{src} no longer exists") from None
     if not resolved.is_file():
         raise MoveError(f"Only files are moved, not {resolved}")
-    if resolved == root or not is_within(resolved, root):
-        raise MoveError(f"{resolved} is outside the root {root}")
-    return resolved
+    if resolved != root and is_within(resolved, root):
+        return resolved
+    if allowed is not None and is_within(resolved, _resolved_dir(allowed)):
+        if not same_drive(resolved, root):
+            raise MoveError(
+                f"{resolved} is on another drive than {root}; AutoShelf only moves files "
+                "and never copies and deletes them"
+            )
+        return resolved
+    raise MoveError(f"{resolved} is outside the root {root}")
 
 
-def _checked_target_dir(dst_dir: Path, root: Path) -> Path:
+def _checked_target_dir(dst_dir: Path, root: Path, allowed: Path | None) -> Path:
     try:
         resolved = dst_dir.resolve(strict=True)
     except FileNotFoundError:
@@ -194,9 +217,20 @@ def _checked_target_dir(dst_dir: Path, root: Path) -> Path:
         ) from None
     if not resolved.is_dir():
         raise MoveError(f"Destination is not a folder: {resolved}")
-    if not is_within(resolved, root):
-        raise MoveError(f"Destination {resolved} is outside the root {root}")
-    return resolved
+    if is_within(resolved, root):
+        return resolved
+    if allowed is not None and resolved == _resolved_dir(allowed):
+        if not same_drive(resolved, root):
+            raise MoveError(f"{resolved} is on another drive than {root}")
+        return resolved
+    raise MoveError(f"Destination {resolved} is outside the root {root}")
+
+
+def _resolved_dir(folder: Path) -> Path:
+    try:
+        return Path(folder).resolve(strict=True)
+    except FileNotFoundError:
+        raise MoveError(f"The folder {folder} no longer exists") from None
 
 
 def _check_name(name: str) -> None:

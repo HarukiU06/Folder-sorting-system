@@ -8,7 +8,6 @@ from autoshelf import __version__
 from autoshelf.actions.mover import move_file
 from autoshelf.cli import format_history_entry, main
 from autoshelf.db import repository
-from autoshelf.ml import embedder as embedder_module
 from autoshelf.ui import app as ui_app
 
 
@@ -98,14 +97,6 @@ def test_extract_command_missing_file(tmp_path: Path, capsys: pytest.CaptureFixt
 
 
 # --- Phase 3: folders, classification and the Inbox ---------------------------------
-
-
-@pytest.fixture
-def fake_model(monkeypatch: pytest.MonkeyPatch) -> FakeEmbedder:
-    """Replace the language model with the fake one for commands that load it."""
-    embedder = FakeEmbedder()
-    monkeypatch.setattr(embedder_module, "load_embedder", lambda name, cache_dir: embedder)
-    return embedder
 
 
 @pytest.fixture

@@ -138,3 +138,13 @@ def test_top_suggestion_comes_from_the_latest_decision(conn) -> None:
         conn, action="move", src="b", dst="c", reason="user", root="C:/shelf", file_id=file_id
     )
     assert repository.top_suggestion(conn, file_id) == "Recipes"
+
+
+def test_nested_transactions_roll_back_only_the_inner_part(conn) -> None:
+    with transaction(conn):
+        repository.set_setting(conn, "outer", 1)
+        with pytest.raises(LookupError), transaction(conn):
+            repository.set_setting(conn, "inner", 2)
+            raise LookupError("inner step failed")
+    assert repository.get_setting(conn, "outer") == 1
+    assert repository.get_setting(conn, "inner") is None

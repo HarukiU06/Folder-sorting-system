@@ -56,6 +56,9 @@ def undo(
             f"The original folder {original.parent} no longer exists, "
             "and AutoShelf won't recreate it"
         )
+    # A file that came from a watched or organized folder outside the root goes back there.
+    source_folder = entry.details.get("source_folder")
+    outside = original.parent if source_folder and Path(source_folder) == original.parent else None
 
     try:
         result = move_file(
@@ -68,11 +71,39 @@ def undo(
             new_name=original.name,
             undo_of=history_id,
             before_rename=before_rename,
+            allowed_target=outside,
         )
     except MoveError as exc:
         raise UndoError(str(exc)) from exc
     repository.set_history_state(conn, history_id, "undone")
     return result
+
+
+def undo_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    *,
+    force: bool = False,
+    before_rename: BeforeRename | None = None,
+) -> list[MoveResult]:
+    """Undo every move of one batch (e.g. an organize run), newest first.
+
+    Stops at the first failure; ``UndoError.completed`` lists what was undone.
+    """
+    entries = [
+        entry
+        for entry in reversed(repository.list_batch(conn, batch_id))
+        if entry.state == "done" and entry.action in repository.UNDOABLE_ACTIONS
+    ]
+    if not entries:
+        raise UndoError(f"Nothing in batch {batch_id} can be undone")
+    completed: list[MoveResult] = []
+    for entry in entries:
+        try:
+            completed.append(undo(conn, entry.id, force=force, before_rename=before_rename))
+        except UndoError as exc:
+            raise UndoError(f"Stopped at #{entry.id}: {exc}", completed) from exc
+    return completed
 
 
 def undo_last(

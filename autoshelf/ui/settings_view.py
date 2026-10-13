@@ -1,16 +1,20 @@
 """The Settings screen."""
 
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSlider,
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autoshelf.actions.rules import extensions as parse_extensions
 from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.ui.tasks import TaskRunner
@@ -125,6 +130,40 @@ class SettingsView(QWidget):
         apply_row.addWidget(apply)
         files.addRow("", apply_row)
 
+        # Watched folders
+        self.watched = QListWidget()
+        self.watched.setMaximumHeight(80)
+        add_watched = QPushButton("Add folder...")
+        add_watched.clicked.connect(self.add_watched)
+        remove_watched = QPushButton("Remove")
+        remove_watched.clicked.connect(self.remove_watched)
+        self.extensions = QLineEdit()
+        self.extensions.setPlaceholderText(".pdf, .docx")
+        save_extensions = QPushButton("Apply")
+        save_extensions.clicked.connect(self._apply_extensions)
+        watched_buttons = QVBoxLayout()
+        watched_buttons.addWidget(add_watched)
+        watched_buttons.addWidget(remove_watched)
+        watched_buttons.addStretch(1)
+        watched_row = QHBoxLayout()
+        watched_row.addWidget(self.watched, 1)
+        watched_row.addLayout(watched_buttons)
+        extensions_row = QHBoxLayout()
+        extensions_row.addWidget(QLabel("Take files ending in"))
+        extensions_row.addWidget(self.extensions, 1)
+        extensions_row.addWidget(save_extensions)
+        watched_note = QLabel(
+            "Optional. New files that arrive in these folders (e.g. Downloads) with these "
+            "extensions are moved into your library and sorted; undo puts them back. Files "
+            "already there, and subfolders, are left alone."
+        )
+        watched_note.setWordWrap(True)
+        watched_box = QGroupBox("Watch other folders")
+        watched_layout = QVBoxLayout(watched_box)
+        watched_layout.addWidget(watched_note)
+        watched_layout.addLayout(watched_row)
+        watched_layout.addLayout(extensions_row)
+
         self.model = QLabel()
         self.model.setWordWrap(True)
         self.model.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -133,6 +172,7 @@ class SettingsView(QWidget):
         layout.addWidget(root_box)
         layout.addWidget(sorting_box)
         layout.addWidget(files_box)
+        layout.addWidget(watched_box)
         layout.addWidget(self.model)
         layout.addStretch(1)
 
@@ -171,6 +211,9 @@ class SettingsView(QWidget):
         self.notifications.setChecked(settings.notifications)
         self.stable.setValue(settings.stable_seconds)
         self.patterns.setPlainText("\n".join(settings.ignore_patterns))
+        self.watched.clear()
+        self.watched.addItems(settings.watched_folders)
+        self.extensions.setText(", ".join(settings.watched_extensions))
         self.model.setText(
             f"Language model: {settings.embedding_model} (runs on this PC; stored in "
             f"{self.service.paths.model_dir})"
@@ -218,6 +261,32 @@ class SettingsView(QWidget):
             stable_seconds=float(self.stable.value()),
             ignore_patterns=[pattern for pattern in patterns if pattern],
         )
+
+    def add_watched(self) -> None:
+        """Opt a folder in for watching."""
+        folder = QFileDialog.getExistingDirectory(self, "Watch this folder for new files")
+        if not folder:
+            return
+        self.runner.run(
+            lambda: self.service.add_watched(Path(folder)),
+            lambda path: (self.load(), self.restart_needed.emit(f"Watching {path}")),
+            lambda exc: QMessageBox.warning(self, "This folder can't be watched", str(exc)),
+        )
+
+    def remove_watched(self) -> None:
+        """Stop watching the selected folder."""
+        item = self.watched.currentItem()
+        if item is None:
+            return
+        folder = Path(item.text())
+        self.runner.run(
+            lambda: self.service.remove_watched(folder),
+            lambda _: (self.load(), self.restart_needed.emit(f"No longer watching {folder}")),
+        )
+
+    def _apply_extensions(self) -> None:
+        wanted = sorted(parse_extensions(self.extensions.text())) if self.extensions.text() else []
+        self._update("Saved", True, watched_extensions=wanted)
 
     def _open_root(self) -> None:
         if self.root.text():

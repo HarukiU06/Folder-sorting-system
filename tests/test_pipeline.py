@@ -302,7 +302,7 @@ def test_classifier_failure_sends_the_file_to_inbox(
     def broken(*args, **kwargs):
         raise RuntimeError("model crashed")
 
-    monkeypatch.setattr(smart.library, "vectorize", broken)
+    monkeypatch.setattr(smart.library, "embed", broken)
     outcome = smart.process(make(shelf / "invoice 2025.txt", "invoice total tax due"))
     assert outcome.kind is OutcomeKind.MOVED
     assert outcome.dst == shelf / "_Inbox" / "invoice 2025.txt"

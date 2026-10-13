@@ -91,6 +91,8 @@ class WatchService:
         on_status: Callable[[str], None] | None = None,
         on_learned: Callable[[Sequence], None] | None = None,
         learn_delay: float = LEARN_DELAY_SECONDS,
+        watched: Sequence[Path] = (),
+        watched_extensions: Iterable[str] = (),
     ) -> None:
         self.root = root
         self.db_path = db_path
@@ -106,6 +108,8 @@ class WatchService:
         self._on_status = on_status
         self._on_learned = on_learned
         self._learn_delay = learn_delay
+        self.watched = tuple(watched)
+        self.watched_extensions = {ext.casefold() for ext in watched_extensions}
         self._changed_at: float | None = None
         self._changed_lock = threading.Lock()
         self._stop = threading.Event()
@@ -124,6 +128,14 @@ class WatchService:
         self._settle_history()
         observer = Observer()
         observer.schedule(_EventHandler(self), str(self.root), recursive=True)
+        for folder in self.watched:
+            # Only files that arrive from now on; what is already there stays put.
+            observer.schedule(_EventHandler(self), str(folder), recursive=False)
+            log.info(
+                "Also watching %s for new %s files",
+                folder,
+                ", ".join(sorted(self.watched_extensions)),
+            )
         observer.start()
         self._observer = observer
         self._worker = threading.Thread(
@@ -171,6 +183,8 @@ class WatchService:
         if self.self_moves.is_expected(path):
             return
         zone = zone_of(path, self.root)
+        if zone is Zone.OUTSIDE and self._in_watched_folder(path):
+            zone = Zone.DROP
         if zone is Zone.CATEGORY:
             self._note_once(path, "inside a category folder: kept there as an example")
             self._library_changed()
@@ -185,6 +199,11 @@ class WatchService:
             self._note_once(path, f"ignored: {reason}")
             return
         self.tracker.touch(path)
+
+    def _in_watched_folder(self, path: Path) -> bool:
+        return path.suffix.casefold() in self.watched_extensions and any(
+            path.parent == folder for folder in self.watched
+        )
 
     def forget(self, path: Path) -> None:
         """Stop tracking a path that was deleted or moved away."""
@@ -300,6 +319,8 @@ class WatchService:
             library=self._open_library(conn),
             threshold=self.threshold,
             margin=self.margin,
+            watched=self.watched,
+            watched_extensions=self.watched_extensions,
         )
         try:
             while not self._stop.wait(self.poll_interval):

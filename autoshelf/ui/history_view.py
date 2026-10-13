@@ -28,7 +28,12 @@ from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.why_panel import WhyPanel
 
 COLUMNS = ("When", "File", "From", "To", "Why", "Score", "State")
-_REASONS = {"auto": "Sorted automatically", "ask": "Not sure: sent to Inbox", "user": "You chose"}
+_REASONS = {
+    "auto": "Sorted automatically",
+    "ask": "Not sure: sent to Inbox",
+    "user": "You chose",
+    "organize": "Organized (you approved)",
+}
 FORCE_HINT = "; use --force to undo anyway"  # CLI advice; the app asks instead
 _STATES = {"done": "Done", "undone": "Undone", "failed": "Failed", "pending": "In progress"}
 
@@ -39,6 +44,8 @@ def describe_reason(entry: HistoryEntry) -> str:
         return f"Undo of #{entry.undo_of}" if entry.undo_of else "Undo"
     if entry.reason == "user" and entry.details.get("corrects"):
         return f"You corrected #{entry.details['corrects']}"
+    if entry.reason.startswith("duplicate of "):
+        return f"Set aside: {entry.reason}"
     return _REASONS.get(entry.reason, entry.reason)
 
 
@@ -105,6 +112,9 @@ class HistoryView(QWidget):
         self.count = QSpinBox()
         self.count.setRange(1, 100)
         self.count.setValue(5)
+        self.batch_button = QPushButton("Undo its batch")
+        self.batch_button.setToolTip("Undo every move made together with this one")
+        self.batch_button.clicked.connect(self.undo_selected_batch)
         undo_last = QPushButton("Undo the last")
         undo_last.clicked.connect(self.undo_last)
         refresh = QPushButton("Refresh")
@@ -113,6 +123,7 @@ class HistoryView(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(self.undo_button)
         buttons.addWidget(self.correct_button)
+        buttons.addWidget(self.batch_button)
         buttons.addSpacing(20)
         buttons.addWidget(undo_last)
         buttons.addWidget(self.count)
@@ -174,6 +185,7 @@ class HistoryView(QWidget):
         entry = self._selected()
         self.undo_button.setEnabled(entry is not None and can_undo(entry))
         self.correct_button.setEnabled(entry is not None and can_correct(entry))
+        self.batch_button.setEnabled(entry is not None and bool(entry.batch_id))
         if entry is None:
             self.why.clear_details()
             return
@@ -219,6 +231,14 @@ class HistoryView(QWidget):
         if entry is None or not can_undo(entry):
             return
         self._run_undo(lambda force: [self.service.undo(entry.id, force=force)])
+
+    def undo_selected_batch(self) -> None:
+        """Undo every move of the selected row's batch (e.g. one organize run)."""
+        entry = self._selected()
+        if entry is None or not entry.batch_id:
+            return
+        batch = entry.batch_id
+        self._run_undo(lambda force: self.service.undo_batch(batch, force=force))
 
     def undo_last(self) -> None:
         """Undo the last N moves, newest first."""

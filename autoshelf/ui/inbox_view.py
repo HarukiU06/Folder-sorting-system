@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -81,6 +82,11 @@ class InboxView(QWidget):
         other_row.addWidget(QLabel("Other folder:"))
         other_row.addWidget(self.other, 1)
         other_row.addWidget(self.move_other)
+        self.tag_row = QHBoxLayout()
+        self.tag_label = QLabel("Also tag it:")
+        self.tag_row.addWidget(self.tag_label)
+        self.tag_boxes: list[QCheckBox] = []
+        self.tag_row.addStretch(1)
 
         open_file = QPushButton("Open file")
         open_file.clicked.connect(self._open_file)
@@ -107,6 +113,7 @@ class InboxView(QWidget):
         detail.addWidget(QLabel("Move it to:"))
         detail.addLayout(self.suggestions)
         detail.addLayout(other_row)
+        detail.addLayout(self.tag_row)
         detail.addLayout(file_row)
         detail.addWidget(self.pages, 1)
 
@@ -232,6 +239,16 @@ class InboxView(QWidget):
             self.suggestion_buttons.append(button)
         if top:
             self.other.setCurrentText(top[0].folder)
+        for box in self.tag_boxes:
+            self.tag_row.removeWidget(box)
+            box.deleteLater()
+        self.tag_boxes = []
+        for name in item.tag_suggestions:
+            box = QCheckBox(name)
+            box.setToolTip("It fits this folder too: tag it, so it shows up under the tag")
+            self.tag_row.insertWidget(self.tag_row.count() - 1, box)
+            self.tag_boxes.append(box)
+        self.tag_label.setVisible(bool(self.tag_boxes))
 
     def _move_to_other(self) -> None:
         if self.other.currentText():
@@ -244,6 +261,8 @@ class InboxView(QWidget):
             return
         self.detail.setEnabled(False)
         path = item.path
+        leaf = folder.rsplit("/", 1)[-1]
+        tags = [box.text() for box in self.tag_boxes if box.isChecked() and box.text() != leaf]
 
         def done(result) -> None:
             self.detail.setEnabled(True)
@@ -255,7 +274,7 @@ class InboxView(QWidget):
             QMessageBox.warning(self, "Couldn't move the file", str(exc))
             self.refresh()
 
-        self.runner.run(lambda: self.service.assign(path, folder), done, failed)
+        self.runner.run(lambda: self.service.assign(path, folder, tags), done, failed)
 
     def _open_file(self) -> None:
         item = self._current_item()

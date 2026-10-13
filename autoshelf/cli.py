@@ -21,8 +21,8 @@ from autoshelf.actions.inbox import (
     waiting_files,
 )
 from autoshelf.actions.mover import MoveResult
-from autoshelf.actions.undo import UndoError, undo, undo_last
-from autoshelf.app_service import library_factory, watch_lock
+from autoshelf.actions.undo import UndoError, undo, undo_batch, undo_last
+from autoshelf.app_service import AppService, library_factory, valid_watched, watch_lock
 from autoshelf.config import (
     DEFAULT_EMBEDDING_MODEL,
     AppPaths,
@@ -36,6 +36,8 @@ from autoshelf.config import (
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
+from autoshelf.features.duplicates import DuplicateError
+from autoshelf.features.tags import TagError
 from autoshelf.layout import INBOX_DIRNAME
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import explain
@@ -83,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     target = undo_cmd.add_mutually_exclusive_group(required=True)
     target.add_argument("id", nargs="?", type=int, help="history entry to undo")
     target.add_argument("--last", type=int, metavar="N", help="undo the N most recent moves")
+    target.add_argument("--batch", metavar="ID", help="undo a whole batch (e.g. an organize run)")
     undo_cmd.add_argument(
         "--force", action="store_true", help="undo even if the file changed after it was moved"
     )
@@ -124,6 +127,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--margin", type=float, help="how far the best folder must beat the next one"
     )
     config.add_argument("--model", help="embedding model (sentence-transformers name)")
+    config.add_argument(
+        "--watch", type=Path, metavar="FOLDER", help="also take new files from this folder"
+    )
+    config.add_argument("--unwatch", type=Path, metavar="FOLDER", help="stop watching a folder")
+    config.add_argument(
+        "--watch-extensions",
+        metavar="EXTS",
+        help='which new files to take from watched folders, e.g. ".pdf, .docx"',
+    )
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
     why.add_argument("id", type=int, help="history entry (see: autoshelf history)")
@@ -160,6 +172,44 @@ def build_parser() -> argparse.ArgumentParser:
     rule_commands.add_parser("test", help="show which rule would handle a file").add_argument(
         "file", type=Path
     )
+
+    search = with_root(commands.add_parser("search", help="find files by meaning or words"))
+    search.add_argument("query", help='e.g. "paper explaining k-means initialization"')
+    search.add_argument("--limit", type=int, default=10, help="how many results (default 10)")
+
+    related = with_root(commands.add_parser("related", help="files most similar to a file"))
+    related.add_argument("file", type=Path)
+
+    tag = with_root(commands.add_parser("tag", help="add tags to a file"))
+    tag.add_argument("file", type=Path)
+    tag.add_argument("tags", nargs="+", help="one or more tags")
+    untag = with_root(commands.add_parser("untag", help="remove a tag from a file"))
+    untag.add_argument("file", type=Path)
+    untag.add_argument("tag")
+    tags = with_root(commands.add_parser("tags", help="list tags, or the files with a tag"))
+    tags.add_argument("tag", nargs="?", help="show the files with this tag")
+
+    duplicates = with_root(
+        commands.add_parser("duplicates", help="list identical files (nothing is deleted)")
+    )
+    duplicates.add_argument(
+        "--keep",
+        type=Path,
+        metavar="FILE",
+        help="keep this copy and move its identical copies into _Duplicates",
+    )
+    with_root(commands.add_parser("versions", help="list files that look like versions"))
+
+    organize = with_root(
+        commands.add_parser("organize", help="propose where every file in a folder belongs")
+    )
+    organize.add_argument("folder", type=Path, help="the root, _Inbox, a folder, or another one")
+    organize.add_argument("--recursive", action="store_true", help="include subfolders")
+    organize.add_argument(
+        "--apply", action="store_true", help="move the confident proposals (one undoable batch)"
+    )
+
+    with_root(commands.add_parser("stats", help="numbers about your library"))
     return parser
 
 
@@ -198,6 +248,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "correct": _cmd_correct,
             "learned": _cmd_learned,
             "rules": _cmd_rules,
+            "search": _cmd_search,
+            "related": _cmd_related,
+            "tag": _cmd_tag,
+            "untag": _cmd_untag,
+            "tags": _cmd_tags,
+            "duplicates": _cmd_duplicates,
+            "versions": _cmd_versions,
+            "organize": _cmd_organize,
+            "stats": _cmd_stats,
         }[args.command]
         return handler(args, paths)
     except _NoRoot:
@@ -214,6 +273,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         EmbedderError,
         learning.CorrectionError,
         rule_engine.RuleError,
+        TagError,
+        DuplicateError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -277,6 +338,8 @@ def _watch(args: argparse.Namespace, paths: AppPaths, settings: Settings, root: 
         make_library=library_factory(paths, settings, root),
         threshold=settings.auto_threshold,
         margin=settings.auto_margin,
+        watched=valid_watched(paths, settings, root),
+        watched_extensions=settings.watched_extensions,
     )
     mode = "DRY RUN: nothing will be moved" if args.dry_run else "files will be moved"
     log.info("Watching %s (%s). Data folder: %s", root, mode, paths.home)
@@ -307,7 +370,9 @@ def _cmd_history(args: argparse.Namespace, paths: AppPaths) -> int:
 def _cmd_undo(args: argparse.Namespace, paths: AppPaths) -> int:
     with contextlib.closing(open_database(paths.db_path)) as conn:
         try:
-            if args.last is not None:
+            if args.batch is not None:
+                results = undo_batch(conn, args.batch, force=args.force)
+            elif args.last is not None:
                 results = undo_last(conn, args.last, force=args.force)
             else:
                 results = [undo(conn, args.id, force=args.force)]
@@ -505,13 +570,25 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         if args.model is not None:
             settings.embedding_model = args.model.strip()
             changed = True
+        if args.watch_extensions is not None:
+            settings.watched_extensions = sorted(rule_engine.extensions(args.watch_extensions))
+            changed = True
         if changed:
             save_settings(conn, settings)
+    if args.watch is not None or args.unwatch is not None:
+        service = AppService(paths)
+        if args.watch is not None:
+            print(f"Watching {service.add_watched(args.watch)} (restart the watcher to apply)")
+        if args.unwatch is not None:
+            service.remove_watched(args.unwatch)
+        settings = service.settings()
     print(f"Root folder:      {settings.root or '(not set)'}")
     print(f"Auto threshold:   {settings.auto_threshold:.2f}")
     print(f"Auto margin:      {settings.auto_margin:.2f}")
     print(f"Embedding model:  {settings.embedding_model}")
     print(f"Stable seconds:   {settings.stable_seconds:g}")
+    print(f"Watched folders:  {', '.join(settings.watched_folders) or '(none)'}")
+    print(f"  taking:         {', '.join(settings.watched_extensions) or '(nothing)'}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(
@@ -656,6 +733,157 @@ def _rules_test(args: argparse.Namespace, paths: AppPaths) -> int:
             f"Rule {match.rule.name!r} matches ({match.match}): "
             f"it would go to {match.rule.target_folder}"
         )
+    return 0
+
+
+def _service(args: argparse.Namespace, paths: AppPaths) -> AppService:
+    """The app's logic for commands that use it, honouring --root."""
+    settings = _settings(paths)
+    root = _root(args, settings, paths)
+    return AppService(paths, root=root)
+
+
+def _cmd_search(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    hits = service.search(args.query, limit=args.limit)
+    if not hits:
+        print("Nothing found.")
+        return 0
+    for hit in hits:
+        where = hit.folder or "(root)"
+        exact = "  [contains the words]" if hit.keyword else ""
+        print(f"{hit.score:5.2f}  {hit.path.name}  in {where}{exact}")
+        print(f"       {hit.snippet}")
+    return 0
+
+
+def _cmd_related(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    found = service.related(args.file.resolve())
+    if not found:
+        print("No related files (AutoShelf hasn't read this file yet).")
+    for item in found:
+        print(f"{item.similarity:5.2f}  {item.path.name}  in {item.folder or '(root)'}")
+    return 0
+
+
+def _cmd_tag(args: argparse.Namespace, paths: AppPaths) -> int:
+    added = _service(args, paths).tag(args.file.resolve(), args.tags)
+    print(f"Tagged {args.file.name}: {', '.join(added)}" if added else "Nothing new to tag.")
+    return 0
+
+
+def _cmd_untag(args: argparse.Namespace, paths: AppPaths) -> int:
+    removed = _service(args, paths).untag(args.file.resolve(), args.tag)
+    print(f"Removed the tag {args.tag!r}." if removed else f"{args.file.name} had no such tag.")
+    return 0
+
+
+def _cmd_tags(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    if args.tag:
+        files = service.tagged(args.tag)
+        print(f"{len(files)} file(s) tagged {args.tag!r}:")
+        for path in files:
+            print(f"  {path}")
+        return 0
+    tags = service.tags()
+    if not tags:
+        print('No tags yet. Add some with: autoshelf tag "<file>" <tag>')
+    for name, count in tags:
+        print(f"  {name}  ({count})")
+    return 0
+
+
+def _cmd_duplicates(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    groups = service.duplicates()
+    if args.keep is not None:
+        keep = args.keep.resolve()
+        group = next((g for g in groups if keep in g.paths), None)
+        if group is None:
+            print(f"error: {args.keep} has no identical copies", file=sys.stderr)
+            return 1
+        moved = service.keep_one(keep, [path for path in group.paths if path != keep])
+        for result in moved:
+            print(f"Moved {result.src} -> {result.dst}")
+        if moved:
+            print(f"Undo with: autoshelf undo --batch {_batch_of(paths, moved[0].history_id)}")
+        return 0
+    if not groups:
+        print("No identical files found.")
+    for group in groups:
+        print(f"{len(group.paths)} identical files ({group.size:,} bytes):")
+        for path in group.paths:
+            print(f"  {path}")
+    if groups:
+        print('Keep one and move the others to _Duplicates: autoshelf duplicates --keep "<file>"')
+    return 0
+
+
+def _batch_of(paths: AppPaths, history_id: int) -> str:
+    with contextlib.closing(open_database(paths.db_path)) as conn:
+        return repository.get_history(conn, history_id).batch_id
+
+
+def _cmd_versions(args: argparse.Namespace, paths: AppPaths) -> int:
+    groups = _service(args, paths).versions()
+    if not groups:
+        print("No possible versions found.")
+    for group in groups:
+        print(f"Possibly versions of one document (similarity {group.similarity:.2f}):")
+        for path in group.paths:
+            print(f"  {path}")
+    return 0
+
+
+def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    folder = service.check_organize_folder(args.folder)
+    proposals = service.plan_organize(folder, recursive=args.recursive)
+    if not proposals:
+        print(f"Everything in {folder} is already where it belongs.")
+        return 0
+    print(f"Proposed moves for {folder} ([x] = confident, moved by --apply):")
+    for item in proposals:
+        mark = "[x]" if item.selected else "[ ]"
+        score = f"{item.confidence:.2f}" if item.confidence is not None else "    "
+        print(f"  {mark} {score}  {item.path.name}: {item.current} -> {item.target or '?'}")
+        print(f"            {item.explanation}")
+    if not args.apply:
+        print("Nothing was moved. Add --apply to move the [x] files (as one undoable batch).")
+        return 0
+    result = service.apply_organize(folder, proposals)
+    print(f"Moved {len(result.moved)} file(s).")
+    for path, error in result.failed:
+        print(f"  couldn't move {path.name}: {error}", file=sys.stderr)
+    if result.moved:
+        print(f"Undo all of them with: autoshelf undo --batch {result.batch_id}")
+    return 1 if result.failed else 0
+
+
+def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
+    stats = _service(args, paths).stats()
+    print(f"Files in your folders: {stats.total_files}   waiting in _Inbox: {stats.inbox}")
+    if stats.accuracy is not None:
+        kept = stats.auto_moves - stats.auto_corrected
+        print(
+            f"Automatic moves: {stats.auto_moves}, kept {kept} ({stats.accuracy:.0%}); "
+            f"moves by rules: {stats.rule_moves}"
+        )
+    print("Files per folder:")
+    for folder, count in stats.files_per_folder:
+        print(f"  {count:5}  {folder}")
+    print("Added per month (last 12):")
+    print("  " + "  ".join(f"{month}: {count}" for month, count in stats.added_per_month if count))
+    if stats.corrected_pairs:
+        print("Most corrected:")
+        for source, target, count in stats.corrected_pairs:
+            print(f"  {count:3}x  {source} -> {target}")
+    if stats.stale_total:
+        print(f"Not opened in 6+ months: {stats.stale_total} file(s), e.g.:")
+        for item in stats.stale[:5]:
+            print(f"  {item.last_used:%Y-%m-%d}  {item.path.name}")
     return 0
 
 

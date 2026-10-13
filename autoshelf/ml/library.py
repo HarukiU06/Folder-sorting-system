@@ -29,7 +29,7 @@ from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification, FolderProfile, choose, score_folders
 from autoshelf.ml.embedder import Embedder
 from autoshelf.ml.learned import Example, adjustments
-from autoshelf.ml.vectors import document_vector, from_blob, to_blob
+from autoshelf.ml.vectors import EmbeddedDocument, embed_document, from_blob, to_blob
 from autoshelf.watcher.ignore import matching_pattern
 
 log = logging.getLogger(__name__)
@@ -171,16 +171,26 @@ def store_content(conn: sqlite3.Connection, file_id: int, extraction: Extraction
 def store_vector(
     conn: sqlite3.Connection,
     file_id: int,
-    vector: np.ndarray,
+    document: EmbeddedDocument,
     *,
     model: str,
     size: int,
     mtime: float,
     source: str = CONTENT,
 ) -> None:
-    """Store a file's vector with the model and file version it was made from."""
+    """Store a file's vector with the model and file version it was made from, and its
+    text chunks with their vectors (for search)."""
     repository.set_vector(
-        conn, file_id, model=model, size=size, mtime=mtime, source=source, vector=to_blob(vector)
+        conn,
+        file_id,
+        model=model,
+        size=size,
+        mtime=mtime,
+        source=source,
+        vector=to_blob(document.vector),
+    )
+    repository.replace_chunks(
+        conn, file_id, list(document.texts), [to_blob(row) for row in document.vectors]
     )
 
 
@@ -212,9 +222,13 @@ class LibraryIndex:
         """The embedding model this index uses."""
         return self.embedder.model_id
 
+    def embed(self, extraction: Extraction, name: str) -> EmbeddedDocument:
+        """Embed a file from what was extracted from it, keeping its chunks."""
+        return embed_document(self.embedder, extraction, name)
+
     def vectorize(self, extraction: Extraction, name: str) -> np.ndarray:
         """Embed a file from what was extracted from it."""
-        return document_vector(self.embedder, extraction, name)
+        return self.embed(extraction, name).vector
 
     def stored_vector(self, path: Path) -> np.ndarray | None:
         """The vector stored for the file at ``path``, if it still matches the file."""
@@ -431,6 +445,8 @@ class LibraryIndex:
         stored = repository.get_vector(self.conn, record.id)
         if stored is None or stored.model != self.model:
             return None
+        if not repository.has_chunks(self.conn, record.id):
+            return None  # indexed before search existed: read it once more
         return IndexedFile(
             item.path,
             item.folder,
@@ -453,7 +469,7 @@ class LibraryIndex:
         except OSError as exc:
             log.warning("Couldn't read %s for the index: %s", item.path, exc)
             return None
-        vector = self.vectorize(extraction, item.path.name)
+        document = self.embed(extraction, item.path.name)
         with transaction(self.conn):
             file_id = repository.upsert_file(
                 self.conn, item.path, sha256=digest, size=item.size, mtime=item.mtime
@@ -463,13 +479,13 @@ class LibraryIndex:
             store_vector(
                 self.conn,
                 file_id,
-                vector,
+                document,
                 model=self.model,
                 size=item.size,
                 mtime=item.mtime,
                 source=source,
             )
-        return IndexedFile(item.path, item.folder, item.size, item.mtime, source, vector)
+        return IndexedFile(item.path, item.folder, item.size, item.mtime, source, document.vector)
 
 
 def _self_and_parents(key: str) -> list[str]:

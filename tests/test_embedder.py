@@ -76,3 +76,13 @@ def test_is_downloaded_looks_for_a_snapshot(tmp_path: Path) -> None:
     snapshot = tmp_path / "models--org--some-model" / "snapshots" / "abc123"
     snapshot.mkdir(parents=True)
     assert is_downloaded(model, tmp_path)
+
+
+def test_short_last_window_overlaps_the_one_before() -> None:
+    from autoshelf.ml.embedder import _windows
+
+    text = "abcdefghi"
+    offsets = [(i, i + 1) for i in range(len(text))]
+    assert _windows(text, offsets, 4) == ["abcd", "efgh", "fghi"]  # not a 1-letter scrap
+    assert _windows(text, offsets, 6) == ["abcdef", "ghi"]  # half a window: long enough
+    assert _windows("abc", [(0, 1), (1, 2), (2, 3)], 4) == ["abc"]

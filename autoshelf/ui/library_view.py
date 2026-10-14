@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from autoshelf.app_service import AppService, FileInfo
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import show_in_explorer
+from autoshelf.ui.widgets import plain_label, plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
 COLUMNS = ("File", "Folder", "Match")
@@ -67,7 +67,7 @@ class LibraryView(QWidget):
         top = QHBoxLayout()
         top.addWidget(self.query, 1)
         top.addWidget(search)
-        self.summary = QLabel(HINT)
+        self.summary = plain_label(HINT)
         self.summary.setWordWrap(True)
 
         self.tag_list = QListWidget()
@@ -108,7 +108,7 @@ class LibraryView(QWidget):
 
     def _build_detail(self) -> QWidget:
         box = QWidget()
-        self.name = QLabel()
+        self.name = plain_label()
         self.name.setWordWrap(True)
         self.name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         font = self.name.font()
@@ -117,7 +117,7 @@ class LibraryView(QWidget):
         self.facts = QLabel()
         self.facts.setWordWrap(True)
         self.facts.setTextFormat(Qt.TextFormat.RichText)
-        self.summary_text = QLabel()
+        self.summary_text = plain_label()
         self.summary_text.setWordWrap(True)
         open_button = QPushButton("Open")
         open_button.clicked.connect(self.open_file)
@@ -239,7 +239,7 @@ class LibraryView(QWidget):
             for column, text in enumerate((path.name, folder, match)):
                 item = QTableWidgetItem(text)
                 item.setData(PATH_ROLE, str(path))
-                item.setToolTip(str(path) if column < 2 else text)
+                item.setToolTip(str(path) if column < 2 else plain_tooltip(text))
                 self.results.setItem(row, column, item)
         if rows:
             self.results.selectRow(0)

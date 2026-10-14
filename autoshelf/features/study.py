@@ -17,6 +17,7 @@ CARD_INPUT_CHARS = 12_000
 LIST_EXCERPT_CHARS = 600
 MAX_LIST_FILES = 40
 _JSON_ARRAY = re.compile(r"\[.*\]", re.DOTALL)
+_FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
 
 
 @dataclass(frozen=True)
@@ -134,5 +135,12 @@ def export_csv(cards: list[repository.Flashcard], target: Path) -> int:
     with open(target, "x", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         for card in cards:
-            writer.writerow([card.question, card.answer])
+            writer.writerow([csv_cell(card.question), csv_cell(card.answer)])
     return len(cards)
+
+
+def csv_cell(text: str) -> str:
+    """``text`` made safe for spreadsheets: a cell starting with ``=``, ``+``, ``-``, ``@``
+    (or a tab or carriage return) is a formula in Excel, and the AI writes cards from file
+    text that anyone could have written."""
+    return "'" + text if text.startswith(_FORMULA_STARTS) else text

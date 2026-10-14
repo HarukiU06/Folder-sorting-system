@@ -30,6 +30,7 @@ from autoshelf.config import (
 )
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
+from autoshelf.extract import guard as read_guard
 from autoshelf.features import ask as ask_features
 from autoshelf.features import duplicates as duplicate_features
 from autoshelf.features import new_folders as folder_features
@@ -221,7 +222,13 @@ class AppService:
 
     def acquire(self) -> bool:
         """Take the single-sorter lock for this app session. False if another has it."""
-        return self._lock.acquire()
+        if self._lock.held:
+            return True
+        if not self._lock.acquire():
+            return False
+        # Files that crashed the last sorting process while being read aren't read again.
+        read_guard.start(self.paths.home, record=True)
+        return True
 
     def lock_holder(self) -> int | None:
         """Process id of whoever holds the lock, if known."""
@@ -230,6 +237,8 @@ class AppService:
     def release(self) -> None:
         """Stop the watcher and give the lock back (on quit)."""
         self.stop()
+        if self._lock.held:
+            read_guard.stop()
         self._lock.release()
 
     @property

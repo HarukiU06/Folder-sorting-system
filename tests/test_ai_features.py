@@ -1,6 +1,7 @@
 """Features that use the optional LLM (with a fake one), and the parts that work without it:
 summaries, better names, new-folder suggestions, Ask your library, study mode."""
 
+import csv
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -249,6 +250,19 @@ def test_flashcards_are_parsed_stored_and_exported(conn, tmp_path: Path) -> None
     assert target.read_text(encoding="utf-8").strip() == "Q1,A1"
     with pytest.raises(FileExistsError):
         export_csv(stored, target)  # never overwrites
+
+
+def test_flashcard_export_keeps_spreadsheets_from_running_formulas(conn, tmp_path: Path) -> None:
+    pairs = [('=HYPERLINK("http://x.test")', "@SUM(1)"), ("What is -1 squared?", "+1")]
+    repository.add_flashcards(conn, pairs, file_id=None, folder=None)
+    target = tmp_path / "cards.csv"
+    export_csv(repository.list_flashcards(conn), target)
+    with open(target, encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    assert rows == [
+        ['\'=HYPERLINK("http://x.test")', "'@SUM(1)"],
+        ["What is -1 squared?", "'+1"],
+    ]
 
 
 # --- through the app and the command line -------------------------------------------------------

@@ -44,8 +44,19 @@ class Provider(Protocol):
 Transport = Callable[[str, dict[str, str], dict[str, Any] | None, float], tuple[int, Any]]
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Return redirects as errors: urllib would re-send every header, including the API
+    key, to whatever host a redirect names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def _urlopen(request: urllib.request.Request, timeout: float):
-    return urllib.request.urlopen(request, timeout=timeout)
+    return _opener.open(request, timeout=timeout)
 
 
 def post_json(

@@ -10,12 +10,20 @@ keep the file locked and block the move that follows.
 
 import re
 import unicodedata
+import zipfile
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
 MAX_TEXT_CHARS = 20_000
 # Files that must be parsed as a whole (e.g. notebooks) are skipped above this size.
 MAX_WHOLE_FILE_BYTES = 50 * 1024 * 1024
+# Office files and EPUB books are ZIP archives that their libraries unpack into memory, so
+# a tiny file could claim gigabytes (a "zip bomb"). Python's zipfile never unpacks more
+# than an entry declares, so the declared sizes are checked before a library reads them:
+# the total, and (like Apache POI) how much each sizeable entry inflates.
+MAX_UNPACKED_BYTES = 300 * 1024 * 1024
+MAX_INFLATE_RATIO = 100
+_INFLATE_GRACE_BYTES = 1024 * 1024
 
 # Soft hyphen, zero-width space/non-joiner/joiner, word joiner and BOM.
 _INVISIBLE_CHARS = (0x00AD, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)
@@ -93,6 +101,27 @@ def read_whole(file: BinaryIO, max_bytes: int = MAX_WHOLE_FILE_BYTES) -> bytes:
     if len(data) > max_bytes:
         raise ExtractionError(f"the file is too large to parse (over {max_bytes:,} bytes)")
     return data
+
+
+def check_zip_container(file: BinaryIO) -> None:
+    """Refuse a ZIP-based file (Office, EPUB) that would unpack to too much data.
+
+    Leaves ``file`` at its start for the library that reads it next.
+    """
+    with zipfile.ZipFile(file) as archive:
+        entries = archive.infolist()
+    file.seek(0)
+    if sum(entry.file_size for entry in entries) > MAX_UNPACKED_BYTES:
+        raise ExtractionError(f"the file would unpack to over {MAX_UNPACKED_BYTES:,} bytes")
+    for entry in entries:
+        if (
+            entry.file_size > _INFLATE_GRACE_BYTES
+            and entry.file_size > MAX_INFLATE_RATIO * entry.compress_size
+        ):
+            raise ExtractionError(
+                f"{entry.filename!r} would unpack to over {MAX_INFLATE_RATIO} times its "
+                "packed size (a zip bomb?)"
+            )
 
 
 def non_empty(**values: object) -> dict[str, str]:

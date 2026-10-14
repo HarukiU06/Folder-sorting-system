@@ -5,11 +5,12 @@ from typing import BinaryIO
 import docx
 from docx.table import Table
 
-from autoshelf.extract.base import Content, TextBudget, non_empty
+from autoshelf.extract.base import Content, TextBudget, check_zip_container, non_empty
 
 
 def extract(file: BinaryIO, max_chars: int) -> Content:
     """Read paragraphs and tables in document order, plus the core properties."""
+    check_zip_container(file)
     document = docx.Document(file)
     budget = TextBudget(max_chars)
     for block in document.iter_inner_content():

@@ -21,7 +21,7 @@ from autoshelf.app_service import AppService
 from autoshelf.features.ask import Answer
 from autoshelf.llm import PRIVACY_NOTE
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import show_in_explorer
+from autoshelf.ui.widgets import plain_label, show_in_explorer
 
 _CITATION = re.compile(r"\[(\d+)\]")
 
@@ -77,7 +77,7 @@ class AskView(QWidget):
         row.addWidget(self.question, 1)
         row.addWidget(self.ask_button)
         row.addWidget(clear)
-        self.status = QLabel()
+        self.status = plain_label()
 
         layout = QVBoxLayout(self)
         layout.addWidget(note)

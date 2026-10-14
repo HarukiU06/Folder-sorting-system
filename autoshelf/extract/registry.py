@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from autoshelf.extract import guard
 from autoshelf.extract.base import MAX_TEXT_CHARS, Content, clean_inline
 from autoshelf.extract.filename import filename_tokens
 from autoshelf.extract.plaintext import looks_like_text
@@ -125,10 +126,12 @@ def extract(path: Path, *, max_chars: int = MAX_TEXT_CHARS) -> Extraction:
     name, module = extractor_for(path)
     if module is None:
         return Extraction(FILENAME_ONLY, tokens)
+    if guard.crashed_before(path):
+        return Extraction(name, tokens, error=guard.CRASHED)
     try:
         extractor = importlib.import_module(f"autoshelf.extract.{module}").extract
         # The registry owns the open file so its handle is always closed on return.
-        with open(path, "rb") as file:
+        with guard.reading(path), open(path, "rb") as file:
             content: Content = extractor(file, max_chars)
     except Exception as exc:
         log.debug("Couldn't extract %s with %s", path, name, exc_info=True)

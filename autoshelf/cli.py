@@ -37,6 +37,7 @@ from autoshelf.config import (
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
+from autoshelf.extract import guard as read_guard
 from autoshelf.features.duplicates import DuplicateError
 from autoshelf.features.new_folders import FolderNameError
 from autoshelf.features.rename import RenameError
@@ -288,6 +289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
+        read_guard.start(paths.home, record=False)  # watch records; see _cmd_watch
         handler = {
             "watch": _cmd_watch,
             "history": _cmd_history,
@@ -386,9 +388,11 @@ def _cmd_watch(args: argparse.Namespace, paths: AppPaths) -> int:
             file=sys.stderr,
         )
         return 1
+    read_guard.start(paths.home, record=True)
     try:
         return _watch(args, paths, settings, root)
     finally:
+        read_guard.stop()
         lock.release()
 
 

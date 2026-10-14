@@ -102,6 +102,15 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def reset_read_guard() -> Iterator[None]:
+    """No test inherits the crash guard (``extract.guard``) another test started."""
+    from autoshelf.extract import guard
+
+    yield
+    guard.stop()
+
+
+@pytest.fixture(autouse=True)
 def reset_logging() -> Iterator[None]:
     """Close handlers that ``cli.main`` attaches, so log files in temp dirs aren't held open."""
     yield

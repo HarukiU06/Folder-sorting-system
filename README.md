@@ -360,7 +360,10 @@ Only the filename and text, never images or audio content (no OCR, no transcript
 | Anything else | the filename only |
 
 A file that can't be parsed (corrupt, password-protected, or an Office or EPUB file that would
-unpack to over 300 MB, as a "zip bomb" does) is still handled using its name.
+unpack to over 300 MB, as a "zip bomb" does) is still handled using its name. So is a file that
+made AutoShelf stop while reading it: it isn't read again (so it can't crash AutoShelf at every
+start) until its content changes. They are listed in `%APPDATA%\AutoShelf\reading.json`; delete
+that file to have them read again.
 
 ## Development
 

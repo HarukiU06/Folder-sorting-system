@@ -1,8 +1,11 @@
 """The optional LLM providers: exact requests, replies and errors (no network is used)."""
 
+import email.message
 import io
 import json
 import urllib.error
+import urllib.request
+import urllib.response
 
 import pytest
 
@@ -136,6 +139,33 @@ def test_post_json_round_trip_and_failures(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(base, "_urlopen", offline)
     with pytest.raises(LLMError, match=r"couldn't reach example.test"):
         base.post_json("https://example.test/x", {}, {}, 5)
+
+
+def test_redirects_are_not_followed_so_the_key_stays_with_the_api() -> None:
+    requested = []
+
+    class Redirecting(urllib.request.BaseHandler):
+        handler_order = 100  # answers before the real HTTPS handler
+
+        def https_open(self, request):
+            requested.append(request.full_url)
+            headers = email.message.Message()
+            headers["Location"] = "https://elsewhere.test/collect"
+            response = urllib.response.addinfourl(io.BytesIO(b"{}"), headers, request.full_url, 302)
+            response.msg = "Found"
+            return response
+
+    assert any(isinstance(handler, base._NoRedirect) for handler in base._opener.handlers)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), base._NoRedirect, Redirecting
+    )
+    request = urllib.request.Request(
+        claude.API_URL, data=b"{}", headers={"x-api-key": "sk-ant-secret"}, method="POST"
+    )
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        opener.open(request, timeout=1)
+    assert caught.value.code == 302
+    assert requested == [claude.API_URL]
 
 
 def test_tests_never_reach_the_network() -> None:

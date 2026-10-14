@@ -30,7 +30,7 @@ from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.llm import claude as claude_provider
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import open_folder
+from autoshelf.ui.widgets import open_folder, plain_label
 
 DEFAULT_LEVEL = 2  # "Balanced"
 
@@ -198,7 +198,7 @@ class SettingsView(QWidget):
         test_ai = QPushButton("Test")
         test_ai.clicked.connect(self.test_ai)
         ai_buttons = QHBoxLayout()
-        self.ai_result = QLabel()
+        self.ai_result = plain_label()
         self.ai_result.setWordWrap(True)
         ai_buttons.addWidget(self.ai_result, 1)
         ai_buttons.addWidget(test_ai)

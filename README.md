@@ -359,7 +359,8 @@ Only the filename and text, never images or audio content (no OCR, no transcript
 | Images | embedded EXIF/PNG text such as title, description, keywords |
 | Anything else | the filename only |
 
-A file that can't be parsed (corrupt, password-protected) is still handled using its name.
+A file that can't be parsed (corrupt, password-protected, or an Office or EPUB file that would
+unpack to over 300 MB, as a "zip bomb" does) is still handled using its name.
 
 ## Development
 

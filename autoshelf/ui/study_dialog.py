@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from autoshelf.app_service import AppService
 from autoshelf.db.repository import Flashcard
 from autoshelf.ui.tasks import TaskRunner
+from autoshelf.ui.widgets import plain_label
 
 
 class StudyDialog(QDialog):
@@ -39,7 +40,7 @@ class StudyDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._reading_page(), "Reading list")
         tabs.addTab(self._cards_page(), "Flashcards")
-        self.status = QLabel()
+        self.status = plain_label()
         self.status.setWordWrap(True)
         layout = QVBoxLayout(self)
         layout.addWidget(tabs, 1)
@@ -80,7 +81,7 @@ class StudyDialog(QDialog):
 
     def _cards_page(self) -> QWidget:
         page = QWidget()
-        self.card_text = QLabel()
+        self.card_text = plain_label()
         self.card_text.setWordWrap(True)
         self.card_text.setMinimumHeight(160)
         font = self.card_text.font()

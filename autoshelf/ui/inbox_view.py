@@ -24,7 +24,7 @@ from autoshelf.actions.inbox import InboxItem
 from autoshelf.app_service import AppService
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.why_panel import WhyPanel
-from autoshelf.ui.widgets import show_in_explorer
+from autoshelf.ui.widgets import plain_label, show_in_explorer
 
 MAX_SUGGESTIONS = 3
 EMPTY_TEXT = (
@@ -48,7 +48,7 @@ class InboxView(QWidget):
         self._reload = False
         self._wanted: Path | None = None
 
-        self.summary = QLabel()
+        self.summary = plain_label()
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
         top = QHBoxLayout()
@@ -59,16 +59,16 @@ class InboxView(QWidget):
         self.list.currentRowChanged.connect(self._show_current)
 
         self.detail = QWidget()
-        self.name = QLabel()
+        self.name = plain_label()
         font = QFont(self.name.font())
         font.setBold(True)
         font.setPointSizeF(font.pointSizeF() * 1.2)
         self.name.setFont(font)
         self.name.setWordWrap(True)
         self.name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.title = QLabel()
+        self.title = plain_label()
         self.title.setWordWrap(True)
-        self.why = QLabel()
+        self.why = plain_label()
         self.why.setWordWrap(True)
         self.why.setStyleSheet("color: palette(placeholder-text);")
 
@@ -88,7 +88,7 @@ class InboxView(QWidget):
         self.tag_boxes: list[QCheckBox] = []
         self.tag_row.addStretch(1)
 
-        self.rename_label = QLabel()
+        self.rename_label = plain_label()
         self.rename_button = QPushButton("Rename")
         self.rename_button.clicked.connect(self._rename)
         self.rename_row = QWidget()

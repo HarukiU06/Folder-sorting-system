@@ -6,11 +6,12 @@ from typing import BinaryIO
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-from autoshelf.extract.base import Content, TextBudget, non_empty
+from autoshelf.extract.base import Content, TextBudget, check_zip_container, non_empty
 
 
 def extract(file: BinaryIO, max_chars: int) -> Content:
     """Read slide text (including tables, groups and speaker notes) slide by slide."""
+    check_zip_container(file)
     presentation = Presentation(file)
     budget = TextBudget(max_chars)
     for slide in presentation.slides:

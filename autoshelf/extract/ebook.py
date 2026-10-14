@@ -5,12 +5,13 @@ from typing import BinaryIO
 import ebooklib
 from ebooklib import epub
 
-from autoshelf.extract.base import Content, TextBudget, non_empty
+from autoshelf.extract.base import Content, TextBudget, check_zip_container, non_empty
 from autoshelf.extract.webpage import html_to_text
 
 
 def extract(file: BinaryIO, max_chars: int) -> Content:
     """Read chapters in reading (spine) order, plus Dublin Core title/creator/subject."""
+    check_zip_container(file)
     book = epub.read_epub(file, options={"ignore_ncx": True})
     budget = TextBudget(max_chars)
     for item_id, _linear in book.spine:

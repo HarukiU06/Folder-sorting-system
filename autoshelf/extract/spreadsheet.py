@@ -5,11 +5,12 @@ from typing import BinaryIO
 from openpyxl import load_workbook
 from openpyxl.workbook.workbook import Workbook
 
-from autoshelf.extract.base import Content, TextBudget, non_empty
+from autoshelf.extract.base import Content, TextBudget, check_zip_container, non_empty
 
 
 def extract(file: BinaryIO, max_chars: int) -> Content:
     """Read sheet names and non-empty cell values row by row, plus document properties."""
+    check_zip_container(file)
     workbook = load_workbook(file, read_only=True, data_only=True)
     try:
         budget = TextBudget(max_chars)

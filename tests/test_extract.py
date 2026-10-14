@@ -1,11 +1,12 @@
 import os
+import zipfile
 from pathlib import Path
 
 import pytest
 import samples
 from helpers import make, windows_only
 
-from autoshelf.extract import FILENAME_ONLY, extract, plaintext
+from autoshelf.extract import FILENAME_ONLY, base, extract, plaintext
 from autoshelf.extract.base import TextBudget, clean_text
 from autoshelf.extract.filename import filename_tokens
 
@@ -243,6 +244,38 @@ def test_notebook(tmp_path: Path) -> None:
     assert result.title == "Customer churn"
     assert result.metadata == {"language": "python"}
     assert "import pandas as pd" in result.text
+
+
+ZIP_CONTAINERS = {
+    "docx": lambda folder: samples.docx(
+        folder / "a.docx", title="T", heading="H", paragraph="P", cells=["c"]
+    ),
+    "pptx": lambda folder: samples.pptx(
+        folder / "a.pptx", title="T", slide_title="S", body="B", notes="N"
+    ),
+    "xlsx": lambda folder: samples.xlsx(folder / "a.xlsx", title="T", sheets={"S": [["x"]]}),
+    "epub": lambda folder: samples.epub(folder / "a.epub", title="T", author="A", chapters=["C"]),
+}
+
+
+@pytest.mark.parametrize("kind", ZIP_CONTAINERS)
+def test_zip_bombs_are_not_unpacked(tmp_path: Path, kind: str) -> None:
+    path = ZIP_CONTAINERS[kind](tmp_path)
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("bomb.xml", b"<a/>" * 1_000_000)  # 4 MB packed into a few KB
+    result = extract(path)
+    assert "zip bomb" in result.error
+    assert result.text == ""
+    assert result.filename_tokens == ("a",)  # still sorted by its name
+
+
+def test_office_files_that_unpack_too_big_are_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = ZIP_CONTAINERS["docx"](tmp_path)
+    assert extract(path).error is None
+    monkeypatch.setattr(base, "MAX_UNPACKED_BYTES", 10_000)
+    assert "would unpack to over 10,000 bytes" in extract(path).error
 
 
 def test_zip_lists_member_names(tmp_path: Path) -> None:

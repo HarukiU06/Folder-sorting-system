@@ -330,3 +330,32 @@ def test_new_folder_is_picked_up_without_restarting(conn, shelf: Path, smart: Pi
 )
 def test_needs_decision(kind: OutcomeKind, dst: Path | None, needs: bool) -> None:
     assert Outcome(kind, Path("a.pdf"), "", dst=dst).needs_decision is needs
+
+
+# --- no rescan of every folder per file (Phase 9) ----------------------------------------------
+
+
+def test_files_are_sorted_without_rescanning_the_library_each_time(
+    conn, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ml import library as library_module
+
+    make(root / "Recipes" / "curry.txt", "recipe curry onion simmer")
+    (root / "Finance").mkdir()
+    repository.set_folder_description(conn, "Recipes", "recipe cooking baking")
+    scans: list[Path] = []
+    real = library_module.scan_library
+    monkeypatch.setattr(
+        library_module, "scan_library", lambda *args, **kw: scans.append(1) or real(*args, **kw)
+    )
+    library = LibraryIndex(conn, root, FakeEmbedder())
+    smart = Pipeline(conn, root, library=library, threshold=0.3, margin=0.1)
+
+    first = smart.process(make(root / "banana bread recipe.txt", "recipe baking banana oven"))
+    second = smart.process(make(root / "apple pie recipe.txt", "recipe baking apple oven"))
+
+    assert first.dst.parent == second.dst.parent == root / "Recipes"
+    assert len(scans) == 1  # the first decision; no rescan per file
+    # The file sorted a moment ago already counts as an example of its folder.
+    neighbours = {n.path.name for n in second.classification.score_of("Recipes").neighbors}
+    assert "banana bread recipe.txt" in neighbours

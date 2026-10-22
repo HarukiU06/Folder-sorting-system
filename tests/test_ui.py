@@ -668,7 +668,7 @@ def fake_ai(service, monkeypatch: pytest.MonkeyPatch):
     from fakes import FakeProvider
 
     provider = FakeProvider("A short summary.")
-    monkeypatch.setattr(service, "provider", lambda: provider)
+    monkeypatch.setattr(service, "provider", lambda bulk=False: provider)
     return provider
 
 
@@ -825,3 +825,81 @@ def test_study_dialog_makes_and_reviews_cards(
     )
     dialog.export()
     assert target.read_text(encoding="utf-8").splitlines()[0] == "What is due?,Tax"
+
+
+# --- Phase 9: missed files, skipped files, the bulk AI model ------------------------------------
+
+_unfinished_reads: list = []  # kept referenced: a collected context manager would clean up
+
+
+def crash_while_reading(paths: AppPaths, path: Path) -> None:
+    """What the sorting process leaves behind when it dies while reading ``path``."""
+    from autoshelf.extract import guard
+
+    reading = guard.ReadGuard(paths.home / guard.STATE_FILENAME, record=True).reading(path)
+    reading.__enter__()
+    _unfinished_reads.append(reading)
+
+
+def test_settings_show_the_sweep_and_the_bulk_model(qtbot, service, runner) -> None:
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.sweep.value() == 5
+    view.sweep.setValue(0)
+    assert view.sweep.text() == "never"
+    view._apply_files()
+    settle(qtbot, runner)
+    assert service.settings().sweep_minutes == 0
+
+    view.ai_provider.setCurrentIndex(view.ai_provider.findData("claude"))
+    assert view.ai_model.currentText() == "claude-opus-5-5"
+    assert view.ai_bulk_model.currentText() == "claude-haiku-5-5"
+    view._apply_ai()
+    settle(qtbot, runner)
+    assert service.settings().llm_bulk_model == ""  # follows the default
+    view.ai_bulk_model.setCurrentText("claude-sonnet-5-5")
+    view._apply_ai()
+    settle(qtbot, runner)
+    assert service.settings().llm_bulk_model == "claude-sonnet-5-5"
+
+
+def test_settings_list_skipped_files_and_read_them_again(
+    qtbot, service, runner, paths: AppPaths, shelf: Path
+) -> None:
+    from autoshelf.extract import guard
+
+    doc = make(shelf / "_Inbox" / "agenda.txt", "agenda")
+    crash_while_reading(paths, doc)
+    guard.start(paths.home, record=True)
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    messages: list[str] = []
+    view.message.connect(messages.append)
+    view.load()
+    settle(qtbot, runner)
+    assert not view.skipped_box.isHidden()
+    assert [view.skipped.item(i).text() for i in range(view.skipped.count())] == ["agenda.txt"]
+
+    view.skipped.item(0).setSelected(True)
+    view.clear_selected_skipped()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert messages == ["AutoShelf will read 1 file(s) again"]
+    assert view.skipped.count() == 0
+    assert view.skipped_box.isHidden()
+    assert not guard.crashed_before(doc)
+
+
+def test_the_app_says_which_files_stopped_its_last_run(
+    qtbot, service, paths: AppPaths, shelf: Path
+) -> None:
+    doc = make(shelf / "broken.pdf", "%PDF")
+    crash_while_reading(paths, doc)
+    assert service.acquire()  # starts the guard: broken.pdf is skipped from now on
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=False)
+    assert "AutoShelf stopped while reading broken.pdf" in app.window.statusBar().currentMessage()
+    app.runner.wait()

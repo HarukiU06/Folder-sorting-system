@@ -13,9 +13,12 @@ from autoshelf.llm.base import DEFAULT_TIMEOUT_SECONDS, LLMError, Message, Trans
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
-# Newest first; the first is the default. Any other model id can be typed in Settings.
+# Most capable first; the first is the default. Any other model id can be typed in Settings.
 MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 DEFAULT_MODEL = MODELS[0]
+# Summaries, file and folder names and flashcards are many small requests: they default to
+# the fastest, cheapest model. Opus or Sonnet can be chosen for them in Settings.
+BULK_MODEL = "claude-haiku-5-5"
 # Room for the model's own thinking as well as the answer.
 MIN_MAX_TOKENS = 4096
 

@@ -89,6 +89,7 @@ def move_file(
     before_rename: BeforeRename | None = None,
     allowed_source: Path | None = None,
     allowed_target: Path | None = None,
+    notify_library: bool = True,
 ) -> MoveResult:
     """Move ``src`` into the existing folder ``dst_dir``, safely and with a history record.
 
@@ -100,6 +101,10 @@ def move_file(
     ``allowed_source`` is a folder outside the root that ``src`` may come from; the
     history then records it, so the move can be undone. ``allowed_target`` is a folder
     outside the root that ``dst_dir`` may be (undo uses it to put such a file back).
+
+    A move into or out of a category folder bumps the library version, so the watcher's
+    index rescans before its next decision (it ignores the events of the app's own
+    moves). The pipeline passes ``notify_library=False``: it updates its index itself.
     """
     root = Path(root).resolve(strict=True)
     source = _checked_source(Path(src), root, allowed_source)
@@ -142,6 +147,8 @@ def move_file(
     # the library knows not to mistake this move for one the user made (actions.learning).
     repository.set_file_location(conn, file_id, dst, status_after_move(dst, root, action))
     repository.set_history_state(conn, history_id, "done")
+    if notify_library and Zone.CATEGORY in (zone_of(source, root), zone_of(dst, root)):
+        repository.bump_library_version(conn)
     log.debug("History #%d: %s %s -> %s", history_id, action, source, dst)
     return MoveResult(history_id=history_id, file_id=file_id, src=source, dst=dst)
 

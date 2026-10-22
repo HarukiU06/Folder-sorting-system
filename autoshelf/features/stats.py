@@ -13,14 +13,19 @@ from autoshelf.config import DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.ml.library import scan_library
 
-STALE_DAYS = 182  # "not opened in 6+ months"
+STALE_DAYS = 182  # "untouched for 6+ months"
 MONTHS_SHOWN = 12
 STALE_SHOWN = 50
+STALE_NOTE = (
+    "Not changed, added or opened from AutoShelf for 6 months or more. Windows doesn't "
+    "reliably record when a file is opened, so files you opened in other programs can be "
+    "listed too."
+)
 
 
 @dataclass(frozen=True)
 class StaleFile:
-    """A file nobody has opened for a long time."""
+    """A file that hasn't been changed, added or opened from AutoShelf for a long time."""
 
     path: Path
     last_used: datetime
@@ -72,8 +77,9 @@ def library_stats(
 ) -> LibraryStats:
     """Collect the dashboard's numbers (reads file metadata only, never contents).
 
-    "Last used" is the later of Windows' last-access time and the last time the file
-    was opened from AutoShelf.
+    "Last used" is the latest of: when the file was changed, when it was created (put in
+    its place), and when it was last opened from AutoShelf. Windows' last-access time isn't
+    used: Windows often doesn't update it, and backups or virus scans touch it.
     """
     now = now or datetime.now(UTC)
     patterns = tuple(ignore_patterns)
@@ -91,7 +97,7 @@ def library_stats(
             continue
         created = datetime.fromtimestamp(_created(st), UTC)
         added[f"{created.year:04d}-{created.month:02d}"] += 1
-        last_used = datetime.fromtimestamp(max(st.st_atime, st.st_mtime), UTC)
+        last_used = datetime.fromtimestamp(max(st.st_mtime, _created(st)), UTC)
         if str(item.path).casefold() in opened:
             last_used = max(last_used, datetime.fromisoformat(opened[str(item.path).casefold()]))
         if last_used < cutoff:

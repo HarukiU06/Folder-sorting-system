@@ -152,6 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ai", choices=["off", "claude", "ollama"], help="optional AI provider (off by default)"
     )
     config.add_argument("--ai-model", metavar="MODEL", help="model name ('' for the default)")
+    config.add_argument(
+        "--ai-bulk-model",
+        metavar="MODEL",
+        help="model for summaries, names and flashcards ('' for the default: the cheapest)",
+    )
     config.add_argument("--ollama-url", metavar="URL", help="Ollama server (default localhost)")
     config.add_argument(
         "--api-key",
@@ -237,6 +242,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     with_root(commands.add_parser("stats", help="numbers about your library"))
 
+    skipped = commands.add_parser(
+        "skipped", help="files only sorted by name because AutoShelf stopped while reading them"
+    )
+    skipped.add_argument("files", nargs="*", type=Path, help="with --clear: just these files")
+    skipped.add_argument("--clear", action="store_true", help="read them (or all) again")
+
     # Optional AI (needs `config --ai claude|ollama`)
     summarize = with_root(commands.add_parser("summarize", help="summarize a file (AI)"))
     summarize.add_argument("file", type=Path)
@@ -315,6 +326,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "versions": _cmd_versions,
             "organize": _cmd_organize,
             "stats": _cmd_stats,
+            "skipped": _cmd_skipped,
             "summarize": _cmd_summarize,
             "rename-suggestions": _cmd_rename_suggestions,
             "rename": _cmd_rename,
@@ -413,6 +425,7 @@ def _watch(args: argparse.Namespace, paths: AppPaths, settings: Settings, root: 
         margin=settings.auto_margin,
         watched=valid_watched(paths, settings, root),
         watched_extensions=settings.watched_extensions,
+        sweep_interval=settings.sweep_minutes * 60,
     )
     mode = "DRY RUN: nothing will be moved" if args.dry_run else "files will be moved"
     log.info("Watching %s (%s). Data folder: %s", root, mode, paths.home)
@@ -652,6 +665,9 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         if args.ai_model is not None:
             settings.llm_model = args.ai_model.strip()
             changed = True
+        if args.ai_bulk_model is not None:
+            settings.llm_bulk_model = args.ai_bulk_model.strip()
+            changed = True
         if args.ollama_url is not None:
             settings.ollama_url = args.ollama_url.strip()
             changed = True
@@ -685,11 +701,15 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
     print(f"Stable seconds:   {settings.stable_seconds:g}")
     print(f"Watched folders:  {', '.join(settings.watched_folders) or '(none)'}")
     print(f"  taking:         {', '.join(settings.watched_extensions) or '(nothing)'}")
-    from autoshelf.llm import PROVIDER_NAMES, default_model
+    from autoshelf.llm import BULK_TASKS, PROVIDER_NAMES, bulk_model, default_model
 
     ai = PROVIDER_NAMES.get(settings.llm_provider, settings.llm_provider)
     if settings.llm_provider != "off":
-        ai += f", model {settings.llm_model or default_model(settings.llm_provider)}"
+        model = settings.llm_model or default_model(settings.llm_provider)
+        bulk = bulk_model(settings.llm_provider, settings.llm_model, settings.llm_bulk_model)
+        ai += f", model {model}"
+        if bulk != model:
+            ai += f" ({BULK_TASKS}: {bulk})"
     print(f"AI (optional):    {ai}")
     from autoshelf import startup
 
@@ -988,9 +1008,36 @@ def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
         for source, target, count in stats.corrected_pairs:
             print(f"  {count:3}x  {source} -> {target}")
     if stats.stale_total:
-        print(f"Not opened in 6+ months: {stats.stale_total} file(s), e.g.:")
+        print(
+            f"Untouched for 6+ months (not changed, added or opened from AutoShelf): "
+            f"{stats.stale_total} file(s), e.g.:"
+        )
         for item in stats.stale[:5]:
             print(f"  {item.last_used:%Y-%m-%d}  {item.path.name}")
+    return 0
+
+
+def _cmd_skipped(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = AppService(paths)
+    if args.files and not args.clear:
+        print("error: add --clear to read these files again", file=sys.stderr)
+        return EXIT_USAGE
+    if args.clear:
+        files = [path.resolve() for path in args.files] or None
+        cleared = service.clear_skipped(files)
+        print(f"{cleared} file(s) will be read again." if cleared else "No such skipped files.")
+        return 0
+    skipped = service.skipped_files()
+    if not skipped:
+        print("No skipped files: AutoShelf reads every file.")
+        return 0
+    print(
+        "AutoShelf stopped while reading these files (a crash, or a power cut or forced "
+        "restart), so it sorts them by name only:"
+    )
+    for item in skipped:
+        print(f"  {item.path}")
+    print("Read them again with: autoshelf skipped --clear [FILE ...]")
     return 0
 
 

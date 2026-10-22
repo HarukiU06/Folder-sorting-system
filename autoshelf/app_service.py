@@ -241,6 +241,36 @@ class AppService:
             read_guard.stop()
         self._lock.release()
 
+    # --- files AutoShelf no longer reads (they stopped it while being read) ------------
+
+    def skipped_files(self) -> list[read_guard.SkippedFile]:
+        """Files only sorted by name because AutoShelf stopped while reading them (a crash,
+        or a power cut or forced restart, which look the same).
+
+        Each is shown where it is now, if AutoShelf knows (it was sorted by its name since).
+        """
+        shown = []
+        with self._connect() as conn:
+            for item in read_guard.skipped_files(self.paths.home):
+                found = repository.path_of_version(conn, item.size, item.mtime_ns)
+                shown.append(replace(item, path=Path(found)) if found else item)
+        return shown
+
+    def newly_skipped(self) -> list[Path]:
+        """Files that stopped AutoShelf's previous run and are skipped from this start on."""
+        return read_guard.newly_skipped()
+
+    def clear_skipped(self, paths: list[Path] | None = None) -> int:
+        """Read these skipped files (or all of them) again; returns how many were cleared.
+
+        Files in your folders that were indexed by name only are read on the next rescan.
+        """
+        cleared = read_guard.clear(self.paths.home, paths)
+        if cleared:
+            with self._connect() as conn:
+                repository.bump_library_version(conn)
+        return cleared
+
     @property
     def watching(self) -> bool:
         """True while the watcher runs."""
@@ -279,6 +309,7 @@ class AppService:
                 on_learned=self._learned,
                 watched=watched,
                 watched_extensions=settings.watched_extensions,
+                sweep_interval=settings.sweep_minutes * 60,
             )
             service.start()
             self._service = service
@@ -327,7 +358,7 @@ class AppService:
             service = self._service
         if service is None:
             return None
-        return lambda src, dst: service.self_moves.expect(dst)
+        return service.self_moves.expect_move
 
     # --- actions (slow: call these off the UI thread) -----------------------------------
 
@@ -639,15 +670,20 @@ class AppService:
 
     # --- optional AI (off by default) ---------------------------------------------------
 
-    def provider(self) -> llm.Provider | None:
-        """The configured LLM provider, or None while it is off. Raises LLMError."""
-        settings = self.settings()
-        return llm.make_provider(
-            settings.llm_provider, settings.llm_model, ollama_url=settings.ollama_url
-        )
+    def provider(self, *, bulk: bool = False) -> llm.Provider | None:
+        """The configured LLM provider, or None while it is off. Raises LLMError.
 
-    def _require_provider(self) -> llm.Provider:
-        provider = self.provider()
+        ``bulk``: for summaries, names and flashcards, which use their own model (by
+        default the cheapest Claude model).
+        """
+        settings = self.settings()
+        model = settings.llm_model
+        if bulk:
+            model = llm.bulk_model(settings.llm_provider, model, settings.llm_bulk_model)
+        return llm.make_provider(settings.llm_provider, model, ollama_url=settings.ollama_url)
+
+    def _require_provider(self, *, bulk: bool = False) -> llm.Provider:
+        provider = self.provider(bulk=bulk)
         if provider is None:
             raise llm.LLMError("Turn on an AI provider in Settings first")
         return provider
@@ -676,16 +712,22 @@ class AppService:
         return secrets.masked(secrets.get_api_key())
 
     def test_ai(self) -> str:
-        """Ask the provider for a one-word reply, to check it works."""
-        provider = self._require_provider()
-        reply = provider.complete(
-            "Reply with the single word OK.", [llm.Message("user", "Are you there?")], max_tokens=16
-        )
-        return f"{provider.name} ({provider.model}) answered: {reply[:60]}"
+        """Ask for a one-word reply, to check the AI works (with each model in use)."""
+        main = self._require_provider()
+        bulk = self._require_provider(bulk=True)
+        answers = []
+        for provider in (main,) if bulk.model == main.model else (main, bulk):
+            reply = provider.complete(
+                "Reply with the single word OK.",
+                [llm.Message("user", "Are you there?")],
+                max_tokens=16,
+            )
+            answers.append(f"{provider.model} answered: {reply[:30]}")
+        return f"{main.name}: " + "; ".join(answers)
 
     def summarize(self, path: Path, *, refresh: bool = False) -> str:
         """A 2-3 sentence summary of a file (cached; made by the AI when missing)."""
-        provider = self._require_provider()
+        provider = self._require_provider(bulk=True)
         with self._connect() as conn:
             return summary_features.file_summary(conn, provider, path, refresh=refresh)
 
@@ -714,7 +756,7 @@ class AppService:
         from autoshelf.extract import extract
 
         extraction = extract(path)
-        provider = self._require_provider() if use_ai else None
+        provider = self._require_provider(bulk=True) if use_ai else None
         if use_ai:
             stem = rename_features.clean_stem(
                 rename_features.ask_for_name(provider, path.name, extraction.title, extraction.text)
@@ -735,7 +777,7 @@ class AppService:
         root = self._require_root()
         settings = self.settings()
         try:
-            provider = self.provider()
+            provider = self.provider(bulk=True)  # names the folders
         except llm.LLMError:
             provider = None
         with self._connect() as conn:
@@ -797,7 +839,7 @@ class AppService:
         self, *, path: Path | None = None, folder: str | None = None, count: int = 10
     ) -> list[repository.Flashcard]:
         """Make cards from one file, or from a whole folder (uses the AI) and keep them."""
-        provider = self._require_provider()
+        provider = self._require_provider(bulk=True)
         root = self._require_root()
         if path is not None:
             key = folder_label(path, root) or None

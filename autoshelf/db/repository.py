@@ -139,6 +139,15 @@ def get_file_content(conn: sqlite3.Connection, file_id: int) -> tuple[str | None
     return (None, None) if row is None else (row["title"], row["text_excerpt"])
 
 
+def file_contents(conn: sqlite3.Connection) -> dict[str, tuple[str | None, str | None]]:
+    """(title, text_excerpt) of every file that has either, keyed by casefolded path."""
+    rows = conn.execute(
+        "SELECT path, title, text_excerpt FROM files"
+        " WHERE title IS NOT NULL OR text_excerpt IS NOT NULL"
+    )
+    return {row["path"].casefold(): (row["title"], row["text_excerpt"]) for row in rows}
+
+
 def set_file_status(conn: sqlite3.Connection, file_id: int, status: str) -> None:
     """Set a file's status ('new', 'sorted', 'inbox' or 'ignored')."""
     conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
@@ -205,11 +214,31 @@ def folder_descriptions(conn: sqlite3.Connection) -> dict[str, str]:
 
 def set_folder_description(conn: sqlite3.Connection, folder: str, description: str) -> None:
     """Set the description of a folder (its key relative to the root, "/"-separated)."""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO folders (path, description) VALUES (?, ?)"
+            " ON CONFLICT (path) DO UPDATE SET path = excluded.path,"
+            " description = excluded.description",
+            (folder, description),
+        )
+        bump_library_version(conn)
+
+
+LIBRARY_VERSION = "library_version"
+
+
+def library_version(conn: sqlite3.Connection) -> int:
+    """A counter that changes whenever the library changes in a way no file event shows
+    (e.g. a folder description), so every process's index knows to refresh."""
+    return int(get_setting(conn, LIBRARY_VERSION, 0))
+
+
+def bump_library_version(conn: sqlite3.Connection) -> None:
+    """Tell every library index (in any process) to refresh before its next decision."""
     conn.execute(
-        "INSERT INTO folders (path, description) VALUES (?, ?)"
-        " ON CONFLICT (path) DO UPDATE SET path = excluded.path,"
-        " description = excluded.description",
-        (folder, description),
+        "INSERT INTO settings (key, value) VALUES (?, '1')"
+        " ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        (LIBRARY_VERSION,),
     )
 
 
@@ -228,12 +257,15 @@ def record_correction(
 
     ``from_folder`` is where AutoShelf had put (or suggested putting) the file, and
     ``vector`` the file's embedding by ``model``, kept so the example outlives the file.
+    Library indexes reload their examples before their next decision.
     """
-    cursor = conn.execute(
-        "INSERT INTO corrections (file_id, from_folder, to_folder, source, ts, vector, model,"
-        " history_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (file_id, from_folder, to_folder, source, now_iso(), vector, model, history_id),
-    )
+    with transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO corrections (file_id, from_folder, to_folder, source, ts, vector, model,"
+            " history_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_id, from_folder, to_folder, source, now_iso(), vector, model, history_id),
+        )
+        bump_library_version(conn)
     return cursor.lastrowid
 
 
@@ -367,6 +399,17 @@ def find_files_by_size(conn: sqlite3.Connection, size: int) -> list[FileRecord]:
     """Return every recorded file of this size."""
     rows = conn.execute("SELECT * FROM files WHERE size = ? ORDER BY id", (size,))
     return [_file_from_row(row) for row in rows]
+
+
+def path_of_version(conn: sqlite3.Connection, size: int, mtime_ns: int) -> str | None:
+    """Where the recorded file of this size and modification time is now, if exactly one
+    such file is known (moves keep both)."""
+    matches = [
+        record.path
+        for record in find_files_by_size(conn, size)
+        if record.mtime is not None and abs(record.mtime - mtime_ns / 1e9) <= 1e-3
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def has_pending_history(conn: sqlite3.Connection, file_id: int) -> bool:

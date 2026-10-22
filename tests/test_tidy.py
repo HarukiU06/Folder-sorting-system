@@ -248,6 +248,26 @@ def test_stats(conn, shelf, library) -> None:
     assert later.stale_total == 3
 
 
+def test_untouched_files_ignore_windows_last_access_time(conn, shelf, library) -> None:
+    import os
+
+    now = datetime.now(UTC) + timedelta(days=400)
+    cake = shelf / "Recipes" / "cake.txt"
+    invoice = shelf / "Finance" / "invoice 2024.txt"
+    # A backup or virus scan touched it just now: that isn't using it.
+    os.utime(cake, (now.timestamp(), cake.stat().st_mtime))
+    # Opened from AutoShelf recently: in use.
+    record = repository.get_file_by_path(conn, invoice)
+    conn.execute(
+        "UPDATE files SET last_opened_at = ? WHERE id = ?",
+        ((now - timedelta(days=3)).isoformat(), record.id),
+    )
+
+    stats = library_stats(conn, shelf, now=now)
+
+    assert [item.path for item in stats.stale] == [cake]
+
+
 # --- watched folders ------------------------------------------------------------------------
 
 

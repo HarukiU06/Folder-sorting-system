@@ -297,7 +297,7 @@ def test_app_features_with_a_fake_ai(
         '[{"n": 2}, {"n": 1}]',
         '[{"q": "What is k-means?", "a": "Clustering"}]',
     )
-    monkeypatch.setattr(service, "provider", lambda: replies)
+    monkeypatch.setattr(service, "provider", lambda bulk=False: replies)
     kmeans = shelf / "Machine Learning" / "kmeans.md"
 
     assert service.summarize(kmeans) == "A k-means note."
@@ -327,7 +327,7 @@ def test_cli_ai_commands(
     import autoshelf.app_service as app_service_module
 
     fake = FakeProvider("Kmeans answer [1].")
-    monkeypatch.setattr(app_service_module.AppService, "provider", lambda self: fake)
+    monkeypatch.setattr(app_service_module.AppService, "provider", lambda self, bulk=False: fake)
     monkeypatch.setattr("getpass.getpass", lambda prompt: "sk-ant-cli-key")
 
     assert main(["config", "--ai", "claude", "--api-key"]) == 0

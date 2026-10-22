@@ -111,6 +111,19 @@ class AutoShelfApp(QObject):
         self.window.refresh_all()
         if show:
             self.show_window()
+        self._report_skipped()
+
+    def _report_skipped(self) -> None:
+        """Say so when files that stopped the last run are sorted by name only from now on."""
+        skipped = self.service.newly_skipped()
+        if not skipped:
+            return
+        names = ", ".join(path.name for path in skipped[:3])
+        more = f" and {len(skipped) - 3} more" if len(skipped) > 3 else ""
+        self.window.show_message(
+            f"AutoShelf stopped while reading {names}{more} last time, so it sorts them by "
+            "name only now. Settings lists them, to read them again."
+        )
 
     def shutdown(self) -> None:
         """Stop everything (called after the event loop ends)."""

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -30,7 +31,7 @@ from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.llm import claude as claude_provider
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import open_folder, plain_label
+from autoshelf.ui.widgets import open_folder, plain_label, plain_tooltip
 
 DEFAULT_LEVEL = 2  # "Balanced"
 
@@ -60,6 +61,7 @@ class SettingsView(QWidget):
     paused_toggled = Signal(bool)
     notifications_toggled = Signal(bool)
     restart_needed = Signal(str)  # a message to show once restarted
+    message = Signal(str)  # a message for the status bar
     ai_state = Signal(bool)  # whether an AI provider is chosen
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
@@ -124,6 +126,16 @@ class SettingsView(QWidget):
         self.stable.setDecimals(0)
         self.stable.setSuffix(" s")
         self.stable.setMaximumWidth(110)
+        self.sweep = QDoubleSpinBox()
+        self.sweep.setRange(0.0, 120.0)
+        self.sweep.setDecimals(0)
+        self.sweep.setSuffix(" min")
+        self.sweep.setSpecialValueText("never")
+        self.sweep.setMaximumWidth(110)
+        self.sweep.setToolTip(
+            "Windows can miss new files in busy iCloud folders. AutoShelf looks at the "
+            "folder again this often, so no file stays unsorted until the next start."
+        )
         self.patterns = QPlainTextEdit()
         self.patterns.setPlaceholderText("One pattern per line, e.g. *.tmp")
         self.patterns.setMaximumHeight(110)
@@ -132,11 +144,39 @@ class SettingsView(QWidget):
         files_box = QGroupBox("New files")
         files = QFormLayout(files_box)
         files.addRow("Wait until a file is unchanged for", self.stable)
+        files.addRow("Look for missed files every", self.sweep)
         files.addRow("Ignore files named like", self.patterns)
         apply_row = QHBoxLayout()
         apply_row.addStretch(1)
         apply_row.addWidget(apply)
         files.addRow("", apply_row)
+
+        # Files that stopped AutoShelf while it read them
+        self.skipped = QListWidget()
+        self.skipped.setMaximumHeight(80)
+        self.skipped.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        read_selected = QPushButton("Read selected again")
+        read_selected.clicked.connect(self.clear_selected_skipped)
+        read_all = QPushButton("Read all again")
+        read_all.clicked.connect(self.clear_all_skipped)
+        skipped_buttons = QVBoxLayout()
+        skipped_buttons.addWidget(read_selected)
+        skipped_buttons.addWidget(read_all)
+        skipped_buttons.addStretch(1)
+        skipped_row = QHBoxLayout()
+        skipped_row.addWidget(self.skipped, 1)
+        skipped_row.addLayout(skipped_buttons)
+        skipped_note = QLabel(
+            "AutoShelf stopped while reading these files, so it sorts them by their names "
+            "only, to avoid stopping again. A power cut or a forced restart looks the same "
+            "as a crash: if that is what happened, read them again."
+        )
+        skipped_note.setWordWrap(True)
+        self.skipped_box = QGroupBox("Files sorted by name only")
+        skipped_layout = QVBoxLayout(self.skipped_box)
+        skipped_layout.addWidget(skipped_note)
+        skipped_layout.addLayout(skipped_row)
+        self.skipped_box.setVisible(False)  # shown when there are any
 
         # Watched folders
         self.watched = QListWidget()
@@ -180,6 +220,13 @@ class SettingsView(QWidget):
         self.ai_model = QComboBox()
         self.ai_model.setEditable(True)
         self.ai_model.setMinimumContentsLength(22)
+        self.ai_bulk_model = QComboBox()
+        self.ai_bulk_model.setEditable(True)
+        self.ai_bulk_model.setMinimumContentsLength(22)
+        self.ai_bulk_model.setToolTip(
+            "Many small requests: the cheapest model is the default. Choose a bigger one "
+            "for better summaries, names and flashcards."
+        )
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("Paste your Claude API key")
@@ -209,7 +256,8 @@ class SettingsView(QWidget):
         ai_box = QGroupBox("AI (optional)")
         ai_form = QFormLayout(ai_box)
         ai_form.addRow("Provider", self.ai_provider)
-        ai_form.addRow("Model", self.ai_model)
+        ai_form.addRow("Model for questions", self.ai_model)
+        ai_form.addRow(f"Model for {llm.BULK_TASKS}", self.ai_bulk_model)
         ai_form.addRow("Claude API key", key_row)
         ai_form.addRow("", self.key_status)
         ai_form.addRow("Ollama address", self.ollama_url)
@@ -225,6 +273,7 @@ class SettingsView(QWidget):
         layout.addWidget(root_box)
         layout.addWidget(sorting_box)
         layout.addWidget(files_box)
+        layout.addWidget(self.skipped_box)
         layout.addWidget(watched_box)
         layout.addWidget(ai_box)
         layout.addWidget(self.model)
@@ -257,6 +306,34 @@ class SettingsView(QWidget):
             self.startup.blockSignals(False)
 
         self.runner.run(self.service.starts_with_windows, startup_loaded, lambda exc: None)
+        self.runner.run(self.service.skipped_files, self.show_skipped, lambda exc: None)
+
+    def show_skipped(self, skipped) -> None:
+        """List the files that are only sorted by name (hidden when there are none)."""
+        self.skipped.clear()
+        for item in skipped:
+            entry = QListWidgetItem(item.path.name)
+            entry.setData(Qt.ItemDataRole.UserRole, str(item.path))
+            entry.setToolTip(plain_tooltip(str(item.path)))
+            self.skipped.addItem(entry)
+        self.skipped_box.setVisible(bool(skipped))
+
+    def clear_selected_skipped(self) -> None:
+        """Read the selected skipped files again."""
+        paths = [Path(item.data(Qt.ItemDataRole.UserRole)) for item in self.skipped.selectedItems()]
+        if paths:
+            self._clear_skipped(paths)
+
+    def clear_all_skipped(self) -> None:
+        """Read every skipped file again."""
+        self._clear_skipped(None)
+
+    def _clear_skipped(self, paths: list[Path] | None) -> None:
+        def cleared(count: int) -> None:
+            self.message.emit(f"AutoShelf will read {count} file(s) again")
+            self.runner.run(self.service.skipped_files, self.show_skipped)
+
+        self.runner.run(lambda: self.service.clear_skipped(paths), cleared)
 
     def show_settings(self, settings: Settings) -> None:
         """Fill in the widgets without triggering any changes."""
@@ -279,12 +356,13 @@ class SettingsView(QWidget):
         self.paused.setChecked(settings.paused)
         self.notifications.setChecked(settings.notifications)
         self.stable.setValue(settings.stable_seconds)
+        self.sweep.setValue(settings.sweep_minutes)
         self.patterns.setPlainText("\n".join(settings.ignore_patterns))
         self.watched.clear()
         self.watched.addItems(settings.watched_folders)
         self.extensions.setText(", ".join(settings.watched_extensions))
         self.ai_provider.setCurrentIndex(max(0, self.ai_provider.findData(settings.llm_provider)))
-        self._fill_models(settings.llm_provider, settings.llm_model)
+        self._fill_models(settings.llm_provider, settings.llm_model, settings.llm_bulk_model)
         self.ollama_url.setText(settings.ollama_url)
         self.ai_state.emit(settings.llm_provider != llm.OFF)
         self.runner.run(
@@ -342,6 +420,7 @@ class SettingsView(QWidget):
             "Saved",
             True,
             stable_seconds=float(self.stable.value()),
+            sweep_minutes=float(self.sweep.value()),
             ignore_patterns=[pattern for pattern in patterns if pattern],
         )
 
@@ -371,15 +450,18 @@ class SettingsView(QWidget):
         wanted = sorted(parse_extensions(self.extensions.text())) if self.extensions.text() else []
         self._update("Saved", True, watched_extensions=wanted)
 
-    def _fill_models(self, provider: str, current: str) -> None:
-        self.ai_model.clear()
-        if provider == llm.CLAUDE:
-            self.ai_model.addItems(claude_provider.MODELS)
-        elif provider == llm.OLLAMA:
-            self.ai_model.addItems(["qwen2.5", "llama3.2", "gemma3"])
-        self.ai_model.setEnabled(provider != llm.OFF)
-        self.ai_model.setCurrentText(
-            current or (llm.default_model(provider) if provider != llm.OFF else "")
+    def _fill_models(self, provider: str, current: str, current_bulk: str = "") -> None:
+        on = provider != llm.OFF
+        for box in (self.ai_model, self.ai_bulk_model):
+            box.clear()
+            if provider == llm.CLAUDE:
+                box.addItems(claude_provider.MODELS)
+            elif provider == llm.OLLAMA:
+                box.addItems(["qwen2.5", "llama3.2", "gemma3"])
+            box.setEnabled(on)
+        self.ai_model.setCurrentText(current or (llm.default_model(provider) if on else ""))
+        self.ai_bulk_model.setCurrentText(
+            llm.bulk_model(provider, current, current_bulk) if on else ""
         )
 
     def _ai_provider_changed(self) -> None:
@@ -387,14 +469,19 @@ class SettingsView(QWidget):
 
     def _apply_ai(self) -> None:
         provider = self.ai_provider.currentData()
-        model = self.ai_model.currentText().strip() if provider != llm.OFF else ""
+        on = provider != llm.OFF
+        model = self.ai_model.currentText().strip() if on else ""
+        bulk = self.ai_bulk_model.currentText().strip() if on else ""
         if model == llm.default_model(provider):
             model = ""
+        if bulk == llm.default_bulk_model(provider, model):
+            bulk = ""  # follow the default (and, with Ollama, the main model)
         self._update(
             None,
             False,
             llm_provider=provider,
             llm_model=model,
+            llm_bulk_model=bulk,
             ollama_url=self.ollama_url.text().strip() or "http://localhost:11434",
         )
         self.ai_state.emit(provider != llm.OFF)

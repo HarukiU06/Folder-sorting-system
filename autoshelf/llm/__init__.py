@@ -17,11 +17,25 @@ PRIVACY_NOTE = (
 )
 
 __all__ = ["CLAUDE", "OFF", "OLLAMA", "LLMError", "Message", "Provider", "make_provider"]
+BULK_TASKS = "summaries, names and flashcards"
 
 
 def default_model(provider: str) -> str:
     """The model used when none is set."""
     return claude.DEFAULT_MODEL if provider == CLAUDE else ollama.DEFAULT_MODEL
+
+
+def default_bulk_model(provider: str, model: str = "") -> str:
+    """The model for summaries, names and flashcards when none is set for them: the
+    cheapest Claude model, or (with Ollama, which runs one local model) the main one."""
+    if provider == CLAUDE:
+        return claude.BULK_MODEL
+    return model or default_model(provider)
+
+
+def bulk_model(provider: str, model: str, bulk: str) -> str:
+    """The model to use for summaries, names and flashcards."""
+    return bulk or default_bulk_model(provider, model)
 
 
 def make_provider(

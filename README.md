@@ -7,7 +7,7 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** all eight phases of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–9 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
 > your corrections, follows your rules, explains every decision, and helps you search and
@@ -89,10 +89,12 @@ start paused so you can look first. AutoShelf then lives in the system tray:
 - **Tidy up:** organize a messy folder (preview, then one undoable batch), find identical
   files and possible versions.
 - **Dashboard:** files per folder, files added per month, how many automatic moves you
-  kept, the most corrected folders, and files not opened for six months.
+  kept, the most corrected folders, and files untouched for six months (not changed, added
+  or opened from AutoShelf: Windows doesn't reliably record when you open a file elsewhere).
 - **Ask** (only with AI on): questions about your files, answered with citations.
 - **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
-  which files to ignore, and other folders to watch (optional, e.g. Downloads).
+  which files to ignore, how often to look for missed files, files sorted by name only (to
+  read them again), and other folders to watch (optional, e.g. Downloads).
 
 When a file needs your decision, a notification asks "Where should *file* go?" with the best
 guesses; click it to open the Inbox with that file selected. (Notifications have no buttons
@@ -216,11 +218,15 @@ Better names and new folders (no AI needed), and the optional AI:
 
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
 files already in your folders ahead of time (the watcher also does this when it starts),
-and `config` shows or changes settings. Every command that needs the root accepts `--root`.
+`skipped` lists files sorted by name only because AutoShelf stopped while reading them
+(`skipped --clear [FILE ...]` reads them again), and `config` shows or changes settings.
+Every command that needs the root accepts `--root`.
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
-unchanged before it is processed. A file you undo is put back where it was and left alone
-from then on. Undo refuses (and changes nothing) if the file has been edited since it was
+unchanged before it is processed. Windows can miss file events in busy iCloud folders, so
+every 5 minutes the watcher also looks at the root and `_Inbox` again for files it missed
+(files it already knows, unchanged, aren't read again); Settings changes the interval or
+turns it off. A file you undo is put back where it was and left alone from then on. Undo refuses (and changes nothing) if the file has been edited since it was
 moved (`--force` overrides), was moved elsewhere, or if its original folder no longer exists.
 
 The log file is `%APPDATA%\AutoShelf\logs\autoshelf.log`. Set `AUTOSHELF_HOME` to use a
@@ -340,8 +346,10 @@ on your own PC, e.g. `ollama pull qwen2.5`). Then:
 
 Privacy: with AI on, the text of the files you ask about is sent to the provider (to
 Anthropic's servers for the Claude API; it stays on your PC with Ollama). Sorting never
-uses the AI, and nothing is sent unless you ask for one of the features above. The default
-Claude model is `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` are cheaper.
+uses the AI, and nothing is sent unless you ask for one of the features above. Questions and
+reading lists use `claude-opus-5-5` by default; summaries, names and flashcards (many small
+requests) use the cheaper `claude-haiku-5-5`. Choose other models in Settings, or with
+`config --ai-model` and `config --ai-bulk-model`.
 
 ## What AutoShelf reads
 
@@ -362,8 +370,9 @@ Only the filename and text, never images or audio content (no OCR, no transcript
 A file that can't be parsed (corrupt, password-protected, or an Office or EPUB file that would
 unpack to over 300 MB, as a "zip bomb" does) is still handled using its name. So is a file that
 made AutoShelf stop while reading it: it isn't read again (so it can't crash AutoShelf at every
-start) until its content changes. They are listed in `%APPDATA%\AutoShelf\reading.json`; delete
-that file to have them read again.
+start) until its content changes. A power cut or a forced restart while a file is being read
+looks the same, so Settings lists these files ("Files sorted by name only"), and "Read again"
+(or `autoshelf skipped --clear`) has AutoShelf read them on its next look.
 
 ## Development
 

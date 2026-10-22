@@ -25,7 +25,13 @@ from autoshelf.fsutil import sha256_file
 from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification
-from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
+from autoshelf.ml.library import (
+    TEXT_EXCERPT_CHARS,
+    LibraryIndex,
+    store_content,
+    store_vector,
+    vector_source,
+)
 from autoshelf.ml.vectors import EmbeddedDocument
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
@@ -209,11 +215,18 @@ class Pipeline:
             details=details,
             before_rename=self._expect_self_move,
             allowed_source=source,
+            notify_library=False,  # its index learns of the file below, without a rescan
         )
         repository.set_suggestion(self.conn, result.file_id, decision.suggestion)
         store_content(self.conn, result.file_id, extraction)
         if document is not None:
-            self._store_vector(result.file_id, document, st)
+            self._store_vector(result.file_id, document, st, extraction)
+        if self.library is not None and zone_of(result.dst, self.root) is Zone.CATEGORY:
+            if document is None:
+                self.library.mark_dirty()  # e.g. a rule moved it without a vector
+            else:
+                # The next file can match this one without a rescan of every folder.
+                self.library.add_file(result.dst, document, size=st.st_size, mtime=st.st_mtime)
         return outcome(
             OutcomeKind.MOVED, decision.message, dst=result.dst, history_id=result.history_id
         )
@@ -225,7 +238,8 @@ class Pipeline:
         if self.library is None:
             return None, None
         try:
-            self.library.refresh()  # pick up folders and files the user added meanwhile
+            # Rescans only if the folders changed (the watcher marks the index dirty).
+            self.library.ensure_current()
             document = self.library.embed(extraction, path.name)
             classification = self.library.classify(
                 document.vector, threshold=self.threshold, margin=self.margin
@@ -323,9 +337,15 @@ class Pipeline:
         repository.set_suggestion(self.conn, file_id, suggestion)
         store_content(self.conn, file_id, extraction)
         if document is not None:
-            self._store_vector(file_id, document, st)
+            self._store_vector(file_id, document, st, extraction)
 
-    def _store_vector(self, file_id: int, document: EmbeddedDocument, st: os.stat_result) -> None:
+    def _store_vector(
+        self,
+        file_id: int,
+        document: EmbeddedDocument,
+        st: os.stat_result,
+        extraction: Extraction,
+    ) -> None:
         # A rename keeps size and mtime, so the vector stays valid at the new path.
         store_vector(
             self.conn,
@@ -334,6 +354,7 @@ class Pipeline:
             model=self.library.model,
             size=st.st_size,
             mtime=st.st_mtime,
+            source=vector_source(extraction),
         )
 
     def _duplicates_of(self, path: Path, digest: str) -> tuple[Path, ...]:
@@ -357,5 +378,6 @@ class Pipeline:
             log.info("Created %s for files waiting on your decision", inbox)
 
     def _expect_self_move(self, src: Path, dst: Path) -> None:
-        # Only the destination: a new file may legitimately appear at ``src`` right away.
-        self.self_moves.expect(dst)
+        # Events at ``dst`` are ignored; ``src`` vanishing doesn't change the library. A new
+        # file appearing at ``src`` right away is still processed.
+        self.self_moves.expect_move(src, dst)

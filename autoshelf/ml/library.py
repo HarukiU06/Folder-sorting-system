@@ -454,12 +454,17 @@ class LibraryIndex:
 
     def files_in(self, folder: str) -> list[IndexedFile]:
         """Indexed files in ``folder`` and its subfolders."""
-        prefix = folder + "/"
-        return [
-            entry
-            for entry in self._entries.values()
-            if entry.folder == folder or entry.folder.startswith(prefix)
-        ]
+        return _files_in(folder, self._entries.values())
+
+    def entries(self) -> list[IndexedFile]:
+        """Every indexed file with its vector, as of the last refresh."""
+        return list(self._entries.values())
+
+    @property
+    def examples(self) -> list[Example]:
+        """The corrections learned from (files moved away from folders), as of the last
+        refresh."""
+        return list(self._examples)
 
     def direct_file_counts(self) -> dict[str, int]:
         """Number of indexed files directly in each folder."""
@@ -478,18 +483,8 @@ class LibraryIndex:
         if missing:
             for text, vector in zip(missing, self.embedder.embed(missing), strict=True):
                 self._profile_vectors[text] = vector
-        profiles = []
-        for key in self.folders:
-            vector = self._profile_vectors[texts[key]]
-            members = self.files_in(key)
-            pool = (
-                np.stack([entry.vector for entry in members])
-                if members
-                else np.empty((0, vector.shape[0]), dtype=np.float32)
-            )
-            paths = tuple(entry.path for entry in members)
-            profiles.append(FolderProfile(key, vector, pool, paths))
-        return profiles
+        vectors = {key: self._profile_vectors[texts[key]] for key in self.folders}
+        return build_profiles(vectors, self._entries.values())
 
     def _stored_entry(self, item: LibraryFile) -> IndexedFile | None:
         record = repository.get_file_by_path(self.conn, item.path)
@@ -540,6 +535,29 @@ class LibraryIndex:
                 source=source,
             )
         return IndexedFile(item.path, item.folder, item.size, item.mtime, source, document.vector)
+
+
+def build_profiles(
+    folder_vectors: dict[str, np.ndarray], entries: Iterable[IndexedFile]
+) -> list[FolderProfile]:
+    """Profiles of folders: each one's name/description vector, and the vectors of the
+    files in it and its subfolders."""
+    entries = list(entries)
+    profiles = []
+    for key, vector in folder_vectors.items():
+        members = _files_in(key, entries)
+        pool = (
+            np.stack([entry.vector for entry in members])
+            if members
+            else np.empty((0, vector.shape[0]), dtype=np.float32)
+        )
+        profiles.append(FolderProfile(key, vector, pool, tuple(entry.path for entry in members)))
+    return profiles
+
+
+def _files_in(folder: str, entries: Iterable[IndexedFile]) -> list[IndexedFile]:
+    prefix = folder + "/"
+    return [entry for entry in entries if entry.folder == folder or entry.folder.startswith(prefix)]
 
 
 def _folder_key(path: Path, root: Path) -> str | None:

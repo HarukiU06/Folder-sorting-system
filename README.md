@@ -7,7 +7,7 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** phases 0–9 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–10 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
 > your corrections, follows your rules, explains every decision, and helps you search and
@@ -219,8 +219,9 @@ Better names and new folders (no AI needed), and the optional AI:
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
 files already in your folders ahead of time (the watcher also does this when it starts),
 `skipped` lists files sorted by name only because AutoShelf stopped while reading them
-(`skipped --clear [FILE ...]` reads them again), and `config` shows or changes settings.
-Every command that needs the root accepts `--root`.
+(`skipped --clear [FILE ...]` reads them again), `calibrate [--apply]` tests how well
+AutoShelf would sort your library at each confidence level (see below), and `config` shows
+or changes settings. Every command that needs the root accepts `--root`.
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
 unchanged before it is processed. Windows can miss file events in busy iCloud folders, so
@@ -261,6 +262,17 @@ model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`); a differe
 
 A dry run moves nothing and records no history, but it does save the vectors of the files
 already in your folders, so the next start is faster.
+
+## How well would it sort your library?
+
+Settings → "How well would AutoShelf sort my library?" (or `autoshelf calibrate`) sorts
+every file already in your folders as if it had just arrived, leaving it out of its own
+folder's examples, and compares the result with where the file is. Nothing is moved. For
+each slider position you see a line like "At Balanced: 87% correct, 9% to the Inbox, 4%
+wrong", and a recommended position: the most automatic one that puts at most 5% of the
+files in a wrong folder ("Use the recommended setting", or `autoshelf calibrate --apply`).
+AutoShelf offers this test once, when your folders hold at least 10 files. Files that are
+iCloud online-only are left out of the test (they aren't read).
 
 ## Rules
 
@@ -380,6 +392,7 @@ looks the same, so Settings lists these files ("Files sorted by name only"), and
 .venv\Scripts\python.exe -m pytest -q                                   # run the tests
 .venv\Scripts\ruff.exe check . ; .venv\Scripts\ruff.exe format .       # lint and format
 .venv\Scripts\python.exe scripts\make_screenshots.py --model-cache "$env:APPDATA\AutoShelf\cache\models"
+.venv\Scripts\python.exe scripts\benchmark.py --model-cache "$env:APPDATA\AutoShelf\cache\models"
 ```
 
 Tests only use temporary folders, never your real files or `%APPDATA%`. They also replace
@@ -388,6 +401,20 @@ Credential Manager, use a fake registry for "Start with Windows", and refuse any
 access. GitHub Actions runs the same lint and tests on Windows with Python 3.12 and 3.13
 (`.github/workflows/tests.yml`). The screenshots are made from a demo library in a
 temporary folder.
+
+`scripts/benchmark.py` checks the classifier's hand-tuned constants. It generates a sample
+library (`scripts/sample_corpus.py`: eleven English and Japanese folders, some close to
+each other, some without a description, files with meaningless names, and "habits" such as
+hotel invoices kept under Travel), or reads a folder you name with `--library` (read only).
+It reports leave-one-out results per slider position, the effect of `NEIGHBOR_WEIGHT`,
+`FULL_POOL`, `NEIGHBORS` and `HEADER_WEIGHT`, a threshold × margin grid, and a simulation of
+files arriving one by one with the user correcting mistakes, for several
+`SIMILAR_FROM`/`SIMILAR_FULL` values. `--fake` runs it without the language model. On the
+generated library (default model, 8 seeds) Balanced sorted 86% of files correctly, sent 12%
+to the Inbox and 1.5% to a wrong folder. `NEIGHBOR_WEIGHT` 0.7–0.8 and `HEADER_WEIGHT` 0.3
+did 1–3% better, and learning from corrections mainly made sorting more cautious. The
+constants were kept, because the generated texts are cleaner than real documents. Run it
+with `--library` on a copy of a real library before changing them.
 
 ## License
 

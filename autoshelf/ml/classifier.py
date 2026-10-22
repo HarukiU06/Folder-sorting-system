@@ -24,6 +24,9 @@ from autoshelf.ml.learned import Adjustment
 NEIGHBORS = 3  # k in the top-k mean of neighbour similarities
 FULL_POOL = 3  # files a folder needs before its neighbours get their full weight
 NEIGHBOR_WEIGHT = 0.6  # weight of neighbour similarity in a folder with FULL_POOL files
+# Checked with scripts/benchmark.py (generated library, default model, 8 seeds): NEIGHBORS
+# 1-5 and FULL_POOL 1-3 made no difference; NEIGHBOR_WEIGHT 0.7-0.8 sorted about 1% more
+# files and 0.4-0.5 clearly fewer. Measure a real library before changing these.
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,7 @@ from autoshelf.actions import undo as undo_actions
 from autoshelf.actions.inbox import InboxItem, assign, inbox_items, resolve_folder
 from autoshelf.actions.mover import BeforeRename, MoveResult
 from autoshelf.config import (
+    CONFIDENCE_LEVELS,
     AppPaths,
     ConfigError,
     Settings,
@@ -44,6 +45,7 @@ from autoshelf.features.search import SearchHit, SearchIndex, folder_label
 from autoshelf.features.stats import LibraryStats, library_stats
 from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.ml import calibrate as calibration
 from autoshelf.ml.embedder import Embedder, is_downloaded
 from autoshelf.ml.library import LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
@@ -626,6 +628,28 @@ class AppService:
             return undo_actions.undo_batch(
                 conn, batch_id, force=force, before_rename=self._before_rename()
             )
+
+    # --- how well would AutoShelf sort this library? ----------------------------------------
+
+    def library_file_count(self) -> int:
+        """How many files your folders hold (reads no file)."""
+        root = self._require_root()
+        return len(scan_library(root, self.settings().ignore_patterns).files)
+
+    def calibrate(self, progress: calibration.Progress | None = None) -> calibration.Calibration:
+        """Sort every file in your folders as if it had just arrived, at each confidence
+        level, and compare with where it is (loads the model; moves nothing)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            library = self.library(conn, root)
+            return calibration.calibrate(library, progress=progress)
+
+    def set_level(self, index: int) -> None:
+        """Sort at one of the confidence presets. Call ``restart`` afterwards."""
+        level = CONFIDENCE_LEVELS[index]
+        self.save_settings(
+            replace(self.settings(), auto_threshold=level.threshold, auto_margin=level.margin)
+        )
 
     def stats(self) -> LibraryStats:
         """The dashboard's numbers."""

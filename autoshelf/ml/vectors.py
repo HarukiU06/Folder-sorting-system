@@ -9,6 +9,9 @@ from autoshelf.ml.embedder import Embedder
 
 # Share of the file's vector that comes from its name, title and metadata. The rest comes
 # from the body text, so a long text can't drown out an informative filename.
+# scripts/benchmark.py's generated library sorts 1-4% more files with 0.2-0.3 (and far fewer
+# with 0.5-0.6), but its texts are short and on topic, unlike real documents. Stored vectors
+# don't record this weight, so changing it means embedding every file again.
 HEADER_WEIGHT = 0.4
 # At most this many body chunks are embedded per file (the text is already capped).
 MAX_CHUNKS = 48

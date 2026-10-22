@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from autoshelf.app_service import AppService
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
 from autoshelf.logging_setup import setup_logging
+from autoshelf.ml import calibrate as calibration
 from autoshelf.pipeline import Outcome
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.main_window import MainWindow
@@ -70,6 +72,7 @@ class AutoShelfApp(QObject):
         self._pending: list[Outcome] = []
         self._notifications = True
         self._notify_path: Path | None = None
+        self._calibration_checked = False
 
         self._notify_timer = QTimer(self, singleShot=True, interval=NOTIFY_DELAY_MSECS)
         self._notify_timer.timeout.connect(self._notify)
@@ -139,6 +142,50 @@ class AutoShelfApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
+        self._maybe_offer_calibration()
+
+    def _maybe_offer_calibration(self) -> None:
+        """Once ever, when the folders already hold enough files: offer to test how well
+        AutoShelf would sort them (Settings)."""
+        if self._calibration_checked:
+            return
+        self._calibration_checked = True
+
+        def files_to_test() -> int | None:
+            if self.service.settings().calibration_offered:
+                return None  # offered before: never again
+            return self.service.library_file_count()
+
+        def checked(files: int | None) -> None:
+            if files is None:
+                return
+            if files < calibration.MIN_FILES:
+                self._calibration_checked = False  # look again when the window next opens
+                return
+            self.offer_calibration(files)
+
+        def failed(exc: Exception) -> None:
+            self._calibration_checked = False  # e.g. no folder chosen yet
+
+        self.runner.run(files_to_test, checked, failed)
+
+    def offer_calibration(self, files: int) -> None:
+        """Ask whether to test sorting on the files already in the folders."""
+        self.runner.run(
+            lambda: self.service.save_settings(
+                replace(self.service.settings(), calibration_offered=True)
+            )
+        )
+        answer = QMessageBox.question(
+            self.window,
+            "How well would AutoShelf sort your files?",
+            f"Your folders already hold {files} files. AutoShelf can sort each of them as if "
+            "it had just arrived and compare the result with where it is, to show how often "
+            "it would be right at each setting. Nothing is moved.\n\nTest it now?",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.show_window(self.window.settings)
+            self.window.settings.calibrate()
 
     # --- user actions -------------------------------------------------------------
 
@@ -201,6 +248,7 @@ class AutoShelfApp(QObject):
             self.tray.set_paused(paused)
             self.window.show_message(f"Now sorting {root}" + (" (paused)" if paused else ""))
             self.window.refresh_all()
+            self._maybe_offer_calibration()
 
         self.runner.run(switch, switched)
 

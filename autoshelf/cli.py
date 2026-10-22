@@ -241,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     with_root(commands.add_parser("stats", help="numbers about your library"))
+    calibrate = with_root(
+        commands.add_parser("calibrate", help="how well would AutoShelf sort your library?")
+    )
+    calibrate.add_argument(
+        "--apply", action="store_true", help="switch to the recommended confidence level"
+    )
 
     skipped = commands.add_parser(
         "skipped", help="files only sorted by name because AutoShelf stopped while reading them"
@@ -326,6 +332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "versions": _cmd_versions,
             "organize": _cmd_organize,
             "stats": _cmd_stats,
+            "calibrate": _cmd_calibrate,
             "skipped": _cmd_skipped,
             "summarize": _cmd_summarize,
             "rename-suggestions": _cmd_rename_suggestions,
@@ -1014,6 +1021,35 @@ def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
         )
         for item in stats.stale[:5]:
             print(f"  {item.last_used:%Y-%m-%d}  {item.path.name}")
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace, paths: AppPaths) -> int:
+    from autoshelf import wording
+    from autoshelf.config import CONFIDENCE_LEVELS, confidence_level
+
+    service = _service(args, paths)
+
+    def progress(done: int, total: int) -> None:
+        if done == total or done % 50 == 0:
+            print(f"Testing: {done}/{total}", file=sys.stderr)
+
+    result = service.calibrate(progress=progress)
+    settings = service.settings()
+    current = confidence_level(settings.auto_threshold, settings.auto_margin)
+    for line in wording.calibration(result, current):
+        print(line)
+    if result.recommended is None or result.recommended == current:
+        return 0
+    level = CONFIDENCE_LEVELS[result.recommended]
+    if not args.apply:
+        print("Switch to it with: autoshelf calibrate --apply")
+        return 0
+    service.set_level(result.recommended)
+    print(
+        f"Now sorting at {level.name} (threshold {level.threshold:.2f}, margin "
+        f"{level.margin:.2f}); restart a running watcher to apply it."
+    )
     return 0
 
 

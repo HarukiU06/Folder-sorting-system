@@ -62,10 +62,16 @@ def settle(qtbot, runner: TaskRunner) -> None:
 
 @pytest.fixture(autouse=True)
 def no_dialogs(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Modal dialogs would block forever; record them instead."""
+    """Modal dialogs would block forever; record them instead (questions get "No")."""
     shown: list[tuple] = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: shown.append(args))
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: shown.append(args))
+
+    def no(*args):
+        shown.append(args)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", no)
     return shown
 
 
@@ -903,3 +909,66 @@ def test_the_app_says_which_files_stopped_its_last_run(
     app.start(show=False)
     assert "AutoShelf stopped while reading broken.pdf" in app.window.statusBar().currentMessage()
     app.runner.wait()
+
+
+# --- Phase 10: how well would AutoShelf sort my library? -------------------------------------
+
+
+@pytest.fixture
+def full_shelf(shelf: Path) -> Path:
+    for number in range(5):
+        make(shelf / "Finance" / f"invoice {number}.txt", f"invoice total tax due bank {number}")
+        make(shelf / "Recipes" / f"cake {number}.txt", f"recipe baking oven flour sugar {number}")
+    return shelf
+
+
+def test_settings_test_sorting_and_use_the_recommendation(
+    qtbot, service, runner, full_shelf: Path
+) -> None:
+    service.set_level(0)  # very cautious
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.calibration_text.isHidden()
+
+    view.calibrate()
+    settle(qtbot, runner)
+    text = view.calibration_text.text()
+    assert "Each of the 11 files in your 2 folders" in text
+    assert "At Balanced:" in text and "Recommended:" in text
+    assert not view.use_recommended.isHidden()
+
+    view._use_recommended()
+    settle(qtbot, runner)
+    assert view.use_recommended.isHidden()
+    assert service.settings().auto_threshold != CONFIDENCE_LEVELS[0].threshold
+
+
+def test_the_app_offers_the_test_once(
+    qtbot, service, full_shelf: Path, no_dialogs: list, monkeypatch
+) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=True)
+    qtbot.waitUntil(lambda: service.settings().calibration_offered, timeout=WAIT_MS)
+    asked = [args for args in no_dialogs if len(args) > 1 and "sort your files" in str(args[1])]
+    assert len(asked) == 1  # answered "No" by the test
+
+    app.show_window()  # opened again: not asked again
+    app.runner.wait()
+    asked = [args for args in no_dialogs if len(args) > 1 and "sort your files" in str(args[1])]
+    assert len(asked) == 1
+    app.runner.wait()
+
+
+def test_a_small_library_is_not_offered_the_test(qtbot, service, no_dialogs: list) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=True)
+    app.runner.wait()
+    qtbot.wait(100)
+    assert not service.settings().calibration_offered
+    assert not any("sort your files" in str(args[1]) for args in no_dialogs if len(args) > 1)

@@ -214,6 +214,7 @@ class Settings:
     auto_threshold: float = DEFAULT_AUTO_THRESHOLD
     auto_margin: float = DEFAULT_AUTO_MARGIN
     paused: bool = False  # automatic sorting paused (files wait until resumed)
+    calibration_offered: bool = False  # "how well would AutoShelf sort?" was offered once
     notifications: bool = True  # notify when a file needs a decision
     # Opt-in folders outside the root (e.g. Downloads): new files there with one of
     # ``watched_extensions`` are moved into the root and sorted. None by default.

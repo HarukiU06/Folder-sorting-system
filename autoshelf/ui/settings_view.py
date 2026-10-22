@@ -25,11 +25,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from autoshelf import llm
+from autoshelf import llm, wording
 from autoshelf.actions.rules import extensions as parse_extensions
 from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.llm import claude as claude_provider
+from autoshelf.ml import calibrate as calibration
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import open_folder, plain_label, plain_tooltip
 
@@ -62,6 +63,7 @@ class SettingsView(QWidget):
     notifications_toggled = Signal(bool)
     restart_needed = Signal(str)  # a message to show once restarted
     message = Signal(str)  # a message for the status bar
+    calibration_progress = Signal(int, int)  # (files tested, of), from a worker thread
     ai_state = Signal(bool)  # whether an AI provider is chosen
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
@@ -112,10 +114,30 @@ class SettingsView(QWidget):
         self.notifications.toggled.connect(self._notifications_changed)
         self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
         self.startup.toggled.connect(self._startup_changed)
+        self.calibrate_button = QPushButton("How well would AutoShelf sort my library?")
+        self.calibrate_button.setToolTip(
+            "Sorts every file in your folders as if it had just arrived and compares the "
+            "result with where it is. Nothing is moved."
+        )
+        self.calibrate_button.clicked.connect(self.calibrate)
+        self.use_recommended = QPushButton("Use the recommended setting")
+        self.use_recommended.clicked.connect(self._use_recommended)
+        self.use_recommended.setVisible(False)
+        self.calibration_text = plain_label()
+        self.calibration_text.setWordWrap(True)
+        self.calibration_text.setVisible(False)
+        self.calibration_progress.connect(self._show_calibration_progress)
+        self._recommended: int | None = None
+        calibrate_row = QHBoxLayout()
+        calibrate_row.addWidget(self.calibrate_button)
+        calibrate_row.addWidget(self.use_recommended)
+        calibrate_row.addStretch(1)
         sorting_box = QGroupBox("Sorting")
         sorting = QVBoxLayout(sorting_box)
         sorting.addLayout(slider_row)
         sorting.addWidget(self.level_text)
+        sorting.addLayout(calibrate_row)
+        sorting.addWidget(self.calibration_text)
         sorting.addWidget(self.paused)
         sorting.addWidget(self.notifications)
         sorting.addWidget(self.startup)
@@ -399,6 +421,51 @@ class SettingsView(QWidget):
             auto_threshold=level.threshold,
             auto_margin=level.margin,
         )
+
+    def calibrate(self) -> None:
+        """Test how well sorting would go on the files already in the folders."""
+        self.calibrate_button.setEnabled(False)
+        self.use_recommended.setVisible(False)
+        self.calibration_text.setVisible(True)
+        self.calibration_text.setText(
+            "Sorting each file in your folders as if it had just arrived... (the first time "
+            "loads the language model)"
+        )
+
+        def done(result: calibration.Calibration) -> None:
+            self.calibrate_button.setEnabled(True)
+            settings = self._settings
+            current = (
+                confidence_level(settings.auto_threshold, settings.auto_margin)
+                if settings
+                else None
+            )
+            self.calibration_text.setText("\n".join(wording.calibration(result, current)))
+            self._recommended = result.recommended
+            self.use_recommended.setVisible(
+                result.recommended is not None and result.recommended != current
+            )
+
+        def failed(exc: Exception) -> None:
+            self.calibrate_button.setEnabled(True)
+            self.calibration_text.setText(f"Couldn't test sorting: {exc}")
+
+        self.runner.run(
+            lambda: self.service.calibrate(progress=self.calibration_progress.emit), done, failed
+        )
+
+    def _show_calibration_progress(self, done: int, total: int) -> None:
+        self.calibration_text.setText(f"Sorting each file as if it were new: {done}/{total}")
+
+    def _use_recommended(self) -> None:
+        index = self._recommended
+        if index is None:
+            return
+        self.use_recommended.setVisible(False)
+        if self.slider.value() == index:
+            self._level_changed(index)  # a custom setting shown at its nearest preset
+        else:
+            self.slider.setValue(index)  # saves it and restarts the watcher
 
     def _paused_changed(self, paused: bool) -> None:
         self.paused_toggled.emit(paused)

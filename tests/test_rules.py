@@ -11,7 +11,6 @@ from autoshelf.actions.inbox import AssignError
 from autoshelf.actions.rules import (
     RuleError,
     check_rule,
-    describe_condition,
     extensions,
     first_match,
     match_rule,
@@ -62,7 +61,7 @@ def test_extensions_are_normalised() -> None:
 
 def test_name_rule_searches_the_file_name_in_any_case() -> None:
     found = match_rule(rule("name", "invoice|receipt"), Path("Amazon RECEIPT 2025.pdf"), None)
-    assert found == "'Amazon RECEIPT 2025.pdf' contains 'RECEIPT'"
+    assert found == {"kind": "name", "name": "Amazon RECEIPT 2025.pdf", "found": "RECEIPT"}
     assert match_rule(rule("name", "invoice"), Path("notes.txt"), None) is None
 
 
@@ -97,9 +96,13 @@ def test_first_enabled_rule_in_order_wins() -> None:
 
 
 def test_conditions_read_well() -> None:
-    assert describe_condition("name", "invoice|receipt") == "file name matches /invoice|receipt/"
-    assert describe_condition("extension", "pdf .docx") == "extension is .docx, .pdf"
-    assert describe_condition("text", "Syllabus") == 'text contains "Syllabus"'
+    from autoshelf.wording import condition
+
+    assert condition({"kind": "name", "pattern": "invoice|receipt"}) == (
+        "file name matches /invoice|receipt/"
+    )
+    assert condition({"kind": "extension", "pattern": "pdf .docx"}) == "extension is .docx, .pdf"
+    assert condition({"kind": "text", "pattern": "Syllabus"}) == 'text contains "Syllabus"'
 
 
 # --- storage ---------------------------------------------------------------------------
@@ -153,7 +156,9 @@ def test_rule_overrides_the_classifier(conn, shelf: Path, smart: Pipeline) -> No
     assert entry.reason == "Rule: Scans"
     assert entry.confidence is None
     assert entry.details["rule"]["name"] == "Scans"
-    assert entry.details["rule"]["condition"] == r"file name matches /^scan_\d+/"
+    assert entry.details["rule"]["conditions"] == [{"kind": "name", "pattern": r"^scan_\d+"}]
+    assert entry.details["reason"]["code"] == "rule"
+    assert "explanation" not in entry.details  # data, not words
     assert entry.details["candidates"][0]["folder"] == "Finance"  # what the AI thought
     assert repository.get_file_by_path(conn, outcome.dst).suggestion == "Recipes"
 

@@ -15,9 +15,10 @@ from pathlib import Path, PurePath
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.layout import Zone, zone_of
 from autoshelf.llm.base import LLMError, Message, Provider, clip
+from autoshelf.reasons import RENAMED, reason
 
 MAX_STEM_CHARS = 100
-REASON_RENAME = "renamed (you approved)"
+REASON_RENAME = "rename"  # history reason: a rename the user approved
 
 _JUNK_WORDS = (
     r"scan|scanned|img|image|dsc|dscn|dcim|photo|pic|document|doc|file|untitled|download|"
@@ -165,7 +166,7 @@ def rename(
             reason=REASON_RENAME,
             action="rename",
             new_name=stem + suffix,
-            details={"explanation": f"renamed from {path.name!r}"},
+            details={"reason": reason(RENAMED, old_name=path.name)},
             before_rename=before_rename,
         )
     except MoveError as exc:

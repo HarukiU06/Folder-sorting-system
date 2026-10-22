@@ -5,6 +5,7 @@ import samples
 from fakes import FakeEmbedder
 from helpers import make
 
+from autoshelf import wording
 from autoshelf.actions.undo import undo
 from autoshelf.db import repository
 from autoshelf.ml.library import LibraryIndex
@@ -222,7 +223,8 @@ def test_unclear_file_goes_to_inbox_with_its_suggestions(
     entry = repository.get_history(conn, outcome.history_id)
     assert entry.reason == REASON_ASK
     assert {c["folder"] for c in entry.details["candidates"]} == {"Finance", "Recipes"}
-    assert "not sure" in entry.details["explanation"]
+    assert "not sure" in wording.explanation(entry.details)
+    assert entry.details["reason"]["code"] in ("low_score", "too_close")
 
 
 def test_moved_file_keeps_its_vector_and_becomes_an_example(

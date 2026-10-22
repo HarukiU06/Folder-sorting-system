@@ -9,10 +9,11 @@ from helpers import make
 from autoshelf.cli import main
 from autoshelf.db import repository
 from autoshelf.ml.classifier import FolderScore, Neighbor, choose
-from autoshelf.ml.explain import decision_details, describe, shared_keywords, terms
+from autoshelf.ml.explain import decision_details, rule_details, shared_keywords, terms
 from autoshelf.ml.learned import Adjustment, Evidence
 from autoshelf.ml.library import LibraryIndex
 from autoshelf.pipeline import Pipeline
+from autoshelf.wording import decision_lines as describe
 
 
 def test_terms_skip_stop_words_and_split_japanese_into_pairs() -> None:
@@ -92,6 +93,21 @@ def test_decision_details_hold_everything_the_panel_shows() -> None:
 
 
 def test_rule_details_read_well() -> None:
+    details = rule_details(
+        "Invoices",
+        [{"kind": "name", "pattern": "invoice"}],
+        "Finance",
+        [{"kind": "name", "name": "invoice.pdf", "found": "invoice"}],
+    )
+    assert details["reason"]["code"] == "rule"
+    assert "explanation" not in details  # data, not words
+    assert describe(details) == [
+        "Rule 'Invoices': file name matches /invoice/ -> Finance",
+        "  matched: 'invoice.pdf' contains 'invoice'",
+    ]
+
+
+def test_rule_details_written_before_reasons_still_read() -> None:
     lines = describe(
         {
             "rule": {

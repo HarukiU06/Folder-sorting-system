@@ -138,7 +138,8 @@ def test_rename_suggestions_and_an_undoable_rename(conn, shelf: Path, library) -
 
     assert result.dst.name == "Invoice March 2025 (2).txt"  # never overwrites
     entry = repository.get_history(conn, result.history_id)
-    assert (entry.action, entry.reason) == ("rename", "renamed (you approved)")
+    assert (entry.action, entry.reason) == ("rename", "rename")
+    assert entry.details["reason"] == {"code": "renamed", "old_name": "scan_0034.txt"}
     undo(conn, result.history_id)
     assert proposal.path.exists()
     with pytest.raises(RenameError):

@@ -449,7 +449,7 @@ def get_vector_blob(conn: sqlite3.Connection, file_id: int) -> tuple[str, bytes]
 
 # --- history ----------------------------------------------------------------
 
-UNDOABLE_ACTIONS = ("move", "rename")
+UNDOABLE_ACTIONS = ("move", "rename")  # "create" joins once undo can put a file in _Trash
 
 
 @dataclass(frozen=True)
@@ -538,6 +538,11 @@ def update_history_dst(conn: sqlite3.Connection, history_id: int, dst: str | Pat
     conn.execute("UPDATE history SET dst = ? WHERE id = ?", (str(dst), history_id))
 
 
+def set_history_file(conn: sqlite3.Connection, history_id: int, file_id: int) -> None:
+    """Link a row to the file record it is about (a created file only gets one once made)."""
+    conn.execute("UPDATE history SET file_id = ? WHERE id = ?", (file_id, history_id))
+
+
 def set_history_state(
     conn: sqlite3.Connection, history_id: int, state: str, *, note: str | None = None
 ) -> None:
@@ -571,9 +576,11 @@ def list_history_in_state(conn: sqlite3.Connection, state: str) -> list[HistoryE
 
 
 def last_undoable(conn: sqlite3.Connection, count: int) -> list[HistoryEntry]:
-    """Return the ``count`` most recent completed moves/renames, newest first."""
+    """Return the ``count`` most recent completed moves, renames and creates, newest first."""
+    marks = ", ".join("?" * len(UNDOABLE_ACTIONS))
     rows = conn.execute(
-        "SELECT * FROM history WHERE state = 'done' AND action IN (?, ?) ORDER BY id DESC LIMIT ?",
+        f"SELECT * FROM history WHERE state = 'done' AND action IN ({marks})"
+        " ORDER BY id DESC LIMIT ?",
         (*UNDOABLE_ACTIONS, count),
     )
     return [_history_from_row(row) for row in rows]

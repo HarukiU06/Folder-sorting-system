@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autoshelf import wording
 from autoshelf.actions.inbox import InboxItem
 from autoshelf.app_service import AppService
 from autoshelf.ui.tasks import TaskRunner
@@ -232,7 +233,7 @@ class InboxView(QWidget):
         self.name.setText(item.path.name)
         self.title.setText(f"Title: {item.title}" if item.title else "")
         self.title.setVisible(bool(item.title))
-        self.why.setText(f"Why it's here: {item.explanation}")
+        self.why.setText(f"Why it's here: {wording.reason_text(item.reason)}")
         self.preview.setPlainText(item.excerpt or "")
         root = item.path.parent.parent  # the file is in <root>/_Inbox
         self.why_panel.show_details(item.details, root)

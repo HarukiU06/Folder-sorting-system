@@ -79,11 +79,12 @@ def tag_file(conn: sqlite3.Connection, path: Path, names: list[str], root: Path)
                 action="tag",
                 src=path,
                 dst=path,
-                reason=f"Tagged '{name}'",
+                reason="tag",
                 root=root,
                 state="done",
                 file_id=record.id,
                 sha256=record.sha256,
+                details={"tag": name},
             )
     return added
 
@@ -98,10 +99,11 @@ def untag_file(conn: sqlite3.Connection, path: Path, name: str, root: Path) -> b
         action="tag",
         src=path,
         dst=path,
-        reason=f"Untagged '{name}'",
+        reason="untag",
         root=root,
         state="done",
         file_id=record.id,
+        details={"tag": name},
     )
     return True
 

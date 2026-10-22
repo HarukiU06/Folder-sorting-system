@@ -26,6 +26,7 @@ from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_fi
 from autoshelf.db import repository
 from autoshelf.db.connection import transaction
 from autoshelf.layout import Zone, zone_of
+from autoshelf.reasons import USER_MOVED, reason
 
 log = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def correct(
             reason="user",
             details={
                 "corrects": history_id,
-                "explanation": f"you moved it from {from_folder!r} to {folder_key!r}",
+                "reason": reason(USER_MOVED, from_folder=from_folder, to_folder=folder_key),
             },
             before_rename=before_rename,
         )

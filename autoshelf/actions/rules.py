@@ -32,10 +32,11 @@ class RuleError(Exception):
 
 @dataclass(frozen=True)
 class RuleMatch:
-    """The rule that decided, and what it matched."""
+    """The rule that decided, and what its conditions found (JSON-ready, e.g.
+    ``{"kind": "name", "name": "scan invoice.pdf", "found": "invoice"}``)."""
 
     rule: RuleRecord
-    match: str
+    matched: tuple[dict, ...]
 
 
 def check_rule(name: str, kind: str, pattern: str) -> None:
@@ -61,36 +62,34 @@ def extensions(pattern: str) -> set[str]:
     return {"." + part.lstrip(".*").casefold() for part in parts if part.lstrip(".*")}
 
 
-def describe_condition(kind: str, pattern: str) -> str:
-    """The condition of a rule in words, e.g. 'file name matches /invoice|receipt/'."""
-    if kind == "name":
-        return f"{RULE_KINDS[kind]} /{pattern}/"
-    if kind == "extension":
-        return f"{RULE_KINDS[kind]} {', '.join(sorted(extensions(pattern)))}"
-    return f'{RULE_KINDS.get(kind, kind)} "{pattern}"'
+def conditions(rule: RuleRecord) -> list[dict]:
+    """A rule's conditions as data, as stored with the decisions it makes."""
+    return [{"kind": rule.kind, "pattern": rule.pattern}]
 
 
 def _fold(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold()
 
 
-def match_rule(rule: RuleRecord, path: Path, extraction: Extraction | None) -> str | None:
-    """What ``rule`` matched in this file, or None if it doesn't apply."""
+def match_rule(rule: RuleRecord, path: Path, extraction: Extraction | None) -> dict | None:
+    """What ``rule`` found in this file (as data), or None if it doesn't apply."""
     if rule.kind == "name":
         try:
             found = re.search(rule.pattern, path.name, re.IGNORECASE)
         except re.error:
             return None
-        return f"{path.name!r} contains {found.group()!r}" if found else None
+        return {"kind": "name", "name": path.name, "found": found.group()} if found else None
     if rule.kind == "extension":
         suffix = path.suffix.casefold()
-        return f"the extension is {suffix}" if suffix in extensions(rule.pattern) else None
+        if suffix not in extensions(rule.pattern):
+            return None
+        return {"kind": "extension", "found": suffix}
     if rule.kind == "text" and extraction is not None:
         wanted = _fold(rule.pattern.strip())
         haystack = _fold(
             "\n".join([extraction.title or "", *extraction.metadata.values(), extraction.text])
         )
-        return f"the text contains {rule.pattern.strip()!r}" if wanted in haystack else None
+        return {"kind": "text", "found": rule.pattern.strip()} if wanted in haystack else None
     return None
 
 
@@ -103,7 +102,7 @@ def first_match(
             continue
         found = match_rule(rule, path, extraction)
         if found is not None:
-            return RuleMatch(rule, found)
+            return RuleMatch(rule, (found,))
     return None
 
 

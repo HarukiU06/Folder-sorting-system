@@ -66,7 +66,7 @@ def undo(
             current,
             original.parent,
             root=Path(entry.root),
-            reason=f"undo #{history_id}",
+            reason="undo",  # the row it reverses is in undo_of
             action="undo",
             new_name=original.name,
             undo_of=history_id,

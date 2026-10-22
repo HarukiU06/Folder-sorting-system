@@ -11,10 +11,11 @@ import logging
 import os
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from autoshelf import wording
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.mover import MoveError, free_destination, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
@@ -33,6 +34,14 @@ from autoshelf.ml.library import (
     vector_source,
 )
 from autoshelf.ml.vectors import EmbeddedDocument
+from autoshelf.reasons import (
+    FOLDER_GONE,
+    NO_CLASSIFIER,
+    RULE,
+    RULE_FOLDER_MISSING,
+    Reason,
+    reason,
+)
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
@@ -54,7 +63,11 @@ class OutcomeKind(StrEnum):
 
 @dataclass(frozen=True)
 class Outcome:
-    """What the pipeline did (or, in a dry run, would do) with one file."""
+    """What the pipeline did (or, in a dry run, would do) with one file.
+
+    ``message`` is for the log; ``why`` is the decision's reason as data (see
+    ``autoshelf.reasons``), and ``details`` everything stored with the move in history.
+    """
 
     kind: OutcomeKind
     path: Path
@@ -64,7 +77,8 @@ class Outcome:
     duplicates: tuple[Path, ...] = ()
     extraction: Extraction | None = None
     classification: Classification | None = None
-    details: dict | None = None  # why: what is stored with the move in history
+    details: dict | None = None
+    why: Reason | None = None
 
     @property
     def needs_decision(self) -> bool:
@@ -82,14 +96,21 @@ class Outcome:
 class Decision:
     """Where a file should go. ``target_dir`` None means it stays where it is (in _Inbox).
 
-    ``suggestion`` is the folder AutoShelf chose or, when asking, thinks most likely.
+    ``reason`` is the history reason ("auto", "ask" or "Rule: <name>"), ``why`` the
+    decision's reason as data. ``suggestion`` is the folder AutoShelf chose or, when
+    asking, thinks most likely.
     """
 
     target_dir: Path | None
     reason: str
-    message: str
+    why: Reason
     confidence: float | None = None
     suggestion: str | None = None
+
+    def message(self) -> str:
+        """The decision in words, for the log."""
+        text = wording.reason_text(self.why)
+        return f"waiting in _Inbox: {text}" if self.target_dir is None else text
 
 
 class Pipeline:
@@ -179,11 +200,13 @@ class Pipeline:
             decision = self._decide(zone, classification)
         if decision.target_dir is not None and not self._can_receive(decision.target_dir):
             decision = self._fallback_to_inbox(zone, decision)
+        message = decision.message()
         if source is not None:
-            decision = replace(decision, message=f"from {source.name}: {decision.message}")
+            message = f"from {source.name}: {message}"
         details = self._details(path, extraction, classification, rule)
+        details["reason"] = decision.why  # what decided, over the classifier's reason
 
-        def outcome(kind: OutcomeKind, message: str, **extra) -> Outcome:
+        def outcome(kind: OutcomeKind, **extra) -> Outcome:
             return Outcome(
                 kind,
                 path,
@@ -192,16 +215,17 @@ class Pipeline:
                 extraction=extraction,
                 classification=classification,
                 details=details,
+                why=decision.why,
                 **extra,
             )
 
         if decision.target_dir is None:
             if not self.dry_run:
                 self._record_waiting(path, digest, st, extraction, document, decision.suggestion)
-            return outcome(OutcomeKind.WAITING, decision.message)
+            return outcome(OutcomeKind.WAITING)
         if self.dry_run:
             dst = self._planned_destination(decision.target_dir, path.name)
-            return outcome(OutcomeKind.WOULD_MOVE, decision.message, dst=dst)
+            return outcome(OutcomeKind.WOULD_MOVE, dst=dst)
 
         self._ensure_inbox_if_target(decision.target_dir)
         result = move_file(
@@ -227,9 +251,7 @@ class Pipeline:
             else:
                 # The next file can match this one without a rescan of every folder.
                 self.library.add_file(result.dst, document, size=st.st_size, mtime=st.st_mtime)
-        return outcome(
-            OutcomeKind.MOVED, decision.message, dst=result.dst, history_id=result.history_id
-        )
+        return outcome(OutcomeKind.MOVED, dst=result.dst, history_id=result.history_id)
 
     def _classify(
         self, path: Path, extraction: Extraction
@@ -251,37 +273,32 @@ class Pipeline:
 
     def _decide(self, zone: Zone, classification: Classification | None) -> Decision:
         if classification is None:
-            why = "it can't be sorted by content right now"
+            why = reason(NO_CLASSIFIER)
         elif classification.choice is not None:
             choice = classification.choice
             target = self.root.joinpath(*choice.folder.split("/"))
-            return Decision(
-                target, REASON_AUTO, classification.explanation, choice.score, choice.folder
-            )
+            return Decision(target, REASON_AUTO, classification.reason, choice.score, choice.folder)
         else:
-            why = classification.explanation
+            why = classification.reason
         best = classification.scores[0] if classification and classification.scores else None
         return self._ask(zone, why, best.score if best else None, best.folder if best else None)
 
     def _ask(
-        self, zone: Zone, why: str, score: float | None = None, suggestion: str | None = None
+        self, zone: Zone, why: Reason, score: float | None = None, suggestion: str | None = None
     ) -> Decision:
         """Leave the file in (or send it to) _Inbox for the user to decide."""
-        if zone is Zone.INBOX:
-            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}", score, suggestion)
-        return Decision(inbox_dir(self.root), REASON_ASK, why, score, suggestion)
+        target = None if zone is Zone.INBOX else inbox_dir(self.root)
+        return Decision(target, REASON_ASK, why, score, suggestion)
 
     def _rule_decision(self, zone: Zone, match: rule_engine.RuleMatch) -> Decision:
         """A rule decides, overriding the classifier; it never creates its folder."""
         rule = match.rule
         target = self.root.joinpath(*rule.target_folder.split("/"))
         if not target.is_dir() or zone_of(target / "x", self.root) is not Zone.CATEGORY:
-            why = f"rule {rule.name!r} matched, but its folder {rule.target_folder!r} doesn't exist"
+            why = reason(RULE_FOLDER_MISSING, rule=rule.name, folder=rule.target_folder)
             return self._ask(zone, why)
-        message = f"rule {rule.name!r} matched: {match.match}"
-        return Decision(
-            target, rule_engine.reason_for(rule), message, suggestion=rule.target_folder
-        )
+        why = reason(RULE, rule=rule.name, matched=list(match.matched))
+        return Decision(target, rule_engine.reason_for(rule), why, suggestion=rule.target_folder)
 
     def _details(
         self,
@@ -289,7 +306,7 @@ class Pipeline:
         extraction: Extraction,
         classification: Classification | None,
         rule: rule_engine.RuleMatch | None,
-    ) -> dict | None:
+    ) -> dict:
         """Why the file goes where it goes, as stored with its move in history."""
         details: dict = {}
         if classification is not None:
@@ -305,12 +322,12 @@ class Pipeline:
             details.update(
                 explain.rule_details(
                     rule.rule.name,
-                    rule_engine.describe_condition(rule.rule.kind, rule.rule.pattern),
+                    rule_engine.conditions(rule.rule),
                     rule.rule.target_folder,
-                    rule.match,
+                    rule.matched,
                 )
             )
-        return details or None
+        return details
 
     def _can_receive(self, target_dir: Path) -> bool:
         """True if files can be moved to ``target_dir`` (``_Inbox`` is created when needed)."""
@@ -318,7 +335,8 @@ class Pipeline:
 
     def _fallback_to_inbox(self, zone: Zone, decision: Decision) -> Decision:
         """The chosen folder vanished after scoring: ask instead. Folders are never created."""
-        return self._ask(zone, f"its folder {decision.target_dir.name!r} no longer exists")
+        folder = decision.suggestion or decision.target_dir.name
+        return self._ask(zone, reason(FOLDER_GONE, folder=folder))
 
     def _record_waiting(
         self,

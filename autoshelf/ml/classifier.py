@@ -20,6 +20,7 @@ import numpy as np
 
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD
 from autoshelf.ml.learned import Adjustment
+from autoshelf.reasons import CLEAR_MATCH, LOW_SCORE, NO_FOLDERS, TOO_CLOSE, Reason, reason
 
 NEIGHBORS = 3  # k in the top-k mean of neighbour similarities
 FULL_POOL = 3  # files a folder needs before its neighbours get their full weight
@@ -75,7 +76,7 @@ class Classification:
 
     scores: tuple[FolderScore, ...]
     choice: FolderScore | None
-    explanation: str
+    reason: Reason  # why it was chosen or the user is asked (see autoshelf.reasons)
     threshold: float = DEFAULT_AUTO_THRESHOLD
     margin: float = DEFAULT_AUTO_MARGIN
     learned: Mapping[str, Adjustment] = field(default_factory=dict)  # penalties, by folder
@@ -89,7 +90,7 @@ class Classification:
         return {
             "candidates": [item.to_details() for item in self.top()],
             "choice": self.choice.folder if self.choice else None,
-            "explanation": self.explanation,
+            "reason": self.reason,
         }
 
     def score_of(self, folder: str) -> FolderScore | None:
@@ -171,30 +172,40 @@ def choose(
     """
     ranked = tuple(sorted(scores, key=lambda item: item.score, reverse=True))
     if not ranked:
-        return Classification(
-            ranked, None, "there are no folders to sort into yet", threshold, margin
-        )
+        return Classification(ranked, None, reason(NO_FOLDERS), threshold, margin)
 
     qualifying = [item for item in ranked if _qualifies(item, ranked, threshold, margin)]
     if qualifying:
         choice = max(qualifying, key=lambda item: (depth(item.folder), item.score))
         contested = _contested_subfolder(choice, ranked, threshold)
         if contested is None:
-            rival = _best_rival(choice, ranked)
-            versus = f", next {rival.folder!r} {rival.score:.2f}" if rival else ""
-            explanation = f"best match {choice.folder!r} {choice.score:.2f}{versus}"
-            return Classification(ranked, choice, explanation, threshold, margin)
-        return Classification(ranked, None, _too_close(contested, ranked), threshold, margin)
+            why = _versus(CLEAR_MATCH, choice, ranked)
+            return Classification(ranked, choice, why, threshold, margin)
+        why = _versus(TOO_CLOSE, contested, ranked)
+        return Classification(ranked, None, why, threshold, margin)
 
     best = ranked[0]
     if best.score < threshold:
-        explanation = (
-            f"not sure: best match {best.folder!r} scored {best.score:.2f}, "
-            f"below the {threshold:.2f} needed to move it automatically"
-        )
+        why = reason(LOW_SCORE, folder=best.folder, score=_round(best.score), threshold=threshold)
     else:
-        explanation = _too_close(best, ranked)
-    return Classification(ranked, None, explanation, threshold, margin)
+        why = _versus(TOO_CLOSE, best, ranked)
+    return Classification(ranked, None, why, threshold, margin)
+
+
+def _round(score: float) -> float:
+    return round(float(score), 4)
+
+
+def _versus(code: str, item: FolderScore, ranked: Sequence[FolderScore]) -> Reason:
+    """A reason naming a folder, its score, and its best rival (if any)."""
+    rival = _best_rival(item, ranked)
+    return reason(
+        code,
+        folder=item.folder,
+        score=_round(item.score),
+        rival=rival.folder if rival else None,
+        rival_score=_round(rival.score) if rival else None,
+    )
 
 
 def _is_below(item: FolderScore, folder: str) -> bool:
@@ -212,14 +223,6 @@ def _contested_subfolder(
     return next(
         (item for item in ranked if _is_below(item, choice.folder) and item.score >= threshold),
         None,
-    )
-
-
-def _too_close(item: FolderScore, ranked: Sequence[FolderScore]) -> str:
-    rival = _best_rival(item, ranked)
-    return (
-        f"not sure: {item.folder!r} ({item.score:.2f}) is too close to "
-        f"{rival.folder!r} ({rival.score:.2f})"
     )
 
 

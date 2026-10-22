@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from autoshelf import reasons
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
@@ -24,6 +25,7 @@ from autoshelf.extract import Extraction, extract
 from autoshelf.fsutil import is_within
 from autoshelf.layout import INBOX_DIRNAME, RESERVED_PREFIX, Zone, zone_of
 from autoshelf.ml.library import LibraryIndex
+from autoshelf.reasons import Reason
 from autoshelf.watcher.ignore import ignore_reason
 
 log = logging.getLogger(__name__)
@@ -46,7 +48,7 @@ class Proposal:
     target: str | None  # where it will go (the user may change it)
     confidence: float | None
     reason: str  # "auto", "Rule: <name>" or "ask" (a best guess, not ticked)
-    explanation: str
+    why: Reason  # the reason as data (wording.reason_text puts it in words)
     selected: bool
     details: dict = field(default_factory=dict)
 
@@ -166,21 +168,21 @@ def _propose(
     if match is not None:
         rule = match.rule
         suggested, confidence = rule.target_folder, None
-        reason, explanation, selected = rule_engine.reason_for(rule), match.match, True
+        why = reasons.reason(reasons.RULE, rule=rule.name, matched=list(match.matched))
+        reason, selected = rule_engine.reason_for(rule), True
     elif classification is not None and classification.choice is not None:
         suggested, confidence = classification.choice.folder, classification.choice.score
-        reason, explanation, selected = "auto", classification.explanation, True
+        reason, why, selected = "auto", classification.reason, True
     elif classification is not None and classification.scores:
         best = classification.scores[0]
         suggested, confidence = best.folder, best.score
-        reason, explanation, selected = "ask", classification.explanation, False
+        reason, why, selected = "ask", classification.reason, False
     else:
-        return Proposal(path, current, None, None, None, "ask", "no suggestion", False, details)
+        why = classification.reason if classification else reasons.reason(reasons.NO_CLASSIFIER)
+        return Proposal(path, current, None, None, None, "ask", why, False, details)
     if suggested.casefold() == current.casefold():
         return None  # already where it belongs
-    return Proposal(
-        path, current, suggested, suggested, confidence, reason, explanation, selected, details
-    )
+    return Proposal(path, current, suggested, suggested, confidence, reason, why, selected, details)
 
 
 def apply(
@@ -210,7 +212,7 @@ def apply(
                 failed.append((proposal.path, "it is outside the folder being organized"))
                 continue
             outside = folder
-        details = {**proposal.details, "explanation": proposal.explanation}
+        details = {**proposal.details, "reason": proposal.why}
         if proposal.suggested:
             details["suggested"] = proposal.suggested
         try:

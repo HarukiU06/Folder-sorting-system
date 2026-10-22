@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from autoshelf import __version__
+from autoshelf import __version__, wording
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.inbox import (
@@ -46,7 +46,6 @@ from autoshelf.layout import INBOX_DIRNAME
 from autoshelf.llm.base import LLMError
 from autoshelf.llm.secrets import SecretError
 from autoshelf.logging_setup import setup_logging
-from autoshelf.ml import explain
 from autoshelf.ml.embedder import EmbedderError
 from autoshelf.startup import StartupError
 
@@ -527,7 +526,7 @@ def _cmd_classify(args: argparse.Namespace, paths: AppPaths) -> int:
         print(f"Decision:  move to {classification.choice.folder!r} automatically")
     else:
         print(f"Decision:  ask you (it would wait in {INBOX_DIRNAME})")
-    print(f"Why:       {classification.explanation}")
+    print(f"Why:       {wording.reason_text(classification.reason)}")
     if classification.scores:
         print("Folders (score = similarity to the folder's name/description and its files):")
     for item in classification.top(5):
@@ -738,7 +737,7 @@ def _cmd_why(args: argparse.Namespace, paths: AppPaths) -> int:
         return 1
     print(format_history_entry(entry))
     root = Path(entry.root) if entry.root else None
-    lines = explain.describe(entry.details, root)
+    lines = wording.decision_lines(entry.details, root)
     if entry.reason == "user" and not entry.details.get("corrects"):
         lines.insert(0, "You chose this folder.")
     print("\n".join(lines) if lines else "No explanation was stored for this entry.")
@@ -845,7 +844,7 @@ def _print_rules(rules: list[repository.RuleRecord]) -> None:
     print("Rules, checked in this order (the first match wins):")
     for number, rule in enumerate(rules, start=1):
         state = "" if rule.enabled else "  (off)"
-        condition = rule_engine.describe_condition(rule.kind, rule.pattern)
+        condition = " and ".join(wording.condition(item) for item in rule_engine.conditions(rule))
         print(f"  {number}. #{rule.id} {rule.name}: {condition} -> {rule.target_folder}{state}")
 
 
@@ -862,7 +861,7 @@ def _rules_test(args: argparse.Namespace, paths: AppPaths) -> int:
         print("No rule matches; AutoShelf would decide by the file's content.")
     else:
         print(
-            f"Rule {match.rule.name!r} matches ({match.match}): "
+            f"Rule {match.rule.name!r} matches ({wording.rule_matches(match.matched)}): "
             f"it would go to {match.rule.target_folder}"
         )
     return 0
@@ -983,7 +982,7 @@ def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
         mark = "[x]" if item.selected else "[ ]"
         score = f"{item.confidence:.2f}" if item.confidence is not None else "    "
         print(f"  {mark} {score}  {item.path.name}: {item.current} -> {item.target or '?'}")
-        print(f"            {item.explanation}")
+        print(f"            {wording.reason_text(item.why)}")
     if not args.apply:
         print("Nothing was moved. Add --apply to move the [x] files (as one undoable batch).")
         return 0

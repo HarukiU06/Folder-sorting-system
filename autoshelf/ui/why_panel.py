@@ -6,6 +6,8 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QTextBrowser
 
+from autoshelf import reasons, wording
+
 BAR_PIXELS = 120
 EMPTY = "Select a file to see why it went where it went."
 
@@ -38,13 +40,20 @@ def why_html(details: Mapping | None, root: Path | None = None, headline: str = 
         parts.append(f"<p><b>{html.escape(headline)}</b></p>")
     rule = details.get("rule")
     if rule:
+        if "conditions" in rule:
+            when = " and ".join(wording.condition(item) for item in rule["conditions"])
+            found = wording.rule_matches(rule.get("matched") or [])
+        else:  # written before rules were stored as data
+            when, found = rule["condition"], rule.get("match", "")
         parts.append(
-            f"<p>Rule <b>{html.escape(rule['name'])}</b>: {html.escape(rule['condition'])} "
+            f"<p>Rule <b>{html.escape(rule['name'])}</b>: {html.escape(when)} "
             f"&rarr; {html.escape(rule['target'])}<br>"
-            f"<small>{html.escape(rule.get('match', ''))}</small></p>"
+            f"<small>{html.escape(found)}</small></p>"
         )
-    elif details.get("explanation"):
-        parts.append(f"<p>{html.escape(details['explanation'])}</p>")
+    code = (details.get("reason") or {}).get("code", reasons.RULE)
+    why = wording.explanation(details)
+    if why and not (rule and code == reasons.RULE):
+        parts.append(f"<p>{html.escape(why)}</p>")
     candidates = details.get("candidates") or []
     if candidates:
         rows = [

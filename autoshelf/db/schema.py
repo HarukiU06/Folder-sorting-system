@@ -170,3 +170,37 @@ CREATE TABLE flashcards (
 );
 CREATE INDEX flashcards_folder ON flashcards (folder);
 """
+
+V6 = """
+-- Files AutoShelf makes (a compressed or converted copy, next to the original) are recorded
+-- with the action 'create': src is the (first) source file, dst the new file, sha256 the
+-- new file's content, reason the operation, details the sources and the operation. SQLite
+-- can't change a CHECK constraint, so the table is rebuilt with the same rows and ids.
+-- (Runs with foreign keys off: corrections and undo rows refer to history rows.)
+CREATE TABLE history_new (
+    id           INTEGER PRIMARY KEY,
+    ts           TEXT    NOT NULL,
+    file_id      INTEGER REFERENCES files (id) ON DELETE SET NULL,
+    action       TEXT    NOT NULL
+                 CHECK (action IN ('move', 'rename', 'tag', 'undo', 'create')),
+    src          TEXT,
+    dst          TEXT,
+    reason       TEXT    NOT NULL DEFAULT '',
+    confidence   REAL,
+    details_json TEXT    NOT NULL DEFAULT '{}',
+    batch_id     TEXT,
+    state        TEXT    NOT NULL CHECK (state IN ('pending', 'done', 'undone', 'failed')),
+    root         TEXT,
+    sha256       TEXT,
+    undo_of      INTEGER REFERENCES history (id)
+);
+INSERT INTO history_new (id, ts, file_id, action, src, dst, reason, confidence, details_json,
+                         batch_id, state, root, sha256, undo_of)
+    SELECT id, ts, file_id, action, src, dst, reason, confidence, details_json,
+           batch_id, state, root, sha256, undo_of FROM history;
+DROP TABLE history;
+ALTER TABLE history_new RENAME TO history;
+CREATE INDEX history_state ON history (state);
+CREATE INDEX history_batch ON history (batch_id);
+CREATE INDEX history_file ON history (file_id);
+"""

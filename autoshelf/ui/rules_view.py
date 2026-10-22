@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from autoshelf.actions.rules import RULE_KINDS, describe_condition
+from autoshelf import wording
+from autoshelf.actions.rules import RULE_KINDS, conditions
 from autoshelf.app_service import AppService, RuleTest
 from autoshelf.db.repository import RuleRecord
 from autoshelf.ui.tasks import TaskRunner
@@ -173,7 +174,9 @@ class RulesView(QWidget):
             cells = (
                 on,
                 QTableWidgetItem(rule.name),
-                QTableWidgetItem(describe_condition(rule.kind, rule.pattern)),
+                QTableWidgetItem(
+                    " and ".join(wording.condition(item) for item in conditions(rule))
+                ),
                 QTableWidgetItem(rule.target_folder),
             )
             for column, item in enumerate(cells):
@@ -286,4 +289,4 @@ class RulesView(QWidget):
             self.runner.run(lambda: self.service.test_rules(Path(path)), self._show_test)
 
     def _show_test(self, result: RuleTest) -> None:
-        self.status.setText(f"{result.path.name}: {result.message}")
+        self.status.setText(f"{result.path.name}: {wording.rule_test(result)}")

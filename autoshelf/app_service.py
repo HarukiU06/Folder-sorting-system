@@ -131,12 +131,12 @@ class FileInfo:
 
 @dataclass(frozen=True)
 class RuleTest:
-    """What the rules (or, failing them, the classifier) would do with a file."""
+    """Which rule would handle a file (``wording.rule_test`` puts it in words)."""
 
     path: Path
-    rule: repository.RuleRecord | None
-    target: str | None  # the folder it would go to; None: it would wait in _Inbox
-    message: str
+    rule: repository.RuleRecord | None  # None: no rule matches; the content decides
+    target: str | None  # the folder it would go to
+    matched: tuple[dict, ...] = ()  # what the rule's conditions found
 
 
 class AppService:
@@ -968,14 +968,9 @@ class AppService:
         with self._connect() as conn:
             rules = repository.list_rules(conn, enabled_only=True)
         match = rule_engine.first_match(rules, path, extraction)
-        if match is not None:
-            rule = match.rule
-            message = (
-                f"Rule {rule.name!r} matches ({match.match}): it would go to {rule.target_folder}"
-            )
-            return RuleTest(path, rule, rule.target_folder, message)
-        message = "No rule matches this file; AutoShelf would decide by its content."
-        return RuleTest(path, None, None, message)
+        if match is None:
+            return RuleTest(path, None, None)
+        return RuleTest(path, match.rule, match.rule.target_folder, match.matched)
 
 
 def _is_waiting(conn: sqlite3.Connection, path: Path) -> bool:

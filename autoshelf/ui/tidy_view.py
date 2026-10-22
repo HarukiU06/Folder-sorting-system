@@ -24,11 +24,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autoshelf import wording
 from autoshelf.app_service import AppService
 from autoshelf.features.duplicates import DuplicateGroup, VersionGroup
 from autoshelf.features.organize import OrganizeResult, Proposal
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import show_in_explorer
+from autoshelf.ui.widgets import plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
 ROOT_CHOICE = "The root (files not sorted yet)"
@@ -327,12 +328,9 @@ class OrganizePage(QWidget):
             self.table.setCellWidget(row, 3, target)
             score = "" if proposal.confidence is None else f"{proposal.confidence:.2f}"
             self.table.setItem(row, 4, QTableWidgetItem(score))
-            why = QTableWidgetItem(
-                f"{proposal.reason}: {proposal.explanation}"
-                if proposal.reason.startswith("Rule")
-                else proposal.explanation
-            )
-            why.setToolTip(proposal.explanation)
+            text = wording.reason_text(proposal.why)
+            why = QTableWidgetItem(text)
+            why.setToolTip(plain_tooltip(text))
             self.table.setItem(row, 5, why)
         ticked = sum(proposal.selected for proposal in proposals)
         self.status.setText(

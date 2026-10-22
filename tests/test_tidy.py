@@ -67,7 +67,8 @@ def test_exact_duplicates_are_found_and_extra_copies_set_aside(conn, shelf, libr
         shelf / "_Duplicates" / "invoice copy.txt"
     ).exists()
     entry = repository.get_history(conn, moved[0].history_id)
-    assert entry.reason == "duplicate of invoice 2024.txt"
+    assert entry.reason == "duplicate"
+    assert Path(entry.details["duplicate_of"]).name == "invoice 2024.txt"
     assert entry.batch_id
     undo_batch(conn, entry.batch_id)
     assert copy.exists()

@@ -10,6 +10,7 @@ import pytest
 from fakes import FakeEmbedder
 from helpers import make
 
+from autoshelf import wording
 from autoshelf.app_service import AppService, watch_lock
 from autoshelf.cli import main
 from autoshelf.config import AppPaths, ConfigError
@@ -188,7 +189,7 @@ def test_inbox_without_a_model_still_lists_files(paths: AppPaths, shelf: Path) -
     (item,) = app.inbox()
     assert item.classification is None
     assert item.excerpt == "call mom"
-    assert "can't be sorted" in item.explanation
+    assert "can't be sorted" in wording.reason_text(item.reason)
 
 
 def test_assign_undo_and_history(service: AppService, shelf: Path) -> None:

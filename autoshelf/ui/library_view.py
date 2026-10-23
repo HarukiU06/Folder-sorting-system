@@ -29,19 +29,11 @@ from PySide6.QtWidgets import (
 )
 
 from autoshelf.app_service import AppService, FileInfo
+from autoshelf.features import convert
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import plain_label, plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
-CONVERSION_LABELS = {
-    "pdf": "PDF",
-    "docx": "Word document (.docx; the layout is only approximated)",
-    "png": "PNG image",
-    "jpg": "JPG image",
-    "webp": "WEBP image",
-    "bmp": "BMP image",
-    "tiff": "TIFF image",
-}
 COLUMNS = ("File", "Folder", "Match")
 HINT = (
     'Search your files by meaning ("paper explaining k-means initialization") or by exact '
@@ -333,7 +325,7 @@ class LibraryView(QWidget):
     def _fill_conversions(self, formats) -> None:
         self.convert_menu.clear()
         for to in formats:
-            action = self.convert_menu.addAction(CONVERSION_LABELS.get(to, to.upper()))
+            action = self.convert_menu.addAction(convert.label(to))
             action.triggered.connect(lambda _=False, to=to: self.convert_file(to))
         self.convert_button.setEnabled(bool(formats))
 

@@ -8,6 +8,7 @@ which is shown as it is.
 """
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 
 from autoshelf import reasons
@@ -284,6 +285,33 @@ def history_reason(entry: HistoryEntry) -> str:
         verb = "Tagged" if entry.reason == "tag" else "Untagged"
         return f"{verb} '{entry.details.get('tag', '')}'"
     return _REASON_LABELS.get(entry.reason, entry.reason)
+
+
+def why_here(path: Path, entry: HistoryEntry | None, here: bool) -> str:
+    """Why a file is where it is, in a sentence ("Why is this here?" in Explorer's menu).
+
+    ``entry`` is AutoShelf's last move of it; ``here`` says whether that move put it where
+    it is now."""
+    name = path.name
+    if entry is None:
+        return f"AutoShelf has no record of moving {name}: you or another program put it here."
+    when = _when(entry.ts)
+    if not here:
+        return (
+            f"AutoShelf last moved {name} on {when}; since then you or another program moved "
+            "it here."
+        )
+    if entry.action == "undo":
+        return f"You undid AutoShelf's move of {name} on {when}, so it is back where it was."
+    if entry.action == "create":
+        return f"AutoShelf made {name} on {when}: {created(entry.details.get('reason') or {})}."
+    if entry.action == "rename":
+        return f"AutoShelf renamed it to {name} on {when} ({history_reason(entry)})."
+    return f"AutoShelf moved {name} here on {when} ({history_reason(entry)})."
+
+
+def _when(ts: str) -> str:
+    return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 # --- how well would AutoShelf sort this library? ------------------------------------------------

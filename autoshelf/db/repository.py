@@ -642,6 +642,16 @@ def last_decision(conn: sqlite3.Connection, file_id: int) -> HistoryEntry | None
     return None if row is None else _history_from_row(row)
 
 
+def latest_history_of(conn: sqlite3.Connection, file_id: int) -> HistoryEntry | None:
+    """The most recent completed move, rename, creation or undo of a file."""
+    row = conn.execute(
+        "SELECT * FROM history WHERE file_id = ? AND state = 'done'"
+        " AND action IN ('move', 'rename', 'create', 'undo') ORDER BY id DESC LIMIT 1",
+        (file_id,),
+    ).fetchone()
+    return None if row is None else _history_from_row(row)
+
+
 def list_batch(conn: sqlite3.Connection, batch_id: str) -> list[HistoryEntry]:
     """Every row of one batch, oldest first."""
     rows = conn.execute("SELECT * FROM history WHERE batch_id = ? ORDER BY id", (batch_id,))

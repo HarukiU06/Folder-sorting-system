@@ -204,6 +204,17 @@ class VersionsPage(QWidget):
             show_in_explorer(Path(item.data(0, PATH_ROLE)))
 
 
+def sort_plan_note(plan) -> str:
+    """What else to say about files chosen in Explorer: already in place, or refused."""
+    lines = []
+    if plan.in_place:
+        names = ", ".join(path.name for path in plan.in_place[:3])
+        more = f" and {len(plan.in_place) - 3} more" if len(plan.in_place) > 3 else ""
+        lines.append(f"Already where it belongs: {names}{more}.")
+    lines.extend(reason for _, reason in plan.refused)
+    return "\n".join(lines)
+
+
 class OrganizePage(QWidget):
     """Preview where every file of a folder would go, then apply as one undoable batch."""
 
@@ -216,6 +227,7 @@ class OrganizePage(QWidget):
         self.runner = runner
         self._proposals: list[Proposal] = []
         self._folder: Path | None = None
+        self._files: list[Path] | None = None  # files chosen in Explorer, instead of a folder
         self._folders: list[str] = []
         self._last_batch: str | None = None
 
@@ -297,7 +309,7 @@ class OrganizePage(QWidget):
         self.table.setRowCount(0)
 
         def planned(proposals: list[Proposal]) -> None:
-            self._folder = folder
+            self._folder, self._files = folder, None
             self._show(proposals)
 
         self.runner.run(
@@ -306,7 +318,24 @@ class OrganizePage(QWidget):
             lambda exc: self.status.setText(str(exc)),
         )
 
-    def _show(self, proposals: list[Proposal]) -> None:
+    def preview_files(self, paths: list[Path]) -> None:
+        """Propose a folder for files chosen in Explorer ("Sort with AutoShelf")."""
+        self.status.setText(f"Reading {len(paths)} file(s)...")
+        self.table.setRowCount(0)
+        self._proposals = []
+        self._update_buttons()
+
+        def planned(plan) -> None:
+            self._folder, self._files = None, list(paths)
+            self._show(plan.proposals, sort_plan_note(plan))
+
+        def failed(exc: Exception) -> None:
+            self.status.setText(str(exc))
+            QMessageBox.warning(self, "Can't sort these files", str(exc))
+
+        self.runner.run(lambda: self.service.plan_sort(paths), planned, failed)
+
+    def _show(self, proposals: list[Proposal], note: str = "") -> None:
         self._proposals = proposals
         self.table.setRowCount(len(proposals))
         for row, proposal in enumerate(proposals):
@@ -334,9 +363,12 @@ class OrganizePage(QWidget):
             self.table.setItem(row, 5, why)
         ticked = sum(proposal.selected for proposal in proposals)
         self.status.setText(
-            f"{len(proposals)} file(s) could move; {ticked} ticked. Nothing has moved yet."
-            if proposals
-            else "Everything there is already where it belongs."
+            (
+                f"{len(proposals)} file(s) could move; {ticked} ticked. Nothing has moved yet."
+                if proposals
+                else "Everything there is already where it belongs."
+            )
+            + (f"\n{note}" if note else "")
         )
         self._update_buttons()
 
@@ -353,7 +385,7 @@ class OrganizePage(QWidget):
 
     def apply(self) -> None:
         """Move the ticked rows as one batch."""
-        if self._folder is None:
+        if self._folder is None and self._files is None:
             return
         proposals = self._collect()
         count = sum(1 for item in proposals if item.selected and item.target)
@@ -361,6 +393,10 @@ class OrganizePage(QWidget):
             self.status.setText("Nothing is ticked.")
             return
         folder = self._folder
+        if folder is None:
+            work = lambda: self.service.apply_sort(proposals)  # noqa: E731
+        else:
+            work = lambda: self.service.apply_organize(folder, proposals)  # noqa: E731
 
         def done(result: OrganizeResult) -> None:
             self._last_batch = result.batch_id if result.moved else None
@@ -375,9 +411,7 @@ class OrganizePage(QWidget):
             self._update_buttons()
 
         self.runner.run(
-            lambda: self.service.apply_organize(folder, proposals),
-            done,
-            lambda exc: QMessageBox.warning(self, "Couldn't organize", str(exc)),
+            work, done, lambda exc: QMessageBox.warning(self, "Couldn't organize", str(exc))
         )
 
     def undo_batch(self) -> None:
@@ -608,6 +642,11 @@ class TidyView(QWidget):
     def refresh(self) -> None:
         """Reload what is cheap to reload (scans run when asked)."""
         self.organize.refresh()
+
+    def sort_files(self, paths: list[Path]) -> None:
+        """Show the preview for files chosen in Explorer."""
+        self.pages.setCurrentWidget(self.organize)
+        self.organize.preview_files(paths)
 
     def set_ai_enabled(self, enabled: bool) -> None:
         """Offer AI-made names only when an AI provider is on."""

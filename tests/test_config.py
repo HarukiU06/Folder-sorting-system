@@ -155,4 +155,4 @@ def test_cli_startup_and_background(fake_run_key: dict, monkeypatch, capsys) -> 
     calls = []
     monkeypatch.setattr(ui_app, "run_app", lambda **kwargs: calls.append(kwargs) or 0)
     assert cli.main(["--background"]) == 0
-    assert calls == [{"verbose": False, "show": False}]
+    assert calls == [{"verbose": False, "show": False, "command": None}]

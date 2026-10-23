@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from autoshelf import __version__, wording
+from autoshelf import commands as app_commands
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions.create import CreateError
@@ -39,6 +40,7 @@ from autoshelf.config import (
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
+from autoshelf.explorer import ExplorerError
 from autoshelf.extract import guard as read_guard
 from autoshelf.features.convert import ConvertError
 from autoshelf.features.duplicates import DuplicateError
@@ -74,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start the app in the tray without opening its window (used at sign-in)",
     )
+    app_commands.add_app_arguments(parser)
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     def with_root(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -168,6 +171,12 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--forget-api-key", action="store_true", help="remove the saved key")
     config.add_argument(
         "--startup", choices=["on", "off"], help="start AutoShelf when you sign in to Windows"
+    )
+    config.add_argument(
+        "--explorer-menu",
+        choices=["on", "off"],
+        help="AutoShelf in Explorer's right-click menu (Sort, Why is this here?, Compress, "
+        "Convert)",
     )
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
@@ -336,11 +345,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     _make_console_safe()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(app_commands.safe_url_argv(argv))
     if args.command is None:
         from autoshelf.ui.app import run_app  # imports Qt; only needed for the app
 
-        return run_app(verbose=args.verbose, show=not args.background)
+        try:
+            command = app_commands.from_args(args)
+        except app_commands.CommandError as exc:
+            parser.error(str(exc))
+        return run_app(verbose=args.verbose, show=not args.background, command=command)
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
@@ -405,6 +419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         FolderNameError,
         FileExistsError,
         StartupError,
+        ExplorerError,
         ConvertError,
         CreateError,
     ) as exc:
@@ -726,6 +741,13 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         from autoshelf import startup
 
         startup.set_enabled(args.startup == "on")
+    if args.explorer_menu is not None:
+        from autoshelf import explorer
+
+        if args.explorer_menu == "on":
+            explorer.add()
+        else:
+            explorer.remove()
     if args.api_key:
         from autoshelf.llm.secrets import set_api_key
 
@@ -760,9 +782,10 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         if bulk != model:
             ai += f" ({BULK_TASKS}: {bulk})"
     print(f"AI (optional):    {ai}")
-    from autoshelf import startup
+    from autoshelf import explorer, startup
 
     print(f"Start with Windows: {'on' if startup.is_enabled() else 'off'}")
+    print(f"Explorer menu:    {'on' if explorer.is_added() else 'off'}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(

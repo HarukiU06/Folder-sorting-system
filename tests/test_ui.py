@@ -13,7 +13,9 @@ from helpers import make
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from autoshelf import commands
 from autoshelf.app_service import AppService
+from autoshelf.commands import Command, encode
 from autoshelf.config import CONFIDENCE_LEVELS, AppPaths
 from autoshelf.pipeline import Outcome, OutcomeKind
 from autoshelf.ui import app as app_module
@@ -377,40 +379,135 @@ def test_server_name_is_per_data_folder(paths: AppPaths, tmp_path: Path) -> None
     assert app_module.server_name(paths) == app_module.server_name(AppPaths(paths.home))
 
 
-def test_later_launches_and_tools_can_show_or_quit_the_app(
-    qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from PySide6.QtNetwork import QLocalServer
+class Receiver:
+    """Stands in for the app: records the commands it receives."""
 
-    shown, quits = [], []
+    def __init__(self) -> None:
+        self.received: list[Command] = []
 
-    class FakeApp:
-        def show_window(self) -> None:
-            shown.append(True)
+    def receive(self, command: Command) -> None:
+        self.received.append(command)
 
-    monkeypatch.setattr(app_module.QApplication, "quit", lambda: quits.append(True))
+
+def start_sender(name: str, command: Command, wait_seconds: float = 0.0) -> subprocess.Popen:
+    """A later launch is another process; send_command blocks until acknowledged."""
+    code = (
+        "import sys; from autoshelf.ui.app import send_command; "
+        "from autoshelf.commands import decode; "
+        f"sys.exit(0 if send_command({name!r}, decode({encode(command)[:-1]!r}), "
+        f"wait_seconds={wait_seconds}) else 1)"
+    )
+    return subprocess.Popen([sys.executable, "-c", code])
+
+
+def sent(qtbot, sender: subprocess.Popen) -> bool:
+    qtbot.waitUntil(lambda: sender.poll() is not None, timeout=WAIT_MS * 3)
+    return sender.returncode == 0
+
+
+def test_later_launches_hand_their_command_to_the_app(qtbot, tmp_path: Path) -> None:
     name = app_module.server_name(AppPaths(tmp_path))
-    server = QLocalServer()
-    QLocalServer.removeServer(name)
-    assert server.listen(name)
-    app_module._serve_commands(server, FakeApp())
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
 
-    def send(command: bytes) -> bool:
-        # A later launch is another process; send_command blocks until acknowledged.
-        code = (
-            "import sys; from autoshelf.ui.app import send_command; "
-            f"sys.exit(0 if send_command({name!r}, {command!r}) else 1)"
-        )
-        sender = subprocess.Popen([sys.executable, "-c", code])
-        qtbot.waitUntil(lambda: sender.poll() is not None, timeout=WAIT_MS * 3)
-        return sender.returncode == 0
-
-    assert send(app_module.SHOW_COMMAND)
-    assert shown == [True]
-    assert send(app_module.QUIT_COMMAND)
-    qtbot.waitUntil(lambda: quits == [True], timeout=WAIT_MS)
+    unicode_file = Command(commands.COMPRESS, (str(tmp_path / "写真 2024 ★.png"),))
+    assert sent(qtbot, start_sender(name, app_module.SHOW_COMMAND))
+    assert sent(qtbot, start_sender(name, unicode_file))
+    assert receiver.received == [app_module.SHOW_COMMAND, unicode_file]
     server.close()
-    assert not send(app_module.SHOW_COMMAND)
+    assert not sent(qtbot, start_sender(name, app_module.SHOW_COMMAND))  # nobody listens
+
+
+def test_a_launch_waits_for_the_app_another_launch_is_starting(qtbot, tmp_path: Path) -> None:
+    name = app_module.server_name(AppPaths(tmp_path))
+    sender = start_sender(name, Command(commands.SORT, ("a.txt",)), wait_seconds=20)
+    qtbot.wait(1500)  # the app isn't listening yet
+    assert sender.poll() is None
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
+    assert sent(qtbot, sender)
+    assert receiver.received == [Command(commands.SORT, ("a.txt",))]  # once
+    server.close()
+
+
+def test_the_app_refuses_nonsense(qtbot, tmp_path: Path) -> None:
+    from PySide6.QtNetwork import QLocalSocket
+
+    name = app_module.server_name(AppPaths(tmp_path))
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    assert socket.waitForConnected(WAIT_MS)
+    socket.write(b'{"action": "format_disk"}\n')
+    socket.flush()
+    answer = b""
+    qtbot.waitUntil(lambda: socket.bytesAvailable() > 0, timeout=WAIT_MS)
+    answer = bytes(socket.readAll().data())
+    assert answer == commands.REFUSED
+    assert receiver.received == []
+    server.close()
+
+
+def test_quit_and_show_commands(qtbot, app, monkeypatch: pytest.MonkeyPatch) -> None:
+    quits = []
+    monkeypatch.setattr(app_module.QApplication, "quit", lambda: quits.append(True))
+    app.receive(app_module.SHOW_COMMAND)
+    assert app.window.isVisible()
+    app.receive(app_module.QUIT_COMMAND)
+    qtbot.waitUntil(lambda: quits == [True], timeout=WAIT_MS)
+
+
+def test_files_right_clicked_together_make_one_zip(qtbot, app, shelf: Path) -> None:
+    a = make(shelf / "Finance" / "a.txt", "a")
+    b = make(shelf / "Finance" / "b.txt", "b")
+    app.receive(Command(commands.COMPRESS, (str(a),)))
+    app.receive(Command(commands.COMPRESS, (str(b),)))
+    qtbot.waitUntil(lambda: (shelf / "Finance" / "a and 1 more.zip").exists(), timeout=WAIT_MS)
+    status = app.window.statusBar()
+    qtbot.waitUntil(lambda: "Made a and 1 more.zip" in status.currentMessage(), timeout=WAIT_MS)
+    assert not (shelf / "Finance" / "a.zip").exists()
+
+
+def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: Path) -> None:
+    bill = make(tmp_path / "Downloads" / "bill.txt", "invoice tax due to the bank")
+    app.run_command(Command(commands.SORT, (str(bill),)))
+    page = app.window.tidy.organize
+    qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
+    assert app.window.tabs.currentWidget() is app.window.tidy
+    assert page.table.cellWidget(0, 3).currentText() == "Finance"
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.apply()
+    qtbot.waitUntil(lambda: (shelf / "Finance" / "bill.txt").exists(), timeout=WAIT_MS)
+    assert not bill.exists()
+
+
+def test_sort_explains_files_it_cant_take(
+    qtbot, app, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warnings = []
+    monkeypatch.setattr(
+        "autoshelf.ui.tidy_view.QMessageBox.warning", lambda *args: warnings.append(args[2])
+    )
+    kept = make(shelf / "_Trash" / "x.txt", "x")
+    app.run_command(Command(commands.SORT, (str(kept),)))
+    qtbot.waitUntil(lambda: bool(warnings), timeout=WAIT_MS)
+    assert "AutoShelf's own folders" in warnings[0]
+
+
+def test_why_is_this_here_opens_a_dialog(qtbot, app, shelf: Path) -> None:
+    from autoshelf.ui.why_panel import WhyDialog
+
+    mine = make(shelf / "Finance" / "mine.txt", "x")
+    app.run_command(Command(commands.WHY, (str(mine),)))
+    qtbot.waitUntil(lambda: bool(app._dialogs), timeout=WAIT_MS)
+    dialog = app._dialogs[-1]
+    assert isinstance(dialog, WhyDialog) and dialog.isVisible()
+    assert "no record of moving mine.txt" in dialog.panel.toPlainText()
+    dialog.close()
 
 
 # --- Phase 5: "Why here?", corrections and rules -------------------------------------------

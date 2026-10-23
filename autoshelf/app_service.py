@@ -136,6 +136,26 @@ class FileInfo:
 
 
 @dataclass(frozen=True)
+class SortPlan:
+    """Where files chosen in Explorer would go: proposals to apply, files already where
+    they belong, and files that can't be sorted (with the reason)."""
+
+    proposals: list[organize_features.Proposal]
+    in_place: list[Path]
+    refused: list[tuple[Path, str]]
+
+
+@dataclass(frozen=True)
+class WhyHere:
+    """Why a file is where it is: AutoShelf's last move of it (None: AutoShelf has no
+    record of moving it), and whether that move put it where it is now."""
+
+    path: Path
+    entry: repository.HistoryEntry | None
+    here: bool
+
+
+@dataclass(frozen=True)
 class RuleTest:
     """Which rule would handle a file (``wording.rule_test`` puts it in words)."""
 
@@ -144,6 +164,10 @@ class RuleTest:
     target: str | None  # the folder it would go to (None: AutoShelf decides)
     matched: tuple[dict, ...] = ()  # what the rule's conditions found
     new_name: str | None = None  # the name the rule would give it
+
+
+def _same_path(stored: str, path: Path) -> bool:
+    return str(Path(stored)).casefold() == str(path).casefold()
 
 
 class AppService:
@@ -636,6 +660,82 @@ class AppService:
                 conn, batch_id, force=force, before_rename=self._before_rename()
             )
 
+    # --- files chosen in Explorer (Sort with AutoShelf, Why is this here?) ----------------------
+
+    def plan_sort(self, paths: list[Path]) -> SortPlan:
+        """Where each file would go (reads them, moves nothing). Files outside the root must
+        be in a folder on the same drive that may be organized; others are refused with
+        the reason. Raises ConfigError if none of them can be sorted."""
+        root = self._require_root()
+        settings = self.settings()
+        files, refused = [], []
+        for path in dict.fromkeys(Path(item) for item in paths):
+            try:
+                files.append(self._sortable(path, root))
+            except ConfigError as exc:
+                refused.append((path, str(exc)))
+        if not files:
+            raise ConfigError("\n".join(reason for _, reason in refused) or "No files chosen")
+        with self._connect() as conn:
+            try:
+                library = self.library(conn, root)
+            except Exception as exc:
+                log.warning("Only rules can propose folders: %s", exc)
+                library = None
+            proposals, in_place = organize_features.plan_files(
+                conn,
+                root,
+                library,
+                files,
+                threshold=settings.auto_threshold,
+                margin=settings.auto_margin,
+            )
+        return SortPlan(proposals, in_place, refused)
+
+    def apply_sort(
+        self, proposals: list[organize_features.Proposal]
+    ) -> organize_features.OrganizeResult:
+        """Move the ticked proposals of ``plan_sort`` as one batch (undo with ``undo_batch``)."""
+        root = self._require_root()
+        outside = {
+            validate_outside_folder(proposal.path.parent, root, self.paths)
+            for proposal in proposals
+            if proposal.selected and proposal.target and not is_within(proposal.path, root)
+        }
+        with self._connect() as conn:
+            return organize_features.apply(
+                conn, root, proposals, folders=sorted(outside), before_rename=self._before_rename()
+            )
+
+    def _sortable(self, path: Path, root: Path) -> Path:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise ConfigError(f"{path.name} is not a file AutoShelf can sort")
+        if is_within(resolved, root):
+            if zone_of(resolved, root) is Zone.RESERVED:
+                raise ConfigError(f"{resolved.name} is in one of AutoShelf's own folders")
+            return resolved
+        try:
+            validate_outside_folder(resolved.parent, root, self.paths)
+        except ConfigError as exc:
+            raise ConfigError(f"{resolved.name} can't be sorted: {exc}") from None
+        return resolved
+
+    def why_here(self, path: Path) -> WhyHere:
+        """AutoShelf's last move of a file in the library, if it made one."""
+        root = self._require_root()
+        resolved = Path(path).resolve()
+        if not is_within(resolved, root):
+            raise ConfigError(
+                f"{resolved.name} is outside the folder AutoShelf sorts ({root}), so AutoShelf "
+                "didn't put it there."
+            )
+        with self._connect() as conn:
+            record = repository.get_file_by_path(conn, resolved)
+            entry = repository.latest_history_of(conn, record.id) if record else None
+        here = entry is not None and entry.dst is not None and _same_path(entry.dst, resolved)
+        return WhyHere(resolved, entry, here)
+
     # --- compress and convert (always new files next to the originals) ------------------------
 
     def conversions(self, path: Path) -> list[str]:
@@ -768,6 +868,33 @@ class AppService:
         from autoshelf import startup
 
         startup.set_enabled(enabled)
+
+    # --- Explorer's right-click menu --------------------------------------------------------
+
+    def explorer_menu(self) -> bool:
+        """True if AutoShelf is in Explorer's right-click menu."""
+        from autoshelf import explorer
+
+        return explorer.is_added()
+
+    def set_explorer_menu(self, enabled: bool) -> None:
+        """Add AutoShelf to Explorer's right-click menu, or take it out."""
+        from autoshelf import explorer
+
+        if enabled:
+            explorer.add()
+        else:
+            explorer.remove()
+
+    def repair_explorer_menu(self) -> bool:
+        """Point the menu at this copy of AutoShelf if the program it starts is gone (the app
+        was moved). Returns True if it was changed."""
+        from autoshelf import explorer
+
+        if explorer.is_broken():
+            explorer.add()
+            return True
+        return False
 
     # --- optional AI (off by default) ---------------------------------------------------
 

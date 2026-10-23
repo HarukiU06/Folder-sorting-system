@@ -115,6 +115,28 @@ adds an entry to your user's startup programs (the registry's `Run` key; no admi
 rights). AutoShelf then starts in the tray without opening its window. Turn it off the same
 way. `autoshelf --background` starts it like that by hand.
 
+### Explorer's right-click menu
+
+Settings → "Add AutoShelf to Explorer's right-click menu" (or
+`autoshelf config --explorer-menu on`) adds, for your Windows user only (no administrator
+rights):
+
+- **AutoShelf ▸ Sort with AutoShelf:** a preview (Tidy up → Organize) of where the selected
+  files would go. Nothing moves until you click Apply, and the moves form one batch you can
+  undo. Files outside your library can come from a folder on the same drive; a file on
+  another drive gets a message instead, because AutoShelf only moves files (it never copies
+  and deletes them).
+- **AutoShelf ▸ Why is this here?** what AutoShelf did with the file and why, or that it has
+  no record of moving it.
+- **AutoShelf ▸ Compress** and **Convert with AutoShelf ▸** (only on file types it can
+  convert, with the formats available on your PC): see [Compress and convert](#compress-and-convert).
+
+On Windows 11 the entries are under "Show more options". Several selected files are handled
+together (one ZIP, one PDF of several images, one preview). If AutoShelf isn't running, the
+menu starts it. The same commands work from a terminal: `AutoShelf.exe --sort FILE ...`,
+`--why FILE`, `--compress FILE ...`, `--convert pdf FILE ...` (from source:
+`.venv\Scripts\python.exe -m autoshelf --sort FILE ...`).
+
 ## Building the app (no Python needed to run it)
 
 ```powershell

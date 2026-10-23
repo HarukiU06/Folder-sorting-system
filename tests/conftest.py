@@ -91,6 +91,18 @@ def fake_run_key(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 
 @pytest.fixture(autouse=True)
+def fake_registry(monkeypatch: pytest.MonkeyPatch):
+    """A fake HKEY_CURRENT_USER, so tests never change Explorer's menu or file types."""
+    from fakes import FakeRegistry
+
+    from autoshelf import explorer
+
+    registry = FakeRegistry()
+    monkeypatch.setattr(explorer, "default_registry", lambda: registry)
+    return registry
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """LLM providers must never reach the internet (or a local Ollama) from tests."""
     from autoshelf.llm import base

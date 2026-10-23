@@ -3,12 +3,15 @@
 Run it with ``python -m autoshelf`` or the ``autoshelf-app`` command (no console window).
 """
 
+import argparse
 import contextlib
 import ctypes
 import hashlib
 import logging
 import os
 import sys
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +19,9 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from autoshelf.app_service import AppService
+from autoshelf import commands
+from autoshelf.app_service import AppService, WhyHere
+from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import calibrate as calibration
@@ -25,15 +30,20 @@ from autoshelf.ui.icons import app_icon
 from autoshelf.ui.main_window import MainWindow
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.tray import Tray
+from autoshelf.ui.why_panel import WhyDialog
 
 log = logging.getLogger(__name__)
 
 APP_USER_MODEL_ID = "HarukiU06.AutoShelf"
 NOTIFY_DELAY_MSECS = 1500  # files arriving together get one notification
 REFRESH_DELAY_MSECS = 700
-SHOW_COMMAND = b"show"
-QUIT_COMMAND = b"quit"
-ACK = b"ok"
+# Explorer starts one AutoShelf per selected file; what arrives within this long of the
+# previous one is handled together (ten right-clicked images: one ZIP).
+BATCH_MSECS = 1500
+# How long a launch keeps trying to reach the app another launch is starting.
+FORWARD_SECONDS = 20.0
+SHOW_COMMAND = Command(commands.SHOW)
+QUIT_COMMAND = Command(commands.QUIT)
 
 
 def icloud_drive() -> Path | None:
@@ -76,6 +86,10 @@ class AutoShelfApp(QObject):
 
         self._notify_timer = QTimer(self, singleShot=True, interval=NOTIFY_DELAY_MSECS)
         self._notify_timer.timeout.connect(self._notify)
+        self._batch = commands.Batch()
+        self._batch_timer = QTimer(self, singleShot=True, interval=BATCH_MSECS)
+        self._batch_timer.timeout.connect(self._run_batch)
+        self._dialogs: list[WhyDialog] = []
         self._refresh_timer = QTimer(self, singleShot=True, interval=REFRESH_DELAY_MSECS)
         self._refresh_timer.timeout.connect(self._refresh_after_outcomes)
 
@@ -110,6 +124,7 @@ class AutoShelfApp(QObject):
             QTimer.singleShot(0, self.choose_root)
             return
         self.service.start()
+        self.runner.run(self.service.repair_explorer_menu, None, lambda exc: None)
         self.window.set_state("Paused" if settings.paused else "Starting...")
         self.window.refresh_all()
         if show:
@@ -276,6 +291,77 @@ class AutoShelfApp(QObject):
             return "paused"
         return None
 
+    # --- commands from Explorer's menu, notifications and later launches ------------
+
+    def receive(self, command: Command) -> None:
+        """A command from another launch. File commands wait briefly for the rest of a
+        multi-file selection (one process per file), then run together."""
+        if command.action == commands.QUIT:
+            log.info("Quit requested by another process")
+            QTimer.singleShot(0, QApplication.quit)
+        elif command.action == commands.SHOW:
+            self.show_window()
+        else:
+            self._batch.add(command)
+            self._batch_timer.start()
+
+    def _run_batch(self) -> None:
+        for command in self._batch.take():
+            self.run_command(command)
+
+    def run_command(self, command: Command) -> None:
+        """Do what a (merged) command asks."""
+        files = [Path(item) for item in command.files]
+        log.info("Command %s for %d file(s)", command.action, len(files))
+        if command.action == commands.SORT:
+            self.show_window(self.window.tidy)
+            self.window.tidy.sort_files(files)
+        elif command.action == commands.WHY:
+            self.explain(files[0])
+        elif command.action == commands.COMPRESS:
+            self.make(lambda: [self.service.compress(files)])
+        elif command.action == commands.CONVERT:
+            to = command.to or ""
+            self.make(lambda: self.service.convert(files, to))
+        else:
+            self.show_window()
+
+    def explain(self, path: Path) -> None:
+        """Show why a file is where it is."""
+
+        def found(result: WhyHere) -> None:
+            self.show_window()
+            dialog = WhyDialog(result, self.window)
+            self._dialogs = [item for item in self._dialogs if item.isVisible()] + [dialog]
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+        self.runner.run(
+            lambda: self.service.why_here(path),
+            found,
+            lambda exc: self._warn(f"Why is {path.name} here?", str(exc)),
+        )
+
+    def make(self, work: Callable[[], list]) -> None:
+        """Compress or convert in the background, then say what was made."""
+
+        def done(created) -> None:
+            names = ", ".join(item.dst.name for item in created)
+            self.window.history.refresh()
+            self._tell(f"Made {names}", "It is next to the original, which is unchanged.")
+
+        self.runner.run(work, done, lambda exc: self._warn("Couldn't make the file", str(exc)))
+
+    def _tell(self, title: str, message: str) -> None:
+        self.window.show_message(f"{title}. {message}")
+        if not self.window.isVisible() or self.window.isMinimized():
+            self.tray.notify(title, message)
+
+    def _warn(self, title: str, text: str) -> None:
+        parent = self.window if self.window.isVisible() else None
+        QMessageBox.warning(parent, title, text)
+
     # --- watcher events -------------------------------------------------------------
 
     def _on_outcome(self, outcome: Outcome) -> None:
@@ -338,53 +424,90 @@ def server_name(paths: AppPaths) -> str:
     return f"AutoShelf-{digest}"
 
 
-def send_command(name: str, command: bytes, timeout_ms: int = 3000) -> bool:
-    """Send ``show`` or ``quit`` to the app running for a data folder.
+def send_command(
+    name: str, command: Command, *, wait_seconds: float = 0.0, timeout_ms: int = 3000
+) -> bool:
+    """Send a command to the app running for a data folder.
 
-    Returns True once the app has acknowledged it. Blocks, so the receiving app must be
-    in another process (or thread).
+    Returns True once the app has acknowledged it. With ``wait_seconds``, keeps trying to
+    connect that long (another launch may be starting the app) and waits as long for the
+    answer. A command is written at most once, so it never runs twice. Blocks, so the
+    receiving app must be in another process (or thread).
     """
+    deadline = time.monotonic() + wait_seconds
     socket = QLocalSocket()
-    socket.connectToServer(name)
-    if not socket.waitForConnected(timeout_ms):
-        return False
-    socket.write(command)
+    while True:
+        socket.connectToServer(name)
+        if socket.waitForConnected(timeout_ms):
+            break
+        socket.abort()
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    socket.write(commands.encode(command))
     socket.flush()
-    acknowledged = socket.waitForReadyRead(timeout_ms) and bytes(socket.readAll().data()) == ACK
+    answer = b""
+    answer_deadline = time.monotonic() + max(timeout_ms / 1000, wait_seconds)
+    while not answer.endswith(b"\n"):
+        remaining = int((answer_deadline - time.monotonic()) * 1000)
+        if remaining <= 0 or not socket.waitForReadyRead(remaining):
+            break
+        answer += bytes(socket.readAll().data())
     socket.disconnectFromServer()
-    return acknowledged
+    return answer == commands.ACK
 
 
 def _serve_commands(server: QLocalServer, app: "AutoShelfApp") -> None:
-    """Handle commands from later launches (show the window) or tools (quit)."""
+    """Handle commands from later launches, Explorer's menu, notifications and tools."""
 
-    def accept() -> None:
-        connection = server.nextPendingConnection()
-        if connection is None:
-            return
+    def serve(connection: QLocalSocket) -> None:
+        reader = commands.LineReader()
 
         def read() -> None:
-            command = bytes(connection.readAll().data()).strip()
-            if not command:
+            try:
+                received = [commands.decode(line) for line in reader.feed(_read_all(connection))]
+            except CommandError as exc:
+                log.warning("Ignored a command from another process: %s", exc)
+                connection.write(commands.REFUSED)
+                connection.flush()
+                connection.disconnectFromServer()
                 return
-            connection.write(ACK)
-            connection.flush()
-            if command == QUIT_COMMAND:
-                log.info("Quit requested by another process")
-                QTimer.singleShot(0, QApplication.quit)
-            else:
-                app.show_window()
+            for command in received:
+                connection.write(commands.ACK)
+                connection.flush()
+                app.receive(command)
 
         connection.readyRead.connect(read)
         connection.disconnected.connect(connection.deleteLater)
         if connection.bytesAvailable():
             read()
 
+    def accept() -> None:
+        while server.hasPendingConnections():
+            connection = server.nextPendingConnection()
+            if connection is not None:
+                serve(connection)
+
     server.newConnection.connect(accept)
 
 
-def run_app(*, verbose: bool = False, show: bool = True) -> int:
-    """Run the desktop app until the user quits. Returns the exit code."""
+def _read_all(connection: QLocalSocket) -> bytes:
+    return bytes(connection.readAll().data())
+
+
+def listen(name: str) -> QLocalServer:
+    """Listen for commands; only this Windows user's processes may connect."""
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    QLocalServer.removeServer(name)  # a stale name left by a crash
+    if not server.listen(name):
+        log.warning("Can't receive commands from other launches: %s", server.errorString())
+    return server
+
+
+def run_app(*, verbose: bool = False, show: bool = True, command: Command | None = None) -> int:
+    """Run the desktop app until the user quits, or hand ``command`` (or "show the window")
+    to the app that is already running. Returns the exit code."""
     _ensure_streams()
     _set_app_id()
     qapp = QApplication.instance() or QApplication(sys.argv[:1])
@@ -398,11 +521,18 @@ def run_app(*, verbose: bool = False, show: bool = True) -> int:
         return 1
     setup_logging(paths.log_dir, verbose=verbose)
 
-    service = AppService(paths)
     name = server_name(paths)
+    message = command or SHOW_COMMAND
+    # Hand the command to the running app (Explorer starts one launch per selected file).
+    if send_command(name, message):
+        log.info("AutoShelf is already running; handed it %s", message.action)
+        return 0
+    if message.action == commands.QUIT:
+        return 0  # nothing to quit
+    service = AppService(paths)
     if not service.acquire():
-        if send_command(name, SHOW_COMMAND):
-            log.info("AutoShelf is already running; showed its window instead")
+        # Another launch is starting the app right now, or `autoshelf watch` is running.
+        if send_command(name, message, wait_seconds=FORWARD_SECONDS):
             return 0
         holder = service.lock_holder()
         QMessageBox.warning(
@@ -414,13 +544,13 @@ def run_app(*, verbose: bool = False, show: bool = True) -> int:
         )
         return 1
 
-    server = QLocalServer()
-    QLocalServer.removeServer(name)  # a stale name left by a crash
-    server.listen(name)
+    server = listen(name)
     app = AutoShelfApp(service)
     _serve_commands(server, app)
     log.info("AutoShelf app started (data folder %s)", paths.home)
-    app.start(show=show)
+    app.start(show=show and command is None)
+    if command is not None:
+        app.receive(command)
     try:
         return qapp.exec()
     finally:
@@ -428,7 +558,15 @@ def run_app(*, verbose: bool = False, show: bool = True) -> int:
         app.shutdown()
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Entry point of the ``autoshelf-app`` command (and of the packaged AutoShelf.exe)."""
-    background = "--background" in sys.argv[1:]
-    sys.exit(run_app(verbose="--verbose" in sys.argv[1:], show=not background))
+    parser = argparse.ArgumentParser(prog="AutoShelf")
+    parser.add_argument("--verbose", "-v", action="store_true", help="log debug output")
+    parser.add_argument("--background", action="store_true", help="start in the tray")
+    commands.add_app_arguments(parser)
+    args = parser.parse_args(commands.safe_url_argv(list(sys.argv[1:] if argv is None else argv)))
+    try:
+        command = commands.from_args(args)
+    except CommandError as exc:
+        parser.error(str(exc))
+    sys.exit(run_app(verbose=args.verbose, show=not args.background, command=command))

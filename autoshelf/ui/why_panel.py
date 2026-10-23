@@ -4,7 +4,7 @@ import html
 from collections.abc import Mapping
 from pathlib import Path
 
-from PySide6.QtWidgets import QTextBrowser
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser, QVBoxLayout
 
 from autoshelf import reasons, wording
 
@@ -102,6 +102,28 @@ def why_html(details: Mapping | None, root: Path | None = None, headline: str = 
     if details.get("corrects"):
         parts.append(f"<p>You moved it here, correcting #{details['corrects']}.</p>")
     return "".join(parts)
+
+
+class WhyDialog(QDialog):
+    """ "Why is this here?" for one file (from Explorer's right-click menu)."""
+
+    def __init__(self, result, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Why is {result.path.name} here?")
+        self.resize(560, 360)
+        entry = result.entry
+        headline = wording.why_here(result.path, entry, result.here)
+        self.panel = WhyPanel()
+        root = Path(entry.root) if entry is not None and entry.root else None
+        details = entry.details if entry is not None and result.here else None
+        self.panel.setHtml(
+            why_html(details, root, headline) if details else f"<p>{html.escape(headline)}</p>"
+        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.panel, 1)
+        layout.addWidget(buttons)
 
 
 class WhyPanel(QTextBrowser):

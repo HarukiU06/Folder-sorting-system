@@ -129,20 +129,50 @@ def plan(
     Files whose proposal is the folder they are already in are left out. Without a
     library (no language model) only rules can propose anything.
     """
-    rules = repository.list_rules(conn, enabled_only=True)
     paths = files_in(folder, root, recursive=recursive, ignore_patterns=ignore_patterns)
-    proposals = []
+    proposals, _ = plan_files(
+        conn,
+        root,
+        library,
+        paths,
+        threshold=threshold,
+        margin=margin,
+        extractor=extractor,
+        progress=progress,
+    )
+    return proposals
+
+
+def plan_files(
+    conn: sqlite3.Connection,
+    root: Path,
+    library: LibraryIndex | None,
+    paths: Iterable[Path],
+    *,
+    threshold: float = DEFAULT_AUTO_THRESHOLD,
+    margin: float = DEFAULT_AUTO_MARGIN,
+    extractor: Callable[[Path], Extraction] = extract,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[Proposal], list[Path]]:
+    """Propose a folder for each of ``paths`` (already checked by the caller).
+
+    Returns the proposals and the files already in the folder AutoShelf would choose."""
+    rules = repository.list_rules(conn, enabled_only=True)
+    paths = list(paths)
+    proposals, in_place = [], []
     for done, path in enumerate(paths, start=1):
         try:
             proposal = _propose(conn, root, library, path, rules, threshold, margin, extractor)
         except OSError as exc:
             log.warning("Couldn't read %s: %s", path, exc)
-            proposal = None
-        if proposal is not None:
-            proposals.append(proposal)
+        else:
+            if proposal is None:
+                in_place.append(path)
+            else:
+                proposals.append(proposal)
         if progress is not None:
             progress(done, len(paths))
-    return proposals
+    return proposals, in_place
 
 
 def _propose(
@@ -191,27 +221,30 @@ def apply(
     proposals: Iterable[Proposal],
     *,
     folder: Path | None = None,
+    folders: Iterable[Path] = (),
     before_rename: BeforeRename | None = None,
 ) -> OrganizeResult:
     """Move every ticked proposal with a target, as one batch. Failures don't stop the rest.
 
-    ``folder`` is the folder that was organized: files outside the root are only taken
-    from inside it (it must have been checked with ``config.validate_outside_folder``).
+    ``folder`` is the folder that was organized (``folders``: several, for files chosen in
+    Explorer): files outside the root are only taken from inside them (each must have been
+    checked with ``config.validate_outside_folder``).
     A target the user changed from AutoShelf's suggestion is learned from, like an
     answer in the Inbox. Folders are never created: a missing target fails that row.
     """
     batch = uuid.uuid4().hex
     moved: list[MoveResult] = []
     failed: list[tuple[Path, str]] = []
+    allowed = ([folder] if folder is not None else []) + list(folders)
     for proposal in proposals:
         if not proposal.selected or not proposal.target:
             continue
         outside = None
         if not is_within(proposal.path, root):
-            if folder is None or not is_within(proposal.path, folder):
+            outside = next((item for item in allowed if is_within(proposal.path, item)), None)
+            if outside is None:
                 failed.append((proposal.path, "it is outside the folder being organized"))
                 continue
-            outside = folder
         details = {**proposal.details, "reason": proposal.why}
         if proposal.suggested:
             details["suggested"] = proposal.suggested

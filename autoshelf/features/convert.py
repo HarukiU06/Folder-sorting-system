@@ -69,6 +69,23 @@ class Job:
     to: str | None = None
 
 
+# What the formats are called in menus.
+FORMAT_LABELS = {
+    "pdf": "PDF",
+    "docx": "Word document (.docx; the layout is only approximated)",
+    "png": "PNG image",
+    "jpg": "JPG image",
+    "webp": "WEBP image",
+    "bmp": "BMP image",
+    "tiff": "TIFF image",
+}
+
+
+def label(to: str) -> str:
+    """ "PDF", "JPG image"... for a format."""
+    return FORMAT_LABELS.get(to, to.upper())
+
+
 # --- what can be done with a file ----------------------------------------------------------------
 
 

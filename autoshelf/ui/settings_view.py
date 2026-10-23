@@ -114,6 +114,15 @@ class SettingsView(QWidget):
         self.notifications.toggled.connect(self._notifications_changed)
         self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
         self.startup.toggled.connect(self._startup_changed)
+        self.explorer_menu = QCheckBox(
+            "Add AutoShelf to Explorer's right-click menu (on Windows 11: under "
+            "\u201cShow more options\u201d)"
+        )
+        self.explorer_menu.setToolTip(
+            "Sort with AutoShelf, Why is this here?, Compress, and Convert for the file "
+            "types AutoShelf can convert"
+        )
+        self.explorer_menu.toggled.connect(self._explorer_menu_changed)
         self.calibrate_button = QPushButton("How well would AutoShelf sort my library?")
         self.calibrate_button.setToolTip(
             "Sorts every file in your folders as if it had just arrived and compares the "
@@ -141,6 +150,7 @@ class SettingsView(QWidget):
         sorting.addWidget(self.paused)
         sorting.addWidget(self.notifications)
         sorting.addWidget(self.startup)
+        sorting.addWidget(self.explorer_menu)
 
         # Files
         self.stable = QDoubleSpinBox()
@@ -336,6 +346,13 @@ class SettingsView(QWidget):
             self.startup.blockSignals(False)
 
         self.runner.run(self.service.starts_with_windows, startup_loaded, lambda exc: None)
+
+        def menu_loaded(added: bool) -> None:
+            self.explorer_menu.blockSignals(True)
+            self.explorer_menu.setChecked(added)
+            self.explorer_menu.blockSignals(False)
+
+        self.runner.run(self.service.explorer_menu, menu_loaded, lambda exc: None)
         self.runner.run(self.service.skipped_files, self.show_skipped, lambda exc: None)
 
     def show_skipped(self, skipped) -> None:
@@ -495,6 +512,13 @@ class SettingsView(QWidget):
             self.load()
 
         self.runner.run(lambda: self.service.set_start_with_windows(enabled), None, failed)
+
+    def _explorer_menu_changed(self, enabled: bool) -> None:
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "Couldn't change Explorer's menu", str(exc))
+            self.load()
+
+        self.runner.run(lambda: self.service.set_explorer_menu(enabled), None, failed)
 
     def _apply_files(self) -> None:
         patterns = [line.strip() for line in self.patterns.toPlainText().splitlines()]

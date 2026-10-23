@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from autoshelf import llm
+from autoshelf import links, llm
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
@@ -886,15 +886,65 @@ class AppService:
         else:
             explorer.remove()
 
-    def repair_explorer_menu(self) -> bool:
-        """Point the menu at this copy of AutoShelf if the program it starts is gone (the app
-        was moved). Returns True if it was changed."""
+    def notification_buttons(self) -> bool:
+        """True if notifications can have buttons (``autoshelf:`` links reach AutoShelf)."""
         from autoshelf import explorer
 
+        return explorer.link_ready()
+
+    def set_notification_buttons(self, enabled: bool) -> None:
+        """Register the ``autoshelf:`` link for this copy of AutoShelf (the installer does this
+        too), or remove it."""
+        from autoshelf import explorer
+
+        if enabled:
+            explorer.add_link()
+        else:
+            explorer.remove_link()
+
+    def repair_integration(self) -> bool:
+        """Point the menu and the ``autoshelf:`` link at this copy of AutoShelf if the program
+        they start is gone (the app was moved). Returns True if anything changed."""
+        from autoshelf import explorer
+
+        changed = False
         if explorer.is_broken():
             explorer.add()
-            return True
-        return False
+            changed = True
+        program = explorer.link_program()
+        if program is not None and not program.exists():
+            explorer.add_link()
+            changed = True
+        return changed
+
+    # --- notification buttons -----------------------------------------------------------
+
+    def offer(self, path: Path, folders: list[str]) -> str:
+        """Remember what a notification about a waiting file offers; returns the token its
+        links carry."""
+        with self._connect() as conn:
+            return links.make_offer(conn, path, folders)
+
+    def offered_file(self, token: str) -> Path | None:
+        """The file a notification was about, if the notification is still current."""
+        with self._connect() as conn:
+            try:
+                return links.get_offer(conn, token).path
+            except links.LinkError:
+                return None
+
+    def answer_offer(self, token: str, choice: int) -> tuple[MoveResult, str]:
+        """Put the file a notification was about into the folder of the button clicked
+        (AutoShelf learns from it, as from the Inbox). Each notification can be answered
+        once: raises LinkError for an answered or old one, and AssignError if the file no
+        longer waits in the Inbox."""
+        with self._connect() as conn:
+            offer = links.get_offer(conn, token)
+            if choice >= len(offer.folders):
+                raise links.LinkError("That button offered no folder.")
+            links.use_offer(conn, token)
+        folder = offer.folders[choice]
+        return self.assign(offer.path, folder), folder
 
     # --- optional AI (off by default) ---------------------------------------------------
 

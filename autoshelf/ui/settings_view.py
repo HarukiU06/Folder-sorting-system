@@ -123,6 +123,14 @@ class SettingsView(QWidget):
             "types AutoShelf can convert"
         )
         self.explorer_menu.toggled.connect(self._explorer_menu_changed)
+        self.buttons = QCheckBox(
+            "Buttons in notifications: put a file away without opening AutoShelf"
+        )
+        self.buttons.setToolTip(
+            "Registers AutoShelf with Windows for its notifications (the installer does this "
+            "too). Without it, a notification opens the Inbox when you click it."
+        )
+        self.buttons.toggled.connect(self._buttons_changed)
         self.calibrate_button = QPushButton("How well would AutoShelf sort my library?")
         self.calibrate_button.setToolTip(
             "Sorts every file in your folders as if it had just arrived and compares the "
@@ -151,6 +159,7 @@ class SettingsView(QWidget):
         sorting.addWidget(self.notifications)
         sorting.addWidget(self.startup)
         sorting.addWidget(self.explorer_menu)
+        sorting.addWidget(self.buttons)
 
         # Files
         self.stable = QDoubleSpinBox()
@@ -353,6 +362,13 @@ class SettingsView(QWidget):
             self.explorer_menu.blockSignals(False)
 
         self.runner.run(self.service.explorer_menu, menu_loaded, lambda exc: None)
+
+        def buttons_loaded(ready: bool) -> None:
+            self.buttons.blockSignals(True)
+            self.buttons.setChecked(ready)
+            self.buttons.blockSignals(False)
+
+        self.runner.run(self.service.notification_buttons, buttons_loaded, lambda exc: None)
         self.runner.run(self.service.skipped_files, self.show_skipped, lambda exc: None)
 
     def show_skipped(self, skipped) -> None:
@@ -519,6 +535,13 @@ class SettingsView(QWidget):
             self.load()
 
         self.runner.run(lambda: self.service.set_explorer_menu(enabled), None, failed)
+
+    def _buttons_changed(self, enabled: bool) -> None:
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "Couldn't change the notification buttons", str(exc))
+            self.load()
+
+        self.runner.run(lambda: self.service.set_notification_buttons(enabled), None, failed)
 
     def _apply_files(self) -> None:
         patterns = [line.strip() for line in self.patterns.toPlainText().splitlines()]

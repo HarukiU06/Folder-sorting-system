@@ -115,7 +115,9 @@ class WhyDialog(QDialog):
         headline = wording.why_here(result.path, entry, result.here)
         self.panel = WhyPanel()
         root = Path(entry.root) if entry is not None and entry.root else None
-        details = entry.details if entry is not None and result.here else None
+        # A move's details explain it; for a file AutoShelf made, the headline says it all.
+        explained = entry is not None and result.here and entry.action in ("move", "rename")
+        details = entry.details if explained else None
         self.panel.setHtml(
             why_html(details, root, headline) if details else f"<p>{html.escape(headline)}</p>"
         )

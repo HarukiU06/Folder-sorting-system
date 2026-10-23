@@ -15,6 +15,8 @@ ICON = ROOT / "build" / "autoshelf.ico"
 
 # Extractors are imported by name when a file type is first seen, so name them all.
 hidden_imports = collect_submodules("autoshelf")
+# Notifications with buttons: winrt is a namespace package of compiled modules.
+hidden_imports += collect_submodules("winrt") + collect_submodules("windows_toasts")
 
 # transformers checks the versions of its dependencies through their package metadata.
 datas = []
@@ -38,6 +40,10 @@ for package in (
         datas += copy_metadata(package)
     except Exception:  # noqa: BLE001 (a missing optional package is fine)
         pass
+
+# The icon as a file, for Windows' notifications and the autoshelf: link (explorer.py).
+if ICON.exists():
+    datas.append((str(ICON), "."))
 
 excludes = ["tkinter", "matplotlib", "IPython", "pytest", "pytestqt", "ruff", "PyInstaller"]
 

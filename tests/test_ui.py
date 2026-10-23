@@ -3,6 +3,7 @@
 import html
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -452,6 +453,66 @@ def test_the_app_refuses_nonsense(qtbot, tmp_path: Path) -> None:
     server.close()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipes are Windows'")
+def test_a_launch_knows_which_process_it_talks_to(qtbot, tmp_path: Path) -> None:
+    import os
+
+    from PySide6.QtNetwork import QLocalSocket
+
+    name = app_module.server_name(AppPaths(tmp_path))
+    server = app_module.listen(name)
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    assert socket.waitForConnected(WAIT_MS)
+    assert app_module.server_process(socket) == os.getpid()
+    socket.abort()
+    server.close()
+
+
+QUITTING_APP = """
+import sys, time
+from PySide6.QtCore import QCoreApplication, QTimer
+from autoshelf.ui import app as app_module
+
+class Slow:
+    def receive(self, command):
+        QTimer.singleShot(1500, QCoreApplication.quit)  # shutting down takes a while
+
+qapp = QCoreApplication([])
+server = app_module.listen(sys.argv[1])
+app_module._serve_commands(server, Slow())
+print("listening", flush=True)
+qapp.exec()
+time.sleep(1)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="waits on a Windows process handle")
+def test_quit_waits_until_the_app_has_ended(tmp_path: Path) -> None:
+    name = app_module.server_name(AppPaths(tmp_path))
+    running = subprocess.Popen(
+        [sys.executable, "-c", QUITTING_APP, name], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert running.stdout.readline().strip() == "listening"
+        started = time.monotonic()
+        assert app_module.send_command(name, app_module.QUIT_COMMAND, exit_seconds=20)
+        assert time.monotonic() - started >= 2.0  # it waited for the app to end (~2.5 s)
+        running.wait(timeout=10)
+    finally:
+        running.kill()
+
+
+def test_why_for_a_file_autoshelf_made(qtbot, service: AppService, shelf: Path) -> None:
+    from autoshelf.ui.why_panel import WhyDialog
+
+    made = service.compress([shelf / "Finance" / "invoice 2024.txt"])
+    dialog = WhyDialog(service.why_here(made.dst))
+    qtbot.addWidget(dialog)
+    text = dialog.panel.toPlainText()
+    assert text.count("a ZIP of invoice 2024.txt") == 1  # said once
+
+
 def test_quit_and_show_commands(qtbot, app, monkeypatch: pytest.MonkeyPatch) -> None:
     quits = []
     monkeypatch.setattr(app_module.QApplication, "quit", lambda: quits.append(True))
@@ -478,6 +539,8 @@ def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: 
     page = app.window.tidy.organize
     qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
     assert app.window.tabs.currentWidget() is app.window.tidy
+    assert page.source.currentText() == "Files chosen in Explorer"
+    assert page.table.item(0, 2).text() == "Downloads"  # the folder, not its whole path
     assert page.table.cellWidget(0, 3).currentText() == "Finance"
     page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
     page.apply()
@@ -1233,3 +1296,75 @@ def test_an_inbox_answer_can_become_a_rule(
         settle(qtbot, runner)
     assert asked and "into Finance. Make this a rule?" in asked[0]
     assert [rule.target_folder for rule in service.rules()] == ["Finance"]
+
+
+# --- Phase 14: notification buttons ----------------------------------------------------------
+
+
+class FakeToaster:
+    def __init__(self, broken: bool = False) -> None:
+        self.notes = []
+        self.broken = broken
+
+    def show(self, note) -> None:
+        if self.broken:
+            raise OSError("no notifications here")
+        self.notes.append(note)
+
+
+def test_notification_buttons_put_a_file_away(
+    qtbot, service: AppService, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toaster = FakeToaster()
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    app._notifications = True
+    app.start(show=False)
+    try:
+        make(shelf / "notes.txt", "call mom buy milk")
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        note = toaster.notes[0]
+        assert note.title == "Where should notes.txt go?" and note.dismiss == "Leave in Inbox"
+        folder, url = note.buttons[0]
+
+        app.receive(Command(commands.URL, url=url))  # Windows ran: AutoShelf.exe --url <url>
+        qtbot.waitUntil(lambda: (shelf / folder / "notes.txt").exists(), timeout=WAIT_MS)
+        status = app.window.statusBar()
+        qtbot.waitUntil(lambda: "Put notes.txt into" in status.currentMessage(), timeout=WAIT_MS)
+
+        warnings = []
+        monkeypatch.setattr(app_module.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+        app.run_command(Command(commands.URL, url=url))  # the same button again
+        qtbot.waitUntil(lambda: bool(warnings), timeout=WAIT_MS)
+        assert "already been answered" in warnings[0]
+        assert (shelf / folder / "notes.txt").exists()
+    finally:
+        app.shutdown()
+
+
+def test_a_click_on_the_notification_opens_the_inbox(qtbot, app, shelf: Path) -> None:
+    waiting = make(shelf / "_Inbox" / "scan.txt", "x")
+    token = app.service.offer(waiting, ["Finance"])
+    app.run_command(Command(commands.URL, url=f"autoshelf:inbox?offer={token}"))
+    qtbot.waitUntil(lambda: app.window.isVisible(), timeout=WAIT_MS)
+    assert app.window.tabs.currentWidget() is app.window.inbox
+    app.run_command(Command(commands.URL, url="autoshelf:nonsense"))  # ignored, no error
+
+
+def test_without_buttons_notifications_still_arrive(
+    qtbot, service: AppService, shelf: Path
+) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: FakeToaster(broken=True))
+    qtbot.addWidget(app.window)
+    app._notifications = True
+    app.start(show=False)
+    try:
+        make(shelf / "notes.txt", "call mom buy milk")
+        status = app.window.statusBar()
+        qtbot.waitUntil(
+            lambda: "Where should notes.txt go?" in status.currentMessage(), timeout=WAIT_MS
+        )
+    finally:
+        app.shutdown()

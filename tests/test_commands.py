@@ -162,14 +162,16 @@ def test_a_menu_whose_program_is_gone_is_repaired(
     fake_registry: FakeRegistry, paths: AppPaths, tmp_path: Path
 ) -> None:
     service = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
-    assert not service.repair_explorer_menu()  # not added: left alone
+    assert not service.repair_integration()  # not added: left alone
     other_copy = make(tmp_path / "other copy" / "AutoShelf.exe", "")
     explorer.add(command=f'"{other_copy}"', targets=fake_targets)
-    assert not service.repair_explorer_menu()  # another copy that exists: left alone
+    explorer.add_link(command=f'"{other_copy}"')
+    assert not service.repair_integration()  # another copy that exists: left alone
     other_copy.unlink()
-    assert service.repair_explorer_menu()
+    assert service.repair_integration()
     assert explorer.program().exists()  # now this copy (here: the Python running the tests)
-    assert not service.repair_explorer_menu()
+    assert explorer.link_ready()
+    assert not service.repair_integration()
     service.set_explorer_menu(False)
     assert not service.explorer_menu()
 

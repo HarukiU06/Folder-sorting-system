@@ -204,6 +204,9 @@ class VersionsPage(QWidget):
             show_in_explorer(Path(item.data(0, PATH_ROLE)))
 
 
+FILES_CHOICE = "Files chosen in Explorer"
+
+
 def sort_plan_note(plan) -> str:
     """What else to say about files chosen in Explorer: already in place, or refused."""
     lines = []
@@ -284,6 +287,8 @@ class OrganizePage(QWidget):
         self.source.addItem("_Inbox")
         self.source.addItems(self._folders)
         self.source.addItem(OTHER_CHOICE)
+        if self._files:
+            self.source.insertItem(0, FILES_CHOICE)
         if current and self.source.findText(current) >= 0:
             self.source.setCurrentText(current)
 
@@ -301,6 +306,9 @@ class OrganizePage(QWidget):
 
     def preview(self) -> None:
         """Propose a folder for every file (in the background)."""
+        if self.source.currentText() == FILES_CHOICE and self._files:
+            self.preview_files(self._files)
+            return
         folder = self._chosen_folder()
         if folder is None:
             return
@@ -325,8 +333,12 @@ class OrganizePage(QWidget):
         self._proposals = []
         self._update_buttons()
 
+        self._folder, self._files = None, list(paths)
+        if self.source.findText(FILES_CHOICE) < 0:
+            self.source.insertItem(0, FILES_CHOICE)
+        self.source.setCurrentText(FILES_CHOICE)
+
         def planned(plan) -> None:
-            self._folder, self._files = None, list(paths)
             self._show(plan.proposals, sort_plan_note(plan))
 
         def failed(exc: Exception) -> None:
@@ -348,7 +360,11 @@ class OrganizePage(QWidget):
             name = QTableWidgetItem(proposal.path.name)
             name.setToolTip(str(proposal.path))
             self.table.setItem(row, 1, name)
-            self.table.setItem(row, 2, QTableWidgetItem(proposal.current))
+            # A folder outside the root is shown by its name (the whole path as a tooltip).
+            current = Path(proposal.current)
+            now_in = QTableWidgetItem(current.name if current.is_absolute() else proposal.current)
+            now_in.setToolTip(proposal.current)
+            self.table.setItem(row, 2, now_in)
             target = QComboBox()
             target.addItem(LEAVE)
             target.addItems(self._folders)

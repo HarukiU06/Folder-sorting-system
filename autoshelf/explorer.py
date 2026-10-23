@@ -1,12 +1,16 @@
-"""Explorer's right-click menu (SPEC Phase 14): per-user registry keys, no administrator
-rights needed.
+"""Explorer's right-click menu and the ``autoshelf:`` link (SPEC Phase 14): per-user
+registry keys, no administrator rights needed.
 
 All files get an "AutoShelf" submenu: "Sort with AutoShelf", "Why is this here?" and
 "Compress". Files AutoShelf can convert also get "Convert with AutoShelf" with the formats
 that file type allows. Each entry starts the app with an option (``AutoShelf.exe --sort
 "<file>"``), which hands the command to the running app. On Windows 11 the entries are under
-"Show more options". The installer removes the same keys on uninstall
-(packaging/autoshelf.iss lists them; a test keeps both in step).
+"Show more options".
+
+Notification buttons open ``autoshelf:`` links (see ``autoshelf.links``), which Windows
+hands to AutoShelf once the link is registered here, together with the app's name and icon
+for notifications (its AppUserModelID). The installer registers both itself and removes all
+these keys on uninstall (packaging/autoshelf.iss lists them; a test keeps both in step).
 """
 
 import contextlib
@@ -26,6 +30,10 @@ CONVERT_SUFFIXES = tuple(
         convert.IMAGE_SUFFIXES | convert.HEIC_SUFFIXES | {".pdf"} | frozenset(convert.OFFICE_KINDS)
     )
 )
+LINK_KEY = CLASSES + r"\autoshelf"
+APP_ID = "HarukiU06.AutoShelf"  # the AppUserModelID: taskbar group and notifications
+APP_ID_KEY = rf"{CLASSES}\AppUserModelId\{APP_ID}"
+ICON_FILE = "autoshelf.ico"  # bundled next to the packaged app's files
 # verb key, label, option, which selections it is offered for
 MENU = (
     ("1sort", "Sort with AutoShelf", "--sort", "Player"),  # any number of files
@@ -117,9 +125,7 @@ def program(registry: Registry | None = None) -> Path | None:
         command = _registry(registry).get(rf"{MENU_KEY}\shell\1sort\command")
     except OSError as exc:
         raise ExplorerError(f"Couldn't read Explorer's menu: {exc}") from exc
-    if not command or not command.startswith('"'):
-        return None
-    return Path(command[1:].split('"', 1)[0])
+    return _program_of(command)
 
 
 def is_broken(registry: Registry | None = None) -> bool:
@@ -191,6 +197,70 @@ def _add_convert(
         registry.set(entry, "MUIVerb", convert.label(to))
         registry.set(entry, "MultiSelectModel", "Player")
         registry.set(rf"{entry}\command", "", _entry(command, f"--convert {to}"))
+
+
+# --- the autoshelf: link (notification buttons) ---------------------------------------------
+
+
+def add_link(registry: Registry | None = None, *, command: str | None = None) -> None:
+    """Let Windows hand ``autoshelf:`` links to this copy of AutoShelf, and give its
+    notifications the name AutoShelf (and its icon)."""
+    registry = _registry(registry)
+    command = command or app_command()
+    try:
+        registry.set(LINK_KEY, "", "URL:AutoShelf")
+        registry.set(LINK_KEY, "URL Protocol", "")
+        registry.set(rf"{LINK_KEY}\shell\open\command", "", f'{command} --url "%1"')
+        registry.set(APP_ID_KEY, "DisplayName", "AutoShelf")
+        icon = icon_file()
+        if icon is not None:
+            registry.set(LINK_KEY + r"\DefaultIcon", "", str(icon))
+            registry.set(APP_ID_KEY, "IconUri", str(icon))
+    except OSError as exc:
+        raise ExplorerError(f"Couldn't register the autoshelf: link: {exc}") from exc
+
+
+def remove_link(registry: Registry | None = None) -> None:
+    """Stop handing ``autoshelf:`` links to AutoShelf (notifications lose their buttons)."""
+    registry = _registry(registry)
+    try:
+        registry.delete_tree(LINK_KEY)
+        registry.delete_tree(APP_ID_KEY)
+    except OSError as exc:
+        raise ExplorerError(f"Couldn't remove the autoshelf: link: {exc}") from exc
+
+
+def link_program(registry: Registry | None = None) -> Path | None:
+    """The program ``autoshelf:`` links start, if they are registered."""
+    if registry is None and sys.platform != "win32":
+        return None
+    try:
+        command = _registry(registry).get(rf"{LINK_KEY}\shell\open\command")
+    except OSError as exc:
+        raise ExplorerError(f"Couldn't read the autoshelf: link: {exc}") from exc
+    return _program_of(command)
+
+
+def link_ready(registry: Registry | None = None) -> bool:
+    """True if ``autoshelf:`` links reach an AutoShelf that exists (so notification buttons
+    work)."""
+    started = link_program(registry)
+    return started is not None and started.exists()
+
+
+def icon_file() -> Path | None:
+    """AutoShelf's icon as a file, in the packaged app (None when running from source)."""
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle is None:
+        return None
+    icon = Path(bundle) / ICON_FILE
+    return icon if icon.exists() else None
+
+
+def _program_of(command: str | None) -> Path | None:
+    if not command or not command.startswith('"'):
+        return None
+    return Path(command[1:].split('"', 1)[0])
 
 
 def _entry(command: str, option: str) -> str:

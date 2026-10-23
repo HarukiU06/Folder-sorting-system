@@ -19,13 +19,14 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from autoshelf import commands
+from autoshelf import commands, explorer, links
 from autoshelf.app_service import AppService, WhyHere
 from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import calibrate as calibration
 from autoshelf.pipeline import Outcome
+from autoshelf.toasts import Note, Toaster, default_toaster
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.main_window import MainWindow
 from autoshelf.ui.tasks import TaskRunner
@@ -34,7 +35,7 @@ from autoshelf.ui.why_panel import WhyDialog
 
 log = logging.getLogger(__name__)
 
-APP_USER_MODEL_ID = "HarukiU06.AutoShelf"
+APP_USER_MODEL_ID = explorer.APP_ID
 NOTIFY_DELAY_MSECS = 1500  # files arriving together get one notification
 REFRESH_DELAY_MSECS = 700
 # Explorer starts one AutoShelf per selected file; what arrives within this long of the
@@ -42,6 +43,8 @@ REFRESH_DELAY_MSECS = 700
 BATCH_MSECS = 1500
 # How long a launch keeps trying to reach the app another launch is starting.
 FORWARD_SECONDS = 20.0
+# How long ``--quit`` waits for the app to end (the uninstaller then removes its files).
+QUIT_SECONDS = 20.0
 SHOW_COMMAND = Command(commands.SHOW)
 QUIT_COMMAND = Command(commands.QUIT)
 
@@ -65,6 +68,31 @@ def notification_text(outcomes: list[Outcome]) -> tuple[str, str]:
     return f"{len(names)} files need your decision", f"{shown}. Click to open your Inbox."
 
 
+def notification_note(outcomes: list[Outcome], offer: Callable[[Path, list[str]], str]) -> Note:
+    """A notification with buttons: for one file, its best folders (and "Leave in Inbox");
+    a click on it opens the Inbox. ``offer(path, folders)`` stores what the buttons offer
+    and returns the token their links carry (see ``autoshelf.links``)."""
+    title, message = notification_text(outcomes)
+    if len(outcomes) == 1:
+        outcome = outcomes[0]
+        top = outcome.classification.top(3) if outcome.classification else ()
+        folders = [score.folder for score in top]
+        if folders:
+            token = offer(outcome.dst or outcome.path, folders)
+            guesses = ", ".join(f"{score.folder} {score.score:.2f}" for score in top)
+            return Note(
+                title,
+                f"Best guesses: {guesses}. Pick one, or click to see the file.",
+                launch=links.link(links.INBOX, token),
+                buttons=tuple(
+                    (folder, links.link(links.ASSIGN, token, number))
+                    for number, folder in enumerate(folders)
+                ),
+                dismiss="Leave in Inbox",
+            )
+    return Note(title, message, launch=links.link(links.INBOX))
+
+
 class AutoShelfApp(QObject):
     """Connects the AppService, the window and the tray. Lives on the GUI thread."""
 
@@ -72,8 +100,15 @@ class AutoShelfApp(QObject):
     status_arrived = Signal(str)
     learned_arrived = Signal(object)
 
-    def __init__(self, service: AppService, *, tray: Tray | None = None) -> None:
+    def __init__(
+        self,
+        service: AppService,
+        *,
+        tray: Tray | None = None,
+        toaster: Callable[[], Toaster | None] = default_toaster,
+    ) -> None:
         super().__init__()
+        self._toaster = toaster
         self.service = service
         self.runner = TaskRunner(self)
         self.runner.on_error = self._task_failed
@@ -124,7 +159,7 @@ class AutoShelfApp(QObject):
             QTimer.singleShot(0, self.choose_root)
             return
         self.service.start()
-        self.runner.run(self.service.repair_explorer_menu, None, lambda exc: None)
+        self.runner.run(self.service.repair_integration, None, lambda exc: None)
         self.window.set_state("Paused" if settings.paused else "Starting...")
         self.window.refresh_all()
         if show:
@@ -323,8 +358,42 @@ class AutoShelfApp(QObject):
         elif command.action == commands.CONVERT:
             to = command.to or ""
             self.make(lambda: self.service.convert(files, to))
-        else:
+        elif command.action == commands.URL:
+            self.open_link(command.url or "")
+
+    def open_link(self, url: str) -> None:
+        """Follow an ``autoshelf:`` link from a notification: open the Inbox, or put the
+        file into the folder on the button clicked."""
+        try:
+            link = links.parse(url)
+        except links.LinkError as exc:
+            log.warning("Ignored a link: %s", exc)
+            return
+        if link.action == links.ASSIGN and link.offer is not None and link.choice is not None:
+            token, choice = link.offer, link.choice
+
+            def answered(result) -> None:
+                moved, folder = result
+                self.window.inbox.refresh()
+                self.window.history.refresh()
+                self._tell(
+                    f"Put {moved.dst.name} into {folder}",
+                    "AutoShelf learns from your choice. Undo it in History.",
+                )
+
+            self.runner.run(
+                lambda: self.service.answer_offer(token, choice),
+                answered,
+                lambda exc: self._warn("Couldn't put the file away", str(exc)),
+            )
+            return
+        token = link.offer
+
+        def show(path: Path | None) -> None:
             self.show_window()
+            self.window.show_inbox(path)
+
+        self.runner.run(lambda: self.service.offered_file(token) if token else None, show)
 
     def explain(self, path: Path) -> None:
         """Show why a file is where it is."""
@@ -381,8 +450,23 @@ class AutoShelfApp(QObject):
             return
         title, message = notification_text(pending)
         self._notify_path = pending[0].dst if len(pending) == 1 else None
-        if not self.tray.notify(title, message):
-            self.window.show_message(f"{title} {message}")
+
+        def with_buttons() -> bool:
+            toaster = self._toaster()
+            if toaster is None:
+                return False
+            toaster.show(notification_note(pending, self.service.offer))
+            return True
+
+        def plain(shown: bool) -> None:
+            if not shown and not self.tray.notify(title, message):
+                self.window.show_message(f"{title} {message}")
+
+        def failed(exc: Exception) -> None:
+            log.warning("Couldn't show a notification with buttons: %s", exc)
+            plain(False)
+
+        self.runner.run(with_buttons, plain, failed)
 
     def _open_inbox_from_tray(self) -> None:
         self.show_window()
@@ -425,14 +509,21 @@ def server_name(paths: AppPaths) -> str:
 
 
 def send_command(
-    name: str, command: Command, *, wait_seconds: float = 0.0, timeout_ms: int = 3000
+    name: str,
+    command: Command,
+    *,
+    wait_seconds: float = 0.0,
+    timeout_ms: int = 3000,
+    exit_seconds: float = 0.0,
 ) -> bool:
     """Send a command to the app running for a data folder.
 
     Returns True once the app has acknowledged it. With ``wait_seconds``, keeps trying to
     connect that long (another launch may be starting the app) and waits as long for the
-    answer. A command is written at most once, so it never runs twice. Blocks, so the
-    receiving app must be in another process (or thread).
+    answer. A command is written at most once, so it never runs twice. With
+    ``exit_seconds``, also waits that long for the app's process to end (``--quit`` from
+    the uninstaller, so no file is still in use). Blocks, so the receiving app must be in
+    another process (or thread).
     """
     deadline = time.monotonic() + wait_seconds
     socket = QLocalSocket()
@@ -444,6 +535,11 @@ def send_command(
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.2)
+    app_process = server_process(socket)
+    if app_process is not None:
+        # This launch may come to the front (Explorer started it for a click); let the
+        # app it hands over to bring its window forward instead.
+        _allow_foreground(app_process)
     socket.write(commands.encode(command))
     socket.flush()
     answer = b""
@@ -454,7 +550,49 @@ def send_command(
             break
         answer += bytes(socket.readAll().data())
     socket.disconnectFromServer()
-    return answer == commands.ACK
+    acknowledged = answer == commands.ACK
+    if acknowledged and exit_seconds > 0 and app_process is not None:
+        _wait_for_exit(app_process, exit_seconds)
+    return acknowledged
+
+
+def server_process(socket: QLocalSocket) -> int | None:
+    """The process ID of the app at the other end of a connected socket (Windows only)."""
+    if sys.platform != "win32":
+        return None
+    from ctypes import wintypes
+
+    get_pid = ctypes.windll.kernel32.GetNamedPipeServerProcessId
+    get_pid.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG))
+    get_pid.restype = wintypes.BOOL
+    pid = wintypes.ULONG()
+    if not get_pid(int(socket.socketDescriptor()), ctypes.byref(pid)):
+        return None
+    return int(pid.value)
+
+
+def _allow_foreground(pid: int) -> None:
+    with contextlib.suppress(AttributeError, OSError):
+        ctypes.windll.user32.AllowSetForegroundWindow(pid)
+
+
+def _wait_for_exit(pid: int, seconds: float) -> None:
+    """Wait until a process has ended (or ``seconds`` have passed)."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    synchronize = 0x00100000
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        return  # already gone
+    try:
+        kernel32.WaitForSingleObject(handle, int(seconds * 1000))
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _serve_commands(server: QLocalServer, app: "AutoShelfApp") -> None:
@@ -524,7 +662,8 @@ def run_app(*, verbose: bool = False, show: bool = True, command: Command | None
     name = server_name(paths)
     message = command or SHOW_COMMAND
     # Hand the command to the running app (Explorer starts one launch per selected file).
-    if send_command(name, message):
+    quitting = message.action == commands.QUIT
+    if send_command(name, message, exit_seconds=QUIT_SECONDS if quitting else 0.0):
         log.info("AutoShelf is already running; handed it %s", message.action)
         return 0
     if message.action == commands.QUIT:
@@ -560,6 +699,7 @@ def run_app(*, verbose: bool = False, show: bool = True, command: Command | None
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Entry point of the ``autoshelf-app`` command (and of the packaged AutoShelf.exe)."""
+    _ensure_streams()  # argparse writes its errors to stderr, which is None without a console
     parser = argparse.ArgumentParser(prog="AutoShelf")
     parser.add_argument("--verbose", "-v", action="store_true", help="log debug output")
     parser.add_argument("--background", action="store_true", help="start in the tray")

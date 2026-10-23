@@ -178,6 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="AutoShelf in Explorer's right-click menu (Sort, Why is this here?, Compress, "
         "Convert)",
     )
+    config.add_argument(
+        "--notification-buttons",
+        choices=["on", "off"],
+        help="folder buttons in notifications (registers the autoshelf: link with Windows)",
+    )
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
     why.add_argument("id", type=int, help="history entry (see: autoshelf history)")
@@ -748,6 +753,13 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
             explorer.add()
         else:
             explorer.remove()
+    if args.notification_buttons is not None:
+        from autoshelf import explorer
+
+        if args.notification_buttons == "on":
+            explorer.add_link()
+        else:
+            explorer.remove_link()
     if args.api_key:
         from autoshelf.llm.secrets import set_api_key
 
@@ -786,6 +798,7 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
 
     print(f"Start with Windows: {'on' if startup.is_enabled() else 'off'}")
     print(f"Explorer menu:    {'on' if explorer.is_added() else 'off'}")
+    print(f"Notification buttons: {'on' if explorer.link_ready() else 'off'}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(

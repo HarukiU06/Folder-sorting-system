@@ -1,0 +1,57 @@
+name: release
+
+# Push a tag such as v0.2.0 (matching autoshelf.__version__) to build the app and its
+# installer and attach both to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+# Creating the release needs write access to the repository's contents.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\python.exe -m pip install -e ".[build]"
+
+      - name: Check the version
+        run: |
+          $version = (.venv\Scripts\python.exe -c "import autoshelf; print(autoshelf.__version__)").Trim()
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "The tag ${{ github.ref_name }} doesn't match autoshelf.__version__ ($version)"
+          }
+
+      - name: Build the app
+        run: powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+
+      - name: Build the installer
+        run: |
+          choco install innosetup --no-progress -y
+          powershell -ExecutionPolicy Bypass -File packaging\installer.ps1
+
+      - name: Zip the app
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          7z a -tzip "dist\AutoShelf-$version-windows.zip" ".\dist\AutoShelf"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          gh release create "${{ github.ref_name }}" `
+            "dist\AutoShelf-$version-setup.exe" `
+            "dist\AutoShelf-$version-windows.zip" `
+            --title "AutoShelf $version" --generate-notes

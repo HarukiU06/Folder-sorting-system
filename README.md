@@ -96,14 +96,19 @@ start paused so you can look first. AutoShelf then lives in the system tray:
   kept, the most corrected folders, and files untouched for six months (not changed, added
   or opened from AutoShelf: Windows doesn't reliably record when you open a file elsewhere).
 - **Ask** (only with AI on): questions about your files, answered with citations.
-- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
-  which files to ignore, how often to look for missed files, files sorted by name only (to
-  read them again), and other folders to watch (optional, e.g. Downloads).
+- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications
+  (and their buttons), start with Windows, the Explorer menu, which files to ignore, how
+  often to look for missed files, files sorted by name only (to read them again), and other
+  folders to watch (optional, e.g. Downloads).
 
 When a file needs your decision, a notification asks "Where should *file* go?" with the best
-guesses; click it to open the Inbox with that file selected. (Notifications have no buttons
-of their own: answering from inside a notification needs the app to be registered with
-Windows by an installer, and AutoShelf installs nothing.) The tray menu can pause sorting: new files then wait until you resume.
+guesses; click it to open the Inbox with that file selected. When AutoShelf is installed
+with the installer (or Settings → "Buttons in notifications" is on), the notification also
+has a button for each of the best three folders and "Leave in Inbox": a folder button puts
+the file there (AutoShelf learns from it, as from the Inbox, and History can undo it), even
+if AutoShelf was closed in the meantime. The buttons open `autoshelf:` links, which carry
+only a random code that works once and expires after 14 days, never a file name, so a link
+on a web page can't make AutoShelf move anything. The tray menu can pause sorting: new files then wait until you resume.
 Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.
@@ -150,6 +155,30 @@ and `autoshelf-cli.exe`, the command line. Copy the whole folder anywhere and ru
 source. The build uses a hand-written PyInstaller spec (`packaging\autoshelf.spec`) and
 builds one folder rather than one file, so it starts quickly and its libraries stay
 replaceable.
+
+### The installer
+
+```powershell
+winget install JRSoftware.InnoSetup                                # once: Inno Setup 6
+powershell -ExecutionPolicy Bypass -File packaging\installer.ps1   # after build.ps1
+```
+
+This makes `dist\AutoShelf-<version>-setup.exe` (`packaging\autoshelf.iss`). It installs for
+your Windows user only, without administrator rights, into
+`%LOCALAPPDATA%\Programs\AutoShelf`, with a Start-menu shortcut. It registers AutoShelf with
+Windows for notification buttons and, if you leave the options ticked, adds the Explorer menu
+and starts AutoShelf when you sign in. Uninstalling (Settings → Apps) quits AutoShelf and
+removes all of that again, including the menu entries, the sign-in entry and the
+`autoshelf:` link, but keeps `%APPDATA%\AutoShelf` (your history and settings, so earlier
+moves stay undoable if you reinstall). Your files are never touched. The installer isn't
+code-signed, so Windows SmartScreen may warn before it runs ("More info" → "Run anyway").
+
+### Releases
+
+Pushing a tag that matches the version in `autoshelf\__init__.py` (for example `v0.1.0`)
+runs `.github\workflows\release.yml`: it builds the app and the installer on GitHub's
+Windows runner and attaches `AutoShelf-<version>-setup.exe` and a ZIP of the app folder to
+a GitHub Release.
 
 ## Command line
 
@@ -496,9 +525,10 @@ with `--library` on a copy of a real library before changing them.
 AutoShelf's own code is MIT-licensed (see [LICENSE](LICENSE)). It uses, among others:
 PySide6 / Qt (LGPL-3.0), PyMuPDF (AGPL-3.0), ebooklib (AGPL-3.0), mutagen (GPL-2.0-or-later),
 PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
-openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools and fire (BSD, MIT,
-Apache-2.0 or similar), and opencv-python-headless (Apache-2.0, needed by pdf2docx; it
-includes an FFmpeg library under LGPL-2.1).
+openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools, fire,
+windows-toasts and the winrt packages (BSD, MIT, Apache-2.0 or similar), and
+opencv-python-headless (Apache-2.0, needed by pdf2docx; it includes an FFmpeg library under
+LGPL-2.1). The installer is made with Inno Setup, whose license allows that.
 The packaged app in `dist\AutoShelf\` bundles all of them, so sharing that folder means
 following their licenses too, notably the AGPL and GPL ones (for example by pointing to this
 repository's source).

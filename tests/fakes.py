@@ -51,3 +51,22 @@ class FakeProvider:
     def complete(self, system, messages, *, max_tokens: int = 2048) -> str:
         self.calls.append((system, list(messages)))
         return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+
+
+class FakeRegistry:
+    """HKEY_CURRENT_USER in memory: {key: {value name: value}} (keys compared as written)."""
+
+    def __init__(self) -> None:
+        self.keys: dict[str, dict[str, str]] = {}
+
+    def get(self, key: str, name: str = "") -> str | None:
+        return self.keys.get(key, {}).get(name)
+
+    def set(self, key: str, name: str, value: str) -> None:
+        self.keys.setdefault(key, {})[name] = value
+
+    def delete_tree(self, key: str) -> None:
+        prefix = key.casefold() + "\\"
+        for existing in list(self.keys):
+            if existing.casefold() == key.casefold() or existing.casefold().startswith(prefix):
+                del self.keys[existing]

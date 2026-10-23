@@ -13,7 +13,8 @@ class Tray(QObject):
     """The tray icon. Works (and does nothing visible) where there is no system tray."""
 
     open_requested = Signal()
-    inbox_requested = Signal()  # also emitted when a notification is clicked
+    inbox_requested = Signal()
+    message_clicked = Signal()  # a notification was clicked
     pause_toggled = Signal(bool)
     quit_requested = Signal()
 
@@ -45,7 +46,7 @@ class Tray(QObject):
         self.icon = QSystemTrayIcon(self._icons[False], self)
         self.icon.setContextMenu(self.menu)
         self.icon.activated.connect(self._activated)
-        self.icon.messageClicked.connect(self.inbox_requested)
+        self.icon.messageClicked.connect(self.message_clicked)
         self._update()
         if self.available:
             self.icon.show()

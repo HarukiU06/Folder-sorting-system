@@ -8,18 +8,23 @@ the language model are slow; the UI must not call them on its own thread.
 import contextlib
 import logging
 import sqlite3
+import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
-from autoshelf import llm
+from autoshelf import links, llm
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
+from autoshelf.actions.create import Created, place_new_file
 from autoshelf.actions.inbox import InboxItem, assign, inbox_items, resolve_folder
 from autoshelf.actions.mover import BeforeRename, MoveResult
 from autoshelf.config import (
+    CONFIDENCE_LEVELS,
     AppPaths,
     ConfigError,
     Settings,
@@ -32,6 +37,8 @@ from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.extract import guard as read_guard
 from autoshelf.features import ask as ask_features
+from autoshelf.features import convert as convert_features
+from autoshelf.features import digest as digest_features
 from autoshelf.features import duplicates as duplicate_features
 from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
@@ -40,10 +47,13 @@ from autoshelf.features import study as study_features
 from autoshelf.features import summaries as summary_features
 from autoshelf.features import tags as tag_features
 from autoshelf.features.related import Related, related_files
+from autoshelf.features.rule_suggestions import RuleSuggestion, suggest_rules
 from autoshelf.features.search import SearchHit, SearchIndex, folder_label
 from autoshelf.features.stats import LibraryStats, library_stats
+from autoshelf.fsutil import is_within
 from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
+from autoshelf.ml import calibrate as calibration
 from autoshelf.ml.embedder import Embedder, is_downloaded
 from autoshelf.ml.library import LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
@@ -128,13 +138,38 @@ class FileInfo:
 
 
 @dataclass(frozen=True)
-class RuleTest:
-    """What the rules (or, failing them, the classifier) would do with a file."""
+class SortPlan:
+    """Where files chosen in Explorer would go: proposals to apply, files already where
+    they belong, and files that can't be sorted (with the reason)."""
+
+    proposals: list[organize_features.Proposal]
+    in_place: list[Path]
+    refused: list[tuple[Path, str]]
+
+
+@dataclass(frozen=True)
+class WhyHere:
+    """Why a file is where it is: AutoShelf's last move of it (None: AutoShelf has no
+    record of moving it), and whether that move put it where it is now."""
 
     path: Path
-    rule: repository.RuleRecord | None
-    target: str | None  # the folder it would go to; None: it would wait in _Inbox
-    message: str
+    entry: repository.HistoryEntry | None
+    here: bool
+
+
+@dataclass(frozen=True)
+class RuleTest:
+    """Which rule would handle a file (``wording.rule_test`` puts it in words)."""
+
+    path: Path
+    rule: repository.RuleRecord | None  # None: no rule matches; the content decides
+    target: str | None  # the folder it would go to (None: AutoShelf decides)
+    matched: tuple[dict, ...] = ()  # what the rule's conditions found
+    new_name: str | None = None  # the name the rule would give it
+
+
+def _same_path(stored: str, path: Path) -> bool:
+    return str(Path(stored)).casefold() == str(path).casefold()
 
 
 class AppService:
@@ -241,6 +276,36 @@ class AppService:
             read_guard.stop()
         self._lock.release()
 
+    # --- files AutoShelf no longer reads (they stopped it while being read) ------------
+
+    def skipped_files(self) -> list[read_guard.SkippedFile]:
+        """Files only sorted by name because AutoShelf stopped while reading them (a crash,
+        or a power cut or forced restart, which look the same).
+
+        Each is shown where it is now, if AutoShelf knows (it was sorted by its name since).
+        """
+        shown = []
+        with self._connect() as conn:
+            for item in read_guard.skipped_files(self.paths.home):
+                found = repository.path_of_version(conn, item.size, item.mtime_ns)
+                shown.append(replace(item, path=Path(found)) if found else item)
+        return shown
+
+    def newly_skipped(self) -> list[Path]:
+        """Files that stopped AutoShelf's previous run and are skipped from this start on."""
+        return read_guard.newly_skipped()
+
+    def clear_skipped(self, paths: list[Path] | None = None) -> int:
+        """Read these skipped files (or all of them) again; returns how many were cleared.
+
+        Files in your folders that were indexed by name only are read on the next rescan.
+        """
+        cleared = read_guard.clear(self.paths.home, paths)
+        if cleared:
+            with self._connect() as conn:
+                repository.bump_library_version(conn)
+        return cleared
+
     @property
     def watching(self) -> bool:
         """True while the watcher runs."""
@@ -279,6 +344,7 @@ class AppService:
                 on_learned=self._learned,
                 watched=watched,
                 watched_extensions=settings.watched_extensions,
+                sweep_interval=settings.sweep_minutes * 60,
             )
             service.start()
             self._service = service
@@ -327,7 +393,7 @@ class AppService:
             service = self._service
         if service is None:
             return None
-        return lambda src, dst: service.self_moves.expect(dst)
+        return service.self_moves.expect_move
 
     # --- actions (slow: call these off the UI thread) -----------------------------------
 
@@ -596,11 +662,204 @@ class AppService:
                 conn, batch_id, force=force, before_rename=self._before_rename()
             )
 
+    # --- files chosen in Explorer (Sort with AutoShelf, Why is this here?) ----------------------
+
+    def plan_sort(self, paths: list[Path]) -> SortPlan:
+        """Where each file would go (reads them, moves nothing). Files outside the root must
+        be in a folder on the same drive that may be organized; others are refused with
+        the reason. Raises ConfigError if none of them can be sorted."""
+        root = self._require_root()
+        settings = self.settings()
+        files, refused = [], []
+        for path in dict.fromkeys(Path(item) for item in paths):
+            try:
+                files.append(self._sortable(path, root))
+            except ConfigError as exc:
+                refused.append((path, str(exc)))
+        if not files:
+            raise ConfigError("\n".join(reason for _, reason in refused) or "No files chosen")
+        with self._connect() as conn:
+            try:
+                library = self.library(conn, root)
+            except Exception as exc:
+                log.warning("Only rules can propose folders: %s", exc)
+                library = None
+            proposals, in_place = organize_features.plan_files(
+                conn,
+                root,
+                library,
+                files,
+                threshold=settings.auto_threshold,
+                margin=settings.auto_margin,
+            )
+        return SortPlan(proposals, in_place, refused)
+
+    def apply_sort(
+        self, proposals: list[organize_features.Proposal]
+    ) -> organize_features.OrganizeResult:
+        """Move the ticked proposals of ``plan_sort`` as one batch (undo with ``undo_batch``)."""
+        root = self._require_root()
+        outside = {
+            validate_outside_folder(proposal.path.parent, root, self.paths)
+            for proposal in proposals
+            if proposal.selected and proposal.target and not is_within(proposal.path, root)
+        }
+        with self._connect() as conn:
+            return organize_features.apply(
+                conn, root, proposals, folders=sorted(outside), before_rename=self._before_rename()
+            )
+
+    def _sortable(self, path: Path, root: Path) -> Path:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise ConfigError(f"{path.name} is not a file AutoShelf can sort")
+        if is_within(resolved, root):
+            if zone_of(resolved, root) is Zone.RESERVED:
+                raise ConfigError(f"{resolved.name} is in one of AutoShelf's own folders")
+            return resolved
+        try:
+            validate_outside_folder(resolved.parent, root, self.paths)
+        except ConfigError as exc:
+            raise ConfigError(f"{resolved.name} can't be sorted: {exc}") from None
+        return resolved
+
+    def why_here(self, path: Path) -> WhyHere:
+        """AutoShelf's last move of a file in the library, if it made one."""
+        root = self._require_root()
+        resolved = Path(path).resolve()
+        if not is_within(resolved, root):
+            raise ConfigError(
+                f"{resolved.name} is outside the folder AutoShelf sorts ({root}), so AutoShelf "
+                "didn't put it there."
+            )
+        with self._connect() as conn:
+            record = repository.get_file_by_path(conn, resolved)
+            entry = repository.latest_history_of(conn, record.id) if record else None
+        here = entry is not None and entry.dst is not None and _same_path(entry.dst, resolved)
+        return WhyHere(resolved, entry, here)
+
+    # --- compress and convert (always new files next to the originals) ------------------------
+
+    def conversions(self, path: Path) -> list[str]:
+        """The formats ``path`` can be converted to here (e.g. ["docx"] for a PDF)."""
+        return convert_features.targets(path)
+
+    def compress(self, paths: list[Path], *, zip_always: bool = False) -> Created:
+        """Make a smaller copy (one PDF or image) or a ZIP (otherwise) next to the first
+        file. The originals stay as they are; undo sets the copy aside in _Trash."""
+        job = convert_features.plan_compress(self._library_files(paths), zip_always=zip_always)
+        (created,) = self._make([job])
+        return created
+
+    def convert(self, paths: list[Path], to: str) -> list[Created]:
+        """Make a copy of each file in format ``to`` next to it (several images to PDF make
+        one PDF). Several new files form one batch in History."""
+        return self._make(convert_features.plan_convert(self._library_files(paths), to))
+
+    def _library_files(self, paths: list[Path]) -> list[Path]:
+        root = self._require_root()
+        files = []
+        for path in paths:
+            resolved = Path(path).resolve()
+            if not resolved.is_file():
+                raise convert_features.ConvertError(f"{Path(path).name} is no longer there")
+            if not is_within(resolved, root):
+                raise convert_features.ConvertError(
+                    f"{resolved.name} is outside your library ({root}); AutoShelf only "
+                    "compresses and converts files inside it"
+                )
+            files.append(resolved)
+        return files
+
+    def _make(self, jobs: list[convert_features.Job]) -> list[Created]:
+        """Make each job's file in AutoShelf's working folder, then put it in place."""
+        root = self._require_root()
+        settings = self.settings()
+        batch = uuid.uuid4().hex if len(jobs) > 1 else None
+        work = self.paths.cache_dir / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        made = []
+        with self._connect() as conn:
+            for job in jobs:
+                with tempfile.TemporaryDirectory(dir=work) as folder:
+                    output = convert_features.run(job, Path(folder))
+                    made.append(
+                        place_new_file(
+                            conn,
+                            output,
+                            job.sources[0].parent,
+                            job.name,
+                            root=root,
+                            operation=job.operation,
+                            sources=list(job.sources),
+                            extra={"to": job.to} if job.to else None,
+                            batch_id=batch,
+                            sort=settings.sort_created_files,
+                            before_create=self._before_create(settings.sort_created_files),
+                        )
+                    )
+        return made
+
+    def _before_create(self, sort: bool):
+        """Unless new files are to be sorted, the watcher ignores the ones AutoShelf makes."""
+        with self._service_lock:
+            service = self._service
+        if service is None or sort:
+            return None
+        return service.self_moves.expect
+
+    # --- how well would AutoShelf sort this library? ----------------------------------------
+
+    def library_file_count(self) -> int:
+        """How many files your folders hold (reads no file)."""
+        root = self._require_root()
+        return len(scan_library(root, self.settings().ignore_patterns).files)
+
+    def calibrate(self, progress: calibration.Progress | None = None) -> calibration.Calibration:
+        """Sort every file in your folders as if it had just arrived, at each confidence
+        level, and compare with where it is (loads the model; moves nothing)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            library = self.library(conn, root)
+            return calibration.calibrate(library, progress=progress)
+
+    def set_level(self, index: int) -> None:
+        """Sort at one of the confidence presets. Call ``restart`` afterwards."""
+        level = CONFIDENCE_LEVELS[index]
+        self.save_settings(
+            replace(self.settings(), auto_threshold=level.threshold, auto_margin=level.margin)
+        )
+
     def stats(self) -> LibraryStats:
         """The dashboard's numbers."""
         root = self._require_root()
         with self._connect() as conn:
             return library_stats(conn, root, self.settings().ignore_patterns)
+
+    def digest(self, now: datetime | None = None) -> digest_features.Digest:
+        """What AutoShelf did in the last seven days."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return digest_features.weekly_digest(
+                conn, root, self.settings().ignore_patterns, now=now
+            )
+
+    def digest_due(self, now: datetime | None = None) -> digest_features.Digest | None:
+        """The weekly digest, if it is on and seven days have passed since it was last
+        shown (it then counts as shown). The first time, only the date is remembered, and
+        a week in which nothing happened is skipped."""
+        now = now or datetime.now(UTC)
+        settings = self.settings()
+        if not settings.weekly_digest or settings.root is None:
+            return None
+        if settings.digest_shown and not digest_features.due(settings.digest_shown, now):
+            return None
+        first = not settings.digest_shown
+        self.save_settings(replace(settings, digest_shown=now.isoformat(timespec="seconds")))
+        if first:
+            return None
+        week = self.digest(now)
+        return None if week.empty else week
 
     # --- watched folders ------------------------------------------------------------------
 
@@ -637,17 +896,99 @@ class AppService:
 
         startup.set_enabled(enabled)
 
+    # --- Explorer's right-click menu --------------------------------------------------------
+
+    def explorer_menu(self) -> bool:
+        """True if AutoShelf is in Explorer's right-click menu."""
+        from autoshelf import explorer
+
+        return explorer.is_added()
+
+    def set_explorer_menu(self, enabled: bool) -> None:
+        """Add AutoShelf to Explorer's right-click menu, or take it out."""
+        from autoshelf import explorer
+
+        if enabled:
+            explorer.add()
+        else:
+            explorer.remove()
+
+    def notification_buttons(self) -> bool:
+        """True if notifications can have buttons (``autoshelf:`` links reach AutoShelf)."""
+        from autoshelf import explorer
+
+        return explorer.link_ready()
+
+    def set_notification_buttons(self, enabled: bool) -> None:
+        """Register the ``autoshelf:`` link for this copy of AutoShelf (the installer does this
+        too), or remove it."""
+        from autoshelf import explorer
+
+        if enabled:
+            explorer.add_link()
+        else:
+            explorer.remove_link()
+
+    def repair_integration(self) -> bool:
+        """Point the menu and the ``autoshelf:`` link at this copy of AutoShelf if the program
+        they start is gone (the app was moved). Returns True if anything changed."""
+        from autoshelf import explorer
+
+        changed = False
+        if explorer.is_broken():
+            explorer.add()
+            changed = True
+        program = explorer.link_program()
+        if program is not None and not program.exists():
+            explorer.add_link()
+            changed = True
+        return changed
+
+    # --- notification buttons -----------------------------------------------------------
+
+    def offer(self, path: Path, folders: list[str]) -> str:
+        """Remember what a notification about a waiting file offers; returns the token its
+        links carry."""
+        with self._connect() as conn:
+            return links.make_offer(conn, path, folders)
+
+    def offered_file(self, token: str) -> Path | None:
+        """The file a notification was about, if the notification is still current."""
+        with self._connect() as conn:
+            try:
+                return links.get_offer(conn, token).path
+            except links.LinkError:
+                return None
+
+    def answer_offer(self, token: str, choice: int) -> tuple[MoveResult, str]:
+        """Put the file a notification was about into the folder of the button clicked
+        (AutoShelf learns from it, as from the Inbox). Each notification can be answered
+        once: raises LinkError for an answered or old one, and AssignError if the file no
+        longer waits in the Inbox."""
+        with self._connect() as conn:
+            offer = links.get_offer(conn, token)
+            if choice >= len(offer.folders):
+                raise links.LinkError("That button offered no folder.")
+            links.use_offer(conn, token)
+        folder = offer.folders[choice]
+        return self.assign(offer.path, folder), folder
+
     # --- optional AI (off by default) ---------------------------------------------------
 
-    def provider(self) -> llm.Provider | None:
-        """The configured LLM provider, or None while it is off. Raises LLMError."""
-        settings = self.settings()
-        return llm.make_provider(
-            settings.llm_provider, settings.llm_model, ollama_url=settings.ollama_url
-        )
+    def provider(self, *, bulk: bool = False) -> llm.Provider | None:
+        """The configured LLM provider, or None while it is off. Raises LLMError.
 
-    def _require_provider(self) -> llm.Provider:
-        provider = self.provider()
+        ``bulk``: for summaries, names and flashcards, which use their own model (by
+        default the cheapest Claude model).
+        """
+        settings = self.settings()
+        model = settings.llm_model
+        if bulk:
+            model = llm.bulk_model(settings.llm_provider, model, settings.llm_bulk_model)
+        return llm.make_provider(settings.llm_provider, model, ollama_url=settings.ollama_url)
+
+    def _require_provider(self, *, bulk: bool = False) -> llm.Provider:
+        provider = self.provider(bulk=bulk)
         if provider is None:
             raise llm.LLMError("Turn on an AI provider in Settings first")
         return provider
@@ -676,16 +1017,22 @@ class AppService:
         return secrets.masked(secrets.get_api_key())
 
     def test_ai(self) -> str:
-        """Ask the provider for a one-word reply, to check it works."""
-        provider = self._require_provider()
-        reply = provider.complete(
-            "Reply with the single word OK.", [llm.Message("user", "Are you there?")], max_tokens=16
-        )
-        return f"{provider.name} ({provider.model}) answered: {reply[:60]}"
+        """Ask for a one-word reply, to check the AI works (with each model in use)."""
+        main = self._require_provider()
+        bulk = self._require_provider(bulk=True)
+        answers = []
+        for provider in (main,) if bulk.model == main.model else (main, bulk):
+            reply = provider.complete(
+                "Reply with the single word OK.",
+                [llm.Message("user", "Are you there?")],
+                max_tokens=16,
+            )
+            answers.append(f"{provider.model} answered: {reply[:30]}")
+        return f"{main.name}: " + "; ".join(answers)
 
     def summarize(self, path: Path, *, refresh: bool = False) -> str:
         """A 2-3 sentence summary of a file (cached; made by the AI when missing)."""
-        provider = self._require_provider()
+        provider = self._require_provider(bulk=True)
         with self._connect() as conn:
             return summary_features.file_summary(conn, provider, path, refresh=refresh)
 
@@ -714,7 +1061,7 @@ class AppService:
         from autoshelf.extract import extract
 
         extraction = extract(path)
-        provider = self._require_provider() if use_ai else None
+        provider = self._require_provider(bulk=True) if use_ai else None
         if use_ai:
             stem = rename_features.clean_stem(
                 rename_features.ask_for_name(provider, path.name, extraction.title, extraction.text)
@@ -735,7 +1082,7 @@ class AppService:
         root = self._require_root()
         settings = self.settings()
         try:
-            provider = self.provider()
+            provider = self.provider(bulk=True)  # names the folders
         except llm.LLMError:
             provider = None
         with self._connect() as conn:
@@ -797,7 +1144,7 @@ class AppService:
         self, *, path: Path | None = None, folder: str | None = None, count: int = 10
     ) -> list[repository.Flashcard]:
         """Make cards from one file, or from a whole folder (uses the AI) and keep them."""
-        provider = self._require_provider()
+        provider = self._require_provider(bulk=True)
         root = self._require_root()
         if path is not None:
             key = folder_label(path, root) or None
@@ -839,37 +1186,104 @@ class AppService:
         with self._connect() as conn:
             return repository.list_rules(conn)
 
-    def _checked_rule(self, name: str, kind: str, pattern: str, target: str) -> str:
-        """Validate a rule and return the key of its (existing) folder."""
-        rule_engine.check_rule(name, kind, pattern)
-        root = self._require_root()
-        return resolve_folder(root, target, self.settings().ignore_patterns)
+    def _checked_rule(
+        self,
+        name: str,
+        conditions: list[dict],
+        target: str,
+        tags: list[str] | tuple[str, ...],
+        rename_template: str,
+    ) -> tuple[list[dict], str, list[str]]:
+        """Validate a rule: (its conditions, its existing folder's key or "", its tags).
+
+        Raises RuleError, AssignError (no such folder) or TagError.
+        """
+        cleaned = rule_engine.check_rule(
+            name, conditions, target=target, tags=tags, rename_template=rename_template
+        )
+        key = ""
+        if target.strip():
+            key = resolve_folder(self._require_root(), target, self.settings().ignore_patterns)
+        names = list(dict.fromkeys(tag_features.clean_tag(tag) for tag in tags if tag.strip()))
+        return cleaned, key, names
 
     def add_rule(
-        self, name: str, kind: str, pattern: str, target: str, *, enabled: bool = True
+        self,
+        name: str,
+        kind: str = "",
+        pattern: str = "",
+        target: str = "",
+        *,
+        conditions: list[dict] | None = None,
+        match_any: bool = False,
+        tags: list[str] | tuple[str, ...] = (),
+        rename_template: str = "",
+        enabled: bool = True,
     ) -> repository.RuleRecord:
-        """Add a rule after the existing ones. Raises RuleError or AssignError if invalid."""
-        key = self._checked_rule(name, kind, pattern, target)
+        """Add a rule after the existing ones: ``conditions`` (or, for one condition,
+        ``kind`` and ``pattern``) and what to do: move to ``target``, add ``tags``, rename
+        from ``rename_template``. Raises RuleError, AssignError or TagError if invalid."""
+        if conditions is None:
+            conditions = [{"kind": kind, "pattern": pattern}]
+        cleaned, key, names = self._checked_rule(name, conditions, target, tags, rename_template)
         with self._connect() as conn:
             rule_id = repository.insert_rule(
                 conn,
                 name=name.strip(),
-                kind=kind,
-                pattern=pattern.strip(),
+                conditions=cleaned,
                 target_folder=key,
+                match_any=match_any,
+                tags=names,
+                rename_template=rename_template.strip(),
                 enabled=enabled,
             )
             return repository.get_rule(conn, rule_id)
 
     def update_rule(self, rule: repository.RuleRecord) -> repository.RuleRecord:
         """Save changes to a rule (validated like a new one)."""
-        key = self._checked_rule(rule.name, rule.kind, rule.pattern, rule.target_folder)
+        cleaned, key, names = self._checked_rule(
+            rule.name, list(rule.conditions), rule.target_folder, rule.tags, rule.rename_template
+        )
         updated = replace(
-            rule, name=rule.name.strip(), pattern=rule.pattern.strip(), target_folder=key
+            rule,
+            name=rule.name.strip(),
+            conditions=tuple(cleaned),
+            target_folder=key,
+            tags=tuple(names),
+            rename_template=rule.rename_template.strip(),
         )
         with self._connect() as conn:
             repository.update_rule(conn, updated)
         return updated
+
+    def rule_suggestions(self) -> list[RuleSuggestion]:
+        """Rules your choices point to (e.g. files named "invoice" always go to Finance)."""
+        root = self._require_root()
+        settings = self.settings()
+        with self._connect() as conn:
+            return suggest_rules(
+                conn, root, settings.ignore_patterns, settings.dismissed_rule_suggestions
+            )
+
+    def rule_suggestion_for(self, folder: str) -> RuleSuggestion | None:
+        """A suggested rule that sends files to ``folder``, if any (after an Inbox answer)."""
+        wanted = folder.casefold()
+        return next(
+            (item for item in self.rule_suggestions() if item.target.casefold() == wanted), None
+        )
+
+    def add_suggested_rule(self, suggestion: RuleSuggestion) -> repository.RuleRecord:
+        """Turn a suggestion into a rule (checked after the existing ones)."""
+        return self.add_rule(
+            suggestion.name, conditions=[suggestion.condition], target=suggestion.target
+        )
+
+    def dismiss_rule_suggestion(self, key: str) -> None:
+        """Don't suggest this rule again."""
+        settings = self.settings()
+        if key not in settings.dismissed_rule_suggestions:
+            settings.dismissed_rule_suggestions = [*settings.dismissed_rule_suggestions, key]
+            self.save_settings(settings)
 
     def set_rule_enabled(self, rule_id: int, enabled: bool) -> None:
         """Switch a rule on or off."""
@@ -902,14 +1316,11 @@ class AppService:
         with self._connect() as conn:
             rules = repository.list_rules(conn, enabled_only=True)
         match = rule_engine.first_match(rules, path, extraction)
-        if match is not None:
-            rule = match.rule
-            message = (
-                f"Rule {rule.name!r} matches ({match.match}): it would go to {rule.target_folder}"
-            )
-            return RuleTest(path, rule, rule.target_folder, message)
-        message = "No rule matches this file; AutoShelf would decide by its content."
-        return RuleTest(path, None, None, message)
+        if match is None:
+            return RuleTest(path, None, None)
+        target = match.rule.target_folder or None
+        new_name = rule_engine.new_name(match.rule, path, extraction, target)
+        return RuleTest(path, match.rule, target, match.matched, new_name)
 
 
 def _is_waiting(conn: sqlite3.Connection, path: Path) -> bool:

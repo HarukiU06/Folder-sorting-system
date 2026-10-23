@@ -63,17 +63,32 @@ def default_run_key() -> RunKey:
     return WindowsRunKey()
 
 
-def startup_command() -> str:
-    """The command Windows runs at sign-in: the packaged app, or pythonw with this package."""
+def app_executable() -> Path | None:
+    """The packaged tray app (AutoShelf.exe), or None when running from source."""
+    if not getattr(sys, "frozen", False):
+        return None
     executable = Path(sys.executable)
-    if getattr(sys, "frozen", False):
-        # Always the tray app, also when the setting is changed from autoshelf-cli.exe
-        # (a console program would open a window at every sign-in).
-        app = executable.with_name(APP_EXE)
-        return f'"{app if app.exists() else executable}" {BACKGROUND_FLAG}'
+    app = executable.with_name(APP_EXE)
+    return app if app.exists() else executable
+
+
+def app_command() -> str:
+    """How Windows starts the desktop app, without a console window: the packaged app, or
+    pythonw with this package. Options go after it."""
+    app = app_executable()
+    if app is not None:
+        # Always the tray app, also when a setting is changed from autoshelf-cli.exe
+        # (a console program would open a window every time).
+        return f'"{app}"'
+    executable = Path(sys.executable)
     windowed = executable.with_name("pythonw.exe")
     interpreter = windowed if windowed.exists() else executable
-    return f'"{interpreter}" -m autoshelf {BACKGROUND_FLAG}'
+    return f'"{interpreter}" -m autoshelf'
+
+
+def startup_command() -> str:
+    """The command Windows runs at sign-in: the app, in the tray."""
+    return f"{app_command()} {BACKGROUND_FLAG}"
 
 
 def is_enabled(run_key: RunKey | None = None) -> bool:

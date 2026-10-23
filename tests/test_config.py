@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from helpers import windows_only
 
 from autoshelf.config import (
     APP_NAME,
@@ -44,6 +45,7 @@ def test_app_home_inside_icloud_is_refused(tmp_path: Path, name: str) -> None:
     assert not (tmp_path / name).exists()
 
 
+@windows_only  # C:\ paths only split into parts on Windows
 def test_is_in_icloud() -> None:
     assert is_in_icloud(Path(r"C:\Users\me\iCloudDrive\AutoShelf"))
     assert not is_in_icloud(Path(r"C:\Users\me\Documents\cloud notes"))
@@ -108,6 +110,7 @@ def test_balanced_preset_is_the_default() -> None:
 # --- start with Windows (Phase 8) ---------------------------------------------------------
 
 
+@windows_only  # the registry's Run key
 def test_start_with_windows_uses_the_run_key(fake_run_key: dict) -> None:
     from autoshelf import startup
 
@@ -138,6 +141,7 @@ def test_packaged_app_starts_the_tray_app(monkeypatch, tmp_path) -> None:
         assert startup.startup_command() == f'"{app}" --background'
 
 
+@windows_only  # config --startup uses the registry's Run key
 def test_cli_startup_and_background(fake_run_key: dict, monkeypatch, capsys) -> None:
     from autoshelf import cli
     from autoshelf.ui import app as ui_app
@@ -151,4 +155,4 @@ def test_cli_startup_and_background(fake_run_key: dict, monkeypatch, capsys) -> 
     calls = []
     monkeypatch.setattr(ui_app, "run_app", lambda **kwargs: calls.append(kwargs) or 0)
     assert cli.main(["--background"]) == 0
-    assert calls == [{"verbose": False, "show": False}]
+    assert calls == [{"verbose": False, "show": False, "command": None}]

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -24,13 +25,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from autoshelf import llm
+from autoshelf import llm, wording
 from autoshelf.actions.rules import extensions as parse_extensions
 from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.llm import claude as claude_provider
+from autoshelf.ml import calibrate as calibration
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import open_folder, plain_label
+from autoshelf.ui.widgets import open_folder, plain_label, plain_tooltip
 
 DEFAULT_LEVEL = 2  # "Balanced"
 
@@ -60,6 +62,8 @@ class SettingsView(QWidget):
     paused_toggled = Signal(bool)
     notifications_toggled = Signal(bool)
     restart_needed = Signal(str)  # a message to show once restarted
+    message = Signal(str)  # a message for the status bar
+    calibration_progress = Signal(int, int)  # (files tested, of), from a worker thread
     ai_state = Signal(bool)  # whether an AI provider is chosen
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
@@ -108,15 +112,59 @@ class SettingsView(QWidget):
         self.paused.toggled.connect(self._paused_changed)
         self.notifications = QCheckBox("Notify me when a file needs my decision")
         self.notifications.toggled.connect(self._notifications_changed)
+        self.weekly = QCheckBox(
+            "Once a week, tell me what AutoShelf did (sorted, waiting, learned)"
+        )
+        self.weekly.toggled.connect(lambda on: self._update(None, False, weekly_digest=on))
         self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
         self.startup.toggled.connect(self._startup_changed)
+        self.explorer_menu = QCheckBox(
+            "Add AutoShelf to Explorer's right-click menu (on Windows 11: under "
+            "\u201cShow more options\u201d)"
+        )
+        self.explorer_menu.setToolTip(
+            "Sort with AutoShelf, Why is this here?, Compress, and Convert for the file "
+            "types AutoShelf can convert"
+        )
+        self.explorer_menu.toggled.connect(self._explorer_menu_changed)
+        self.buttons = QCheckBox(
+            "Buttons in notifications: put a file away without opening AutoShelf"
+        )
+        self.buttons.setToolTip(
+            "Registers AutoShelf with Windows for its notifications (the installer does this "
+            "too). Without it, a notification opens the Inbox when you click it."
+        )
+        self.buttons.toggled.connect(self._buttons_changed)
+        self.calibrate_button = QPushButton("How well would AutoShelf sort my library?")
+        self.calibrate_button.setToolTip(
+            "Sorts every file in your folders as if it had just arrived and compares the "
+            "result with where it is. Nothing is moved."
+        )
+        self.calibrate_button.clicked.connect(self.calibrate)
+        self.use_recommended = QPushButton("Use the recommended setting")
+        self.use_recommended.clicked.connect(self._use_recommended)
+        self.use_recommended.setVisible(False)
+        self.calibration_text = plain_label()
+        self.calibration_text.setWordWrap(True)
+        self.calibration_text.setVisible(False)
+        self.calibration_progress.connect(self._show_calibration_progress)
+        self._recommended: int | None = None
+        calibrate_row = QHBoxLayout()
+        calibrate_row.addWidget(self.calibrate_button)
+        calibrate_row.addWidget(self.use_recommended)
+        calibrate_row.addStretch(1)
         sorting_box = QGroupBox("Sorting")
         sorting = QVBoxLayout(sorting_box)
         sorting.addLayout(slider_row)
         sorting.addWidget(self.level_text)
+        sorting.addLayout(calibrate_row)
+        sorting.addWidget(self.calibration_text)
         sorting.addWidget(self.paused)
         sorting.addWidget(self.notifications)
+        sorting.addWidget(self.weekly)
         sorting.addWidget(self.startup)
+        sorting.addWidget(self.explorer_menu)
+        sorting.addWidget(self.buttons)
 
         # Files
         self.stable = QDoubleSpinBox()
@@ -124,6 +172,16 @@ class SettingsView(QWidget):
         self.stable.setDecimals(0)
         self.stable.setSuffix(" s")
         self.stable.setMaximumWidth(110)
+        self.sweep = QDoubleSpinBox()
+        self.sweep.setRange(0.0, 120.0)
+        self.sweep.setDecimals(0)
+        self.sweep.setSuffix(" min")
+        self.sweep.setSpecialValueText("never")
+        self.sweep.setMaximumWidth(110)
+        self.sweep.setToolTip(
+            "Windows can miss new files in busy iCloud folders. AutoShelf looks at the "
+            "folder again this often, so no file stays unsorted until the next start."
+        )
         self.patterns = QPlainTextEdit()
         self.patterns.setPlaceholderText("One pattern per line, e.g. *.tmp")
         self.patterns.setMaximumHeight(110)
@@ -132,11 +190,47 @@ class SettingsView(QWidget):
         files_box = QGroupBox("New files")
         files = QFormLayout(files_box)
         files.addRow("Wait until a file is unchanged for", self.stable)
+        files.addRow("Look for missed files every", self.sweep)
+        self.sort_created = QCheckBox(
+            "Sort compressed and converted copies like new files (when they land in the "
+            "root or the Inbox)"
+        )
+        self.sort_created.toggled.connect(
+            lambda checked: self._update(None, False, sort_created_files=checked)
+        )
+        files.addRow("", self.sort_created)
         files.addRow("Ignore files named like", self.patterns)
         apply_row = QHBoxLayout()
         apply_row.addStretch(1)
         apply_row.addWidget(apply)
         files.addRow("", apply_row)
+
+        # Files that stopped AutoShelf while it read them
+        self.skipped = QListWidget()
+        self.skipped.setMaximumHeight(80)
+        self.skipped.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        read_selected = QPushButton("Read selected again")
+        read_selected.clicked.connect(self.clear_selected_skipped)
+        read_all = QPushButton("Read all again")
+        read_all.clicked.connect(self.clear_all_skipped)
+        skipped_buttons = QVBoxLayout()
+        skipped_buttons.addWidget(read_selected)
+        skipped_buttons.addWidget(read_all)
+        skipped_buttons.addStretch(1)
+        skipped_row = QHBoxLayout()
+        skipped_row.addWidget(self.skipped, 1)
+        skipped_row.addLayout(skipped_buttons)
+        skipped_note = QLabel(
+            "AutoShelf stopped while reading these files, so it sorts them by their names "
+            "only, to avoid stopping again. A power cut or a forced restart looks the same "
+            "as a crash: if that is what happened, read them again."
+        )
+        skipped_note.setWordWrap(True)
+        self.skipped_box = QGroupBox("Files sorted by name only")
+        skipped_layout = QVBoxLayout(self.skipped_box)
+        skipped_layout.addWidget(skipped_note)
+        skipped_layout.addLayout(skipped_row)
+        self.skipped_box.setVisible(False)  # shown when there are any
 
         # Watched folders
         self.watched = QListWidget()
@@ -180,6 +274,13 @@ class SettingsView(QWidget):
         self.ai_model = QComboBox()
         self.ai_model.setEditable(True)
         self.ai_model.setMinimumContentsLength(22)
+        self.ai_bulk_model = QComboBox()
+        self.ai_bulk_model.setEditable(True)
+        self.ai_bulk_model.setMinimumContentsLength(22)
+        self.ai_bulk_model.setToolTip(
+            "Many small requests: the cheapest model is the default. Choose a bigger one "
+            "for better summaries, names and flashcards."
+        )
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("Paste your Claude API key")
@@ -209,7 +310,8 @@ class SettingsView(QWidget):
         ai_box = QGroupBox("AI (optional)")
         ai_form = QFormLayout(ai_box)
         ai_form.addRow("Provider", self.ai_provider)
-        ai_form.addRow("Model", self.ai_model)
+        ai_form.addRow("Model for questions", self.ai_model)
+        ai_form.addRow(f"Model for {llm.BULK_TASKS}", self.ai_bulk_model)
         ai_form.addRow("Claude API key", key_row)
         ai_form.addRow("", self.key_status)
         ai_form.addRow("Ollama address", self.ollama_url)
@@ -225,6 +327,7 @@ class SettingsView(QWidget):
         layout.addWidget(root_box)
         layout.addWidget(sorting_box)
         layout.addWidget(files_box)
+        layout.addWidget(self.skipped_box)
         layout.addWidget(watched_box)
         layout.addWidget(ai_box)
         layout.addWidget(self.model)
@@ -258,10 +361,59 @@ class SettingsView(QWidget):
 
         self.runner.run(self.service.starts_with_windows, startup_loaded, lambda exc: None)
 
+        def menu_loaded(added: bool) -> None:
+            self.explorer_menu.blockSignals(True)
+            self.explorer_menu.setChecked(added)
+            self.explorer_menu.blockSignals(False)
+
+        self.runner.run(self.service.explorer_menu, menu_loaded, lambda exc: None)
+
+        def buttons_loaded(ready: bool) -> None:
+            self.buttons.blockSignals(True)
+            self.buttons.setChecked(ready)
+            self.buttons.blockSignals(False)
+
+        self.runner.run(self.service.notification_buttons, buttons_loaded, lambda exc: None)
+        self.runner.run(self.service.skipped_files, self.show_skipped, lambda exc: None)
+
+    def show_skipped(self, skipped) -> None:
+        """List the files that are only sorted by name (hidden when there are none)."""
+        self.skipped.clear()
+        for item in skipped:
+            entry = QListWidgetItem(item.path.name)
+            entry.setData(Qt.ItemDataRole.UserRole, str(item.path))
+            entry.setToolTip(plain_tooltip(str(item.path)))
+            self.skipped.addItem(entry)
+        self.skipped_box.setVisible(bool(skipped))
+
+    def clear_selected_skipped(self) -> None:
+        """Read the selected skipped files again."""
+        paths = [Path(item.data(Qt.ItemDataRole.UserRole)) for item in self.skipped.selectedItems()]
+        if paths:
+            self._clear_skipped(paths)
+
+    def clear_all_skipped(self) -> None:
+        """Read every skipped file again."""
+        self._clear_skipped(None)
+
+    def _clear_skipped(self, paths: list[Path] | None) -> None:
+        def cleared(count: int) -> None:
+            self.message.emit(f"AutoShelf will read {count} file(s) again")
+            self.runner.run(self.service.skipped_files, self.show_skipped)
+
+        self.runner.run(lambda: self.service.clear_skipped(paths), cleared)
+
     def show_settings(self, settings: Settings) -> None:
         """Fill in the widgets without triggering any changes."""
         self._settings = settings
-        widgets = (self.slider, self.paused, self.notifications, self.ai_provider)
+        widgets = (
+            self.slider,
+            self.paused,
+            self.notifications,
+            self.weekly,
+            self.ai_provider,
+            self.sort_created,
+        )
         for widget in widgets:
             widget.blockSignals(True)
         self.root.setText(settings.root or "")
@@ -278,13 +430,16 @@ class SettingsView(QWidget):
             self.level_text.setText(describe_level(level))
         self.paused.setChecked(settings.paused)
         self.notifications.setChecked(settings.notifications)
+        self.weekly.setChecked(settings.weekly_digest)
         self.stable.setValue(settings.stable_seconds)
+        self.sweep.setValue(settings.sweep_minutes)
+        self.sort_created.setChecked(settings.sort_created_files)
         self.patterns.setPlainText("\n".join(settings.ignore_patterns))
         self.watched.clear()
         self.watched.addItems(settings.watched_folders)
         self.extensions.setText(", ".join(settings.watched_extensions))
         self.ai_provider.setCurrentIndex(max(0, self.ai_provider.findData(settings.llm_provider)))
-        self._fill_models(settings.llm_provider, settings.llm_model)
+        self._fill_models(settings.llm_provider, settings.llm_model, settings.llm_bulk_model)
         self.ollama_url.setText(settings.ollama_url)
         self.ai_state.emit(settings.llm_provider != llm.OFF)
         self.runner.run(
@@ -322,6 +477,51 @@ class SettingsView(QWidget):
             auto_margin=level.margin,
         )
 
+    def calibrate(self) -> None:
+        """Test how well sorting would go on the files already in the folders."""
+        self.calibrate_button.setEnabled(False)
+        self.use_recommended.setVisible(False)
+        self.calibration_text.setVisible(True)
+        self.calibration_text.setText(
+            "Sorting each file in your folders as if it had just arrived... (the first time "
+            "loads the language model)"
+        )
+
+        def done(result: calibration.Calibration) -> None:
+            self.calibrate_button.setEnabled(True)
+            settings = self._settings
+            current = (
+                confidence_level(settings.auto_threshold, settings.auto_margin)
+                if settings
+                else None
+            )
+            self.calibration_text.setText("\n".join(wording.calibration(result, current)))
+            self._recommended = result.recommended
+            self.use_recommended.setVisible(
+                result.recommended is not None and result.recommended != current
+            )
+
+        def failed(exc: Exception) -> None:
+            self.calibrate_button.setEnabled(True)
+            self.calibration_text.setText(f"Couldn't test sorting: {exc}")
+
+        self.runner.run(
+            lambda: self.service.calibrate(progress=self.calibration_progress.emit), done, failed
+        )
+
+    def _show_calibration_progress(self, done: int, total: int) -> None:
+        self.calibration_text.setText(f"Sorting each file as if it were new: {done}/{total}")
+
+    def _use_recommended(self) -> None:
+        index = self._recommended
+        if index is None:
+            return
+        self.use_recommended.setVisible(False)
+        if self.slider.value() == index:
+            self._level_changed(index)  # a custom setting shown at its nearest preset
+        else:
+            self.slider.setValue(index)  # saves it and restarts the watcher
+
     def _paused_changed(self, paused: bool) -> None:
         self.paused_toggled.emit(paused)
 
@@ -336,12 +536,27 @@ class SettingsView(QWidget):
 
         self.runner.run(lambda: self.service.set_start_with_windows(enabled), None, failed)
 
+    def _explorer_menu_changed(self, enabled: bool) -> None:
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "Couldn't change Explorer's menu", str(exc))
+            self.load()
+
+        self.runner.run(lambda: self.service.set_explorer_menu(enabled), None, failed)
+
+    def _buttons_changed(self, enabled: bool) -> None:
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "Couldn't change the notification buttons", str(exc))
+            self.load()
+
+        self.runner.run(lambda: self.service.set_notification_buttons(enabled), None, failed)
+
     def _apply_files(self) -> None:
         patterns = [line.strip() for line in self.patterns.toPlainText().splitlines()]
         self._update(
             "Saved",
             True,
             stable_seconds=float(self.stable.value()),
+            sweep_minutes=float(self.sweep.value()),
             ignore_patterns=[pattern for pattern in patterns if pattern],
         )
 
@@ -371,15 +586,18 @@ class SettingsView(QWidget):
         wanted = sorted(parse_extensions(self.extensions.text())) if self.extensions.text() else []
         self._update("Saved", True, watched_extensions=wanted)
 
-    def _fill_models(self, provider: str, current: str) -> None:
-        self.ai_model.clear()
-        if provider == llm.CLAUDE:
-            self.ai_model.addItems(claude_provider.MODELS)
-        elif provider == llm.OLLAMA:
-            self.ai_model.addItems(["qwen2.5", "llama3.2", "gemma3"])
-        self.ai_model.setEnabled(provider != llm.OFF)
-        self.ai_model.setCurrentText(
-            current or (llm.default_model(provider) if provider != llm.OFF else "")
+    def _fill_models(self, provider: str, current: str, current_bulk: str = "") -> None:
+        on = provider != llm.OFF
+        for box in (self.ai_model, self.ai_bulk_model):
+            box.clear()
+            if provider == llm.CLAUDE:
+                box.addItems(claude_provider.MODELS)
+            elif provider == llm.OLLAMA:
+                box.addItems(["qwen2.5", "llama3.2", "gemma3"])
+            box.setEnabled(on)
+        self.ai_model.setCurrentText(current or (llm.default_model(provider) if on else ""))
+        self.ai_bulk_model.setCurrentText(
+            llm.bulk_model(provider, current, current_bulk) if on else ""
         )
 
     def _ai_provider_changed(self) -> None:
@@ -387,14 +605,19 @@ class SettingsView(QWidget):
 
     def _apply_ai(self) -> None:
         provider = self.ai_provider.currentData()
-        model = self.ai_model.currentText().strip() if provider != llm.OFF else ""
+        on = provider != llm.OFF
+        model = self.ai_model.currentText().strip() if on else ""
+        bulk = self.ai_bulk_model.currentText().strip() if on else ""
         if model == llm.default_model(provider):
             model = ""
+        if bulk == llm.default_bulk_model(provider, model):
+            bulk = ""  # follow the default (and, with Ollama, the main model)
         self._update(
             None,
             False,
             llm_provider=provider,
             llm_model=model,
+            llm_bulk_model=bulk,
             ollama_url=self.ollama_url.text().strip() or "http://localhost:11434",
         )
         self.ai_state.emit(provider != llm.OFF)

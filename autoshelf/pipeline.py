@@ -11,22 +11,37 @@ import logging
 import os
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from autoshelf import wording
 from autoshelf.actions import rules as rule_engine
-from autoshelf.actions.mover import MoveError, free_destination, move_file
+from autoshelf.actions.mover import MoveError, MoveResult, free_destination, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
-from autoshelf.features.tags import suggest_tags
+from autoshelf.features.tags import TagError, suggest_tags, tag_file
 from autoshelf.fsutil import sha256_file
 from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification
-from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, store_content, store_vector
+from autoshelf.ml.library import (
+    TEXT_EXCERPT_CHARS,
+    LibraryIndex,
+    store_content,
+    store_vector,
+    vector_source,
+)
 from autoshelf.ml.vectors import EmbeddedDocument
+from autoshelf.reasons import (
+    FOLDER_GONE,
+    NO_CLASSIFIER,
+    RULE,
+    RULE_FOLDER_MISSING,
+    Reason,
+    reason,
+)
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.selfmoves import SelfMoveRegistry
 
@@ -48,7 +63,11 @@ class OutcomeKind(StrEnum):
 
 @dataclass(frozen=True)
 class Outcome:
-    """What the pipeline did (or, in a dry run, would do) with one file."""
+    """What the pipeline did (or, in a dry run, would do) with one file.
+
+    ``message`` is for the log; ``why`` is the decision's reason as data (see
+    ``autoshelf.reasons``), and ``details`` everything stored with the move in history.
+    """
 
     kind: OutcomeKind
     path: Path
@@ -58,7 +77,8 @@ class Outcome:
     duplicates: tuple[Path, ...] = ()
     extraction: Extraction | None = None
     classification: Classification | None = None
-    details: dict | None = None  # why: what is stored with the move in history
+    details: dict | None = None
+    why: Reason | None = None
 
     @property
     def needs_decision(self) -> bool:
@@ -76,14 +96,21 @@ class Outcome:
 class Decision:
     """Where a file should go. ``target_dir`` None means it stays where it is (in _Inbox).
 
-    ``suggestion`` is the folder AutoShelf chose or, when asking, thinks most likely.
+    ``reason`` is the history reason ("auto", "ask" or "Rule: <name>"), ``why`` the
+    decision's reason as data. ``suggestion`` is the folder AutoShelf chose or, when
+    asking, thinks most likely.
     """
 
     target_dir: Path | None
     reason: str
-    message: str
+    why: Reason
     confidence: float | None = None
     suggestion: str | None = None
+
+    def message(self) -> str:
+        """The decision in words, for the log."""
+        text = wording.reason_text(self.why)
+        return f"waiting in _Inbox: {text}" if self.target_dir is None else text
 
 
 class Pipeline:
@@ -158,7 +185,11 @@ class Pipeline:
         known = repository.get_file_by_path(self.conn, path)
         if known is not None and known.sha256 == digest:
             if known.status == "ignored":
-                return Outcome(OutcomeKind.SKIPPED, path, "left in place: you undid its last move")
+                return Outcome(
+                    OutcomeKind.SKIPPED,
+                    path,
+                    "left in place: you undid its last move, or AutoShelf made it",
+                )
             if zone is Zone.INBOX and known.status == "inbox":
                 return Outcome(OutcomeKind.SKIPPED, path, "waiting in _Inbox for your decision")
         duplicates = self._duplicates_of(path, digest)
@@ -167,17 +198,26 @@ class Pipeline:
         rule = rule_engine.first_match(
             repository.list_rules(self.conn, enabled_only=True), path, extraction
         )
-        if rule is not None:
+        if rule is not None and rule.rule.target_folder:
             decision = self._rule_decision(zone, rule)
-        else:
+        else:  # no rule, or one that leaves the folder to AutoShelf
             decision = self._decide(zone, classification)
         if decision.target_dir is not None and not self._can_receive(decision.target_dir):
             decision = self._fallback_to_inbox(zone, decision)
+        message = decision.message()
         if source is not None:
-            decision = replace(decision, message=f"from {source.name}: {decision.message}")
+            message = f"from {source.name}: {message}"
         details = self._details(path, extraction, classification, rule)
+        details["reason"] = decision.why  # what decided, over the classifier's reason
+        # A rule the user wrote is their approval of its new name (SPEC Phase 12).
+        renamed = None
+        if rule is not None:
+            renamed = rule_engine.new_name(rule.rule, path, extraction, decision.suggestion)
+        if renamed is not None:
+            details["renamed_from"] = path.name
+            message += f"; renamed to {renamed!r} by rule {rule.rule.name!r}"
 
-        def outcome(kind: OutcomeKind, message: str, **extra) -> Outcome:
+        def outcome(kind: OutcomeKind, **extra) -> Outcome:
             return Outcome(
                 kind,
                 path,
@@ -186,16 +226,22 @@ class Pipeline:
                 extraction=extraction,
                 classification=classification,
                 details=details,
+                why=decision.why,
                 **extra,
             )
 
         if decision.target_dir is None:
-            if not self.dry_run:
-                self._record_waiting(path, digest, st, extraction, document, decision.suggestion)
-            return outcome(OutcomeKind.WAITING, decision.message)
+            if self.dry_run:
+                return outcome(OutcomeKind.WAITING)
+            here = path
+            if renamed is not None:
+                here = self._rename_by_rule(path, renamed, rule, digest, details).dst
+            self._record_waiting(here, digest, st, extraction, document, decision.suggestion)
+            self._tag_by_rule(here, rule)
+            return outcome(OutcomeKind.WAITING, dst=here if here != path else None)
         if self.dry_run:
-            dst = self._planned_destination(decision.target_dir, path.name)
-            return outcome(OutcomeKind.WOULD_MOVE, decision.message, dst=dst)
+            dst = self._planned_destination(decision.target_dir, renamed or path.name)
+            return outcome(OutcomeKind.WOULD_MOVE, dst=dst)
 
         self._ensure_inbox_if_target(decision.target_dir)
         result = move_file(
@@ -209,14 +255,21 @@ class Pipeline:
             details=details,
             before_rename=self._expect_self_move,
             allowed_source=source,
+            notify_library=False,  # its index learns of the file below, without a rescan
+            new_name=renamed,
         )
+        self._tag_by_rule(result.dst, rule)
         repository.set_suggestion(self.conn, result.file_id, decision.suggestion)
         store_content(self.conn, result.file_id, extraction)
         if document is not None:
-            self._store_vector(result.file_id, document, st)
-        return outcome(
-            OutcomeKind.MOVED, decision.message, dst=result.dst, history_id=result.history_id
-        )
+            self._store_vector(result.file_id, document, st, extraction)
+        if self.library is not None and zone_of(result.dst, self.root) is Zone.CATEGORY:
+            if document is None:
+                self.library.mark_dirty()  # e.g. a rule moved it without a vector
+            else:
+                # The next file can match this one without a rescan of every folder.
+                self.library.add_file(result.dst, document, size=st.st_size, mtime=st.st_mtime)
+        return outcome(OutcomeKind.MOVED, dst=result.dst, history_id=result.history_id)
 
     def _classify(
         self, path: Path, extraction: Extraction
@@ -225,7 +278,8 @@ class Pipeline:
         if self.library is None:
             return None, None
         try:
-            self.library.refresh()  # pick up folders and files the user added meanwhile
+            # Rescans only if the folders changed (the watcher marks the index dirty).
+            self.library.ensure_current()
             document = self.library.embed(extraction, path.name)
             classification = self.library.classify(
                 document.vector, threshold=self.threshold, margin=self.margin
@@ -237,37 +291,32 @@ class Pipeline:
 
     def _decide(self, zone: Zone, classification: Classification | None) -> Decision:
         if classification is None:
-            why = "it can't be sorted by content right now"
+            why = reason(NO_CLASSIFIER)
         elif classification.choice is not None:
             choice = classification.choice
             target = self.root.joinpath(*choice.folder.split("/"))
-            return Decision(
-                target, REASON_AUTO, classification.explanation, choice.score, choice.folder
-            )
+            return Decision(target, REASON_AUTO, classification.reason, choice.score, choice.folder)
         else:
-            why = classification.explanation
+            why = classification.reason
         best = classification.scores[0] if classification and classification.scores else None
         return self._ask(zone, why, best.score if best else None, best.folder if best else None)
 
     def _ask(
-        self, zone: Zone, why: str, score: float | None = None, suggestion: str | None = None
+        self, zone: Zone, why: Reason, score: float | None = None, suggestion: str | None = None
     ) -> Decision:
         """Leave the file in (or send it to) _Inbox for the user to decide."""
-        if zone is Zone.INBOX:
-            return Decision(None, REASON_ASK, f"waiting in _Inbox: {why}", score, suggestion)
-        return Decision(inbox_dir(self.root), REASON_ASK, why, score, suggestion)
+        target = None if zone is Zone.INBOX else inbox_dir(self.root)
+        return Decision(target, REASON_ASK, why, score, suggestion)
 
     def _rule_decision(self, zone: Zone, match: rule_engine.RuleMatch) -> Decision:
         """A rule decides, overriding the classifier; it never creates its folder."""
         rule = match.rule
         target = self.root.joinpath(*rule.target_folder.split("/"))
         if not target.is_dir() or zone_of(target / "x", self.root) is not Zone.CATEGORY:
-            why = f"rule {rule.name!r} matched, but its folder {rule.target_folder!r} doesn't exist"
+            why = reason(RULE_FOLDER_MISSING, rule=rule.name, folder=rule.target_folder)
             return self._ask(zone, why)
-        message = f"rule {rule.name!r} matched: {match.match}"
-        return Decision(
-            target, rule_engine.reason_for(rule), message, suggestion=rule.target_folder
-        )
+        why = reason(RULE, rule=rule.name, matched=list(match.matched))
+        return Decision(target, rule_engine.reason_for(rule), why, suggestion=rule.target_folder)
 
     def _details(
         self,
@@ -275,7 +324,7 @@ class Pipeline:
         extraction: Extraction,
         classification: Classification | None,
         rule: rule_engine.RuleMatch | None,
-    ) -> dict | None:
+    ) -> dict:
         """Why the file goes where it goes, as stored with its move in history."""
         details: dict = {}
         if classification is not None:
@@ -291,12 +340,45 @@ class Pipeline:
             details.update(
                 explain.rule_details(
                     rule.rule.name,
-                    rule_engine.describe_condition(rule.rule.kind, rule.rule.pattern),
+                    rule_engine.conditions(rule.rule),
                     rule.rule.target_folder,
-                    rule.match,
+                    rule.matched,
+                    tags=rule.rule.tags,
+                    rename=rule.rule.rename_template,
                 )
             )
-        return details or None
+        return details
+
+    def _rename_by_rule(
+        self,
+        path: Path,
+        new_name: str,
+        match: rule_engine.RuleMatch,
+        digest: str,
+        details: dict,
+    ) -> MoveResult:
+        """Rename a file that stays where it is (in _Inbox), as its rule says (undoable)."""
+        return move_file(
+            self.conn,
+            path,
+            path.parent,
+            root=self.root,
+            reason=rule_engine.reason_for(match.rule),
+            action="rename",
+            new_name=new_name,
+            sha256=digest,
+            details={key: details[key] for key in ("rule", "renamed_from") if key in details},
+            before_rename=self._expect_self_move,
+            notify_library=False,
+        )
+
+    def _tag_by_rule(self, path: Path, match: rule_engine.RuleMatch | None) -> None:
+        if match is None or not match.rule.tags:
+            return
+        try:
+            tag_file(self.conn, path, list(match.rule.tags), self.root)
+        except (TagError, OSError) as exc:
+            log.warning("Couldn't tag %s as rule %r says: %s", path, match.rule.name, exc)
 
     def _can_receive(self, target_dir: Path) -> bool:
         """True if files can be moved to ``target_dir`` (``_Inbox`` is created when needed)."""
@@ -304,7 +386,8 @@ class Pipeline:
 
     def _fallback_to_inbox(self, zone: Zone, decision: Decision) -> Decision:
         """The chosen folder vanished after scoring: ask instead. Folders are never created."""
-        return self._ask(zone, f"its folder {decision.target_dir.name!r} no longer exists")
+        folder = decision.suggestion or decision.target_dir.name
+        return self._ask(zone, reason(FOLDER_GONE, folder=folder))
 
     def _record_waiting(
         self,
@@ -323,9 +406,15 @@ class Pipeline:
         repository.set_suggestion(self.conn, file_id, suggestion)
         store_content(self.conn, file_id, extraction)
         if document is not None:
-            self._store_vector(file_id, document, st)
+            self._store_vector(file_id, document, st, extraction)
 
-    def _store_vector(self, file_id: int, document: EmbeddedDocument, st: os.stat_result) -> None:
+    def _store_vector(
+        self,
+        file_id: int,
+        document: EmbeddedDocument,
+        st: os.stat_result,
+        extraction: Extraction,
+    ) -> None:
         # A rename keeps size and mtime, so the vector stays valid at the new path.
         store_vector(
             self.conn,
@@ -334,6 +423,7 @@ class Pipeline:
             model=self.library.model,
             size=st.st_size,
             mtime=st.st_mtime,
+            source=vector_source(extraction),
         )
 
     def _duplicates_of(self, path: Path, digest: str) -> tuple[Path, ...]:
@@ -357,5 +447,6 @@ class Pipeline:
             log.info("Created %s for files waiting on your decision", inbox)
 
     def _expect_self_move(self, src: Path, dst: Path) -> None:
-        # Only the destination: a new file may legitimately appear at ``src`` right away.
-        self.self_moves.expect(dst)
+        # Events at ``dst`` are ignored; ``src`` vanishing doesn't change the library. A new
+        # file appearing at ``src`` right away is still processed.
+        self.self_moves.expect_move(src, dst)

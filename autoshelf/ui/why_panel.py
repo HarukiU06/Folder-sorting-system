@@ -4,7 +4,9 @@ import html
 from collections.abc import Mapping
 from pathlib import Path
 
-from PySide6.QtWidgets import QTextBrowser
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser, QVBoxLayout
+
+from autoshelf import reasons, wording
 
 BAR_PIXELS = 120
 EMPTY = "Select a file to see why it went where it went."
@@ -38,13 +40,20 @@ def why_html(details: Mapping | None, root: Path | None = None, headline: str = 
         parts.append(f"<p><b>{html.escape(headline)}</b></p>")
     rule = details.get("rule")
     if rule:
+        if "conditions" in rule:
+            when = " and ".join(wording.condition(item) for item in rule["conditions"])
+            found = wording.rule_matches(rule.get("matched") or [])
+        else:  # written before rules were stored as data
+            when, found = rule["condition"], rule.get("match", "")
         parts.append(
-            f"<p>Rule <b>{html.escape(rule['name'])}</b>: {html.escape(rule['condition'])} "
+            f"<p>Rule <b>{html.escape(rule['name'])}</b>: {html.escape(when)} "
             f"&rarr; {html.escape(rule['target'])}<br>"
-            f"<small>{html.escape(rule.get('match', ''))}</small></p>"
+            f"<small>{html.escape(found)}</small></p>"
         )
-    elif details.get("explanation"):
-        parts.append(f"<p>{html.escape(details['explanation'])}</p>")
+    code = (details.get("reason") or {}).get("code", reasons.RULE)
+    why = wording.explanation(details)
+    if why and not (rule and code == reasons.RULE):
+        parts.append(f"<p>{html.escape(why)}</p>")
     candidates = details.get("candidates") or []
     if candidates:
         rows = [
@@ -93,6 +102,30 @@ def why_html(details: Mapping | None, root: Path | None = None, headline: str = 
     if details.get("corrects"):
         parts.append(f"<p>You moved it here, correcting #{details['corrects']}.</p>")
     return "".join(parts)
+
+
+class WhyDialog(QDialog):
+    """ "Why is this here?" for one file (from Explorer's right-click menu)."""
+
+    def __init__(self, result, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Why is {result.path.name} here?")
+        self.resize(560, 360)
+        entry = result.entry
+        headline = wording.why_here(result.path, entry, result.here)
+        self.panel = WhyPanel()
+        root = Path(entry.root) if entry is not None and entry.root else None
+        # A move's details explain it; for a file AutoShelf made, the headline says it all.
+        explained = entry is not None and result.here and entry.action in ("move", "rename")
+        details = entry.details if explained else None
+        self.panel.setHtml(
+            why_html(details, root, headline) if details else f"<p>{html.escape(headline)}</p>"
+        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.panel, 1)
+        layout.addWidget(buttons)
 
 
 class WhyPanel(QTextBrowser):

@@ -219,3 +219,118 @@ Each phase ends with something runnable, tests passing, and a commit.
 6. **Library features:** duplicates and versions, dry-run organize, semantic search, related files, tags and virtual views, stats dashboard, and watched locations.
 7. **LLM features (optional provider):** summaries, smart renaming, new-folder suggestions, Ask-your-library, and study mode.
 8. **Ship:** PyInstaller build, start with Windows, README with screenshots, and a GitHub Actions workflow running tests.
+
+# AutoShelf — next round of work (Phases 9–15)
+
+Read CLAUDE.md and SPEC.md first. All safety rules in CLAUDE.md still apply. Build ONE phase
+at a time, in this order: propose a short plan, implement, add pytest tests, update the README,
+then commit. Don't work on several phases in parallel: app_service.py, cli.py and
+db/repository.py are touched by almost every phase, and each migration must get the next
+number (V6, V7, ...).
+
+## Phase 9 — Reliability and speed
+1. **Periodic sweep.** Today loose files in the root and _Inbox are only queued at startup;
+   after that the watcher relies on file events. StabilityTracker drops a file after 600 s
+   ("will retry on next change"), and Windows can drop events on busy iCloud folders, so
+   files can sit in the root until restart. Every few minutes (setting, default 5 min),
+   re-offer loose files in the root and _Inbox to the tracker and rescan the library. Known,
+   unchanged files are already skipped.
+2. **Refresh only when needed.** Pipeline._classify calls library.refresh() for EVERY file
+   (a full scandir of the tree). Each refresh also clears folder_documents, so explain() then
+   runs about 2 DB queries per library file. Refresh only when the library is dirty, or once
+   per batch. TRAP: _EventHandler ignores directory events, so a newly created empty folder
+   would never mark the library dirty. Folder create/rename/delete events and folder
+   description edits must mark it dirty. Organize and the CLI must still see current folders.
+3. **Small fixes.**
+   - The ReadGuard crash list (reading.json) also catches power cuts and forced restarts, and
+     there's no way to clear it. Add a Settings/CLI action to list and clear skipped files.
+   - The "not opened in 6+ months" stat relies on st_atime, which Windows often doesn't
+     update. Say so in the UI, or rely on AutoShelf's own last_opened plus mtime.
+   - Mark the Windows-only tests in tests/test_config.py (is_in_icloud with C:\ paths,
+     startup Run key, `config --startup`) with skipif(sys.platform != "win32").
+   - Default Claude model for bulk tasks (summaries, names, flashcards) should be
+     claude-haiku-5-5. Keep Opus/Sonnet selectable.
+
+## Phase 10 — Measure accuracy
+1. **Benchmark script** (scripts/benchmark.py plus a small sample corpus in tests/data or
+   generated). Leave-one-out: classify every library file with exclude=its path, and report
+   accuracy, the share sent to the Inbox, and the wrong-auto-move rate at each
+   CONFIDENCE_LEVEL. Use it to check the hand-tuned constants: NEIGHBOR_WEIGHT,
+   HEADER_WEIGHT, FULL_POOL, threshold/margin, and the SIMILAR_FROM/FULL learning curve.
+2. **Feature: "How well would AutoShelf sort my library?"** The same leave-one-out on the
+   user's own folders, run off the UI thread (TaskRunner). Show for example "At Balanced: 87%
+   correct, 9% to Inbox, 4% wrong", and recommend a slider position. Offer it on first run
+   once folders have files, in Settings, and as `autoshelf calibrate` in the CLI.
+
+## Phase 11 — Structured history (foundation for Phases 13 and 14)
+1. Explanations are currently built as English sentences in core code (classifier.choose,
+   explain, learning, organize, rename) and saved in history details_json["explanation"].
+   Store structured data instead (reason code, folders, scores, rule name, match), and build
+   the sentence at display time in the UI/CLI. Keep reading old rows that only have text.
+2. Migration: allow a new history action for files AutoShelf creates (e.g. 'create',
+   recording source file, output file, operation, sha256). Undoing a create must NOT delete:
+   it moves the created file into a reserved folder (e.g. _Trash/ or _Converted/; the name
+   starts with "_" so it's never a category) for the user to delete themselves.
+
+## Phase 12 — Rules
+1. **Suggest rules from corrections.** When several corrections share a pattern (the same
+   word in the name, the same extension, the same to_folder; data is in `corrections`),
+   offer "Make this a rule?" in the Rules view and after an Inbox answer. CLI:
+   `autoshelf rules suggest`.
+2. **Richer rules.** Migration: rules get a list of conditions (JSON) combined with AND
+   (optionally ANY). Conditions: name regex, extension, text contains, size range, file date
+   range. Actions: move to a folder (as now), add tags, and apply a rename template (e.g.
+   "{date} {title}"). DECISION NEEDED: SPEC 5.2 says renames always need approval. Either
+   treat a user-written rule as approval (and log it in history as a rule rename, undoable),
+   or send rule renames to the Inbox for approval. Keep old rules working; update the Rules
+   view, the rule test-on-a-file feature, and the CLI.
+
+## Phase 13 — Compress and convert (new files, never in place)
+Follows the safety rules: never delete, never overwrite. The output is always a NEW file
+next to the original (collision names " (2)" as usual), recorded with the 'create' history
+action from Phase 11. Undo moves the output to the reserved folder, never deletes it.
+Decide, and make it a setting, whether an output written into the root gets sorted by the
+watcher (register it in SelfMoveRegistry if not).
+- Compress: zip one or more files; shrink a PDF (PyMuPDF save with garbage/deflate); shrink
+  images (Pillow). The original is kept.
+- Convert: images png/jpg/webp/bmp/tiff (+heic if pillow-heif) via Pillow; images -> PDF;
+  PDF -> DOCX via pdf2docx (MIT licensed; layout quality varies, so say so in the UI).
+  DOCX/PPTX/XLSX -> PDF has no good pure-Python route: only offer it when Microsoft Word
+  (COM automation) or LibreOffice (soffice --headless) is found, otherwise hide it.
+- Note the licensing: PyMuPDF is AGPL, so the distributed app must follow AGPL terms.
+  Check the license of any new library before adding it.
+- Available from the Library view, the CLI (`autoshelf compress`, `autoshelf convert FILE
+  --to docx`) and the right-click menu (Phase 14). Long work runs off the UI thread.
+
+## Phase 14 — Releases, installer, notifications, right-click menu
+1. **Release workflow** (GitHub Actions, on tag v*): build with packaging/build.ps1, zip
+   dist\AutoShelf, attach to a GitHub Release.
+2. **Installer:** Inno Setup, per-user install with no admin rights. Creates a Start-menu
+   shortcut with an AppUserModelID. Start-with-Windows must point to the installed exe.
+   Code signing is optional (it removes the SmartScreen warning).
+3. **Notification buttons:** with the AUMID registered, show Inbox notifications with
+   buttons (top 3 folders, "Leave in Inbox"), e.g. via windows-toasts. Handle the click
+   when the app is running (through the existing QLocalServer command channel) and when it
+   is closed (launch with arguments). Update the README sentence that says buttons are
+   impossible.
+4. **Explorer right-click menu** (per-user HKCU registry keys, added/removed from Settings
+   and by the installer): "Sort with AutoShelf", "Why is this here?", "Compress",
+   "Convert to ▸". The handler launches AutoShelf with arguments, which forwards the command
+   to the running instance via the existing QLocalServer/QLocalSocket (app.py
+   _serve_commands); start the app if it isn't running. Handle multi-select (many files at
+   once). On Windows 11 these entries appear under "Show more options"; a top-level entry
+   needs a packaged app (MSIX/sparse package + IExplorerCommand), which is out of scope for
+   now. A file outside the root on another drive can't be sorted (moves are renames only):
+   show a clear message instead of failing silently.
+
+## Phase 15 — Weekly digest
+A notification once a week: "This week: 23 sorted, 3 waiting in Inbox, 1 correction
+learned", from the history and corrections tables. Clicking it opens the Dashboard. The app
+isn't always running, so on start, show it if 7+ days have passed since the last one. Store
+the last-shown date in settings. On/off in Settings.
+
+## Phase 16 — Japanese interface (last, once UI text has stopped changing)
+Wrap all UI strings (about 200, in ui/*.py) for Qt translation (self.tr / QCoreApplication
+.translate). Add a Japanese .ts/.qm translation and a language setting (default: follow
+Windows). Translate the display-time explanations from Phase 11. Make the PyInstaller spec
+bundle the .qm files. The CLI can stay English or use the same catalog.

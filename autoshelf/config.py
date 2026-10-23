@@ -18,6 +18,8 @@ HOME_ENV_VAR = "AUTOSHELF_HOME"
 DB_FILENAME = "autoshelf.db"
 
 DEFAULT_STABLE_SECONDS = 3.0
+# Loose files are looked for again this often, in case the watcher missed their events.
+DEFAULT_SWEEP_MINUTES = 5.0
 # Multilingual, so Japanese and English files (and folder names) can be compared.
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # A file is moved automatically only if its best folder scores at least the threshold and
@@ -206,12 +208,20 @@ class Settings:
 
     root: str | None = None
     stable_seconds: float = DEFAULT_STABLE_SECONDS
+    sweep_minutes: float = DEFAULT_SWEEP_MINUTES  # 0: rely on file events only
     ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     auto_threshold: float = DEFAULT_AUTO_THRESHOLD
     auto_margin: float = DEFAULT_AUTO_MARGIN
     paused: bool = False  # automatic sorting paused (files wait until resumed)
+    calibration_offered: bool = False  # "how well would AutoShelf sort?" was offered once
+    dismissed_rule_suggestions: list[str] = field(default_factory=list)  # keys not to suggest
+    # A compressed or converted copy that lands in the root or _Inbox is left there (False)
+    # or sorted like any new file (True). Copies in your folders always stay there.
+    sort_created_files: bool = False
     notifications: bool = True  # notify when a file needs a decision
+    weekly_digest: bool = True  # a notification once a week: sorted, waiting, learned
+    digest_shown: str = ""  # when it was last shown (ISO time); "" before the first start
     # Opt-in folders outside the root (e.g. Downloads): new files there with one of
     # ``watched_extensions`` are moved into the root and sorted. None by default.
     watched_folders: list[str] = field(default_factory=list)
@@ -219,7 +229,8 @@ class Settings:
     # Optional AI ("off", "claude" or "ollama"); the Claude API key is kept in the Windows
     # Credential Manager, never here. An empty model means the provider's default.
     llm_provider: str = "off"
-    llm_model: str = ""
+    llm_model: str = ""  # questions and reading lists
+    llm_bulk_model: str = ""  # summaries, names, flashcards ("": the cheapest Claude model)
     ollama_url: str = "http://localhost:11434"
 
 

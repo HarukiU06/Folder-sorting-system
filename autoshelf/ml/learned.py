@@ -15,6 +15,10 @@ import numpy as np
 # Similarities of file vectors with the default model: files in the same folder have a
 # median of ~0.42, files in different folders ~0.10 (90% below 0.32). A correction starts
 # to count above SIMILAR_FROM and counts fully from SIMILAR_FULL (near-identical files).
+# In scripts/benchmark.py's simulation (files arriving one by one, mistakes corrected), the
+# penalty made sorting slightly more cautious at every value tried (0.25/0.50 to 0.40/0.80):
+# a little fewer wrong moves, a little more waiting in the Inbox. The corrected files, now
+# in their right folders, already teach most habits as neighbours.
 SIMILAR_FROM = 0.35
 SIMILAR_FULL = 0.70
 PENALTY_PER_EXAMPLE = 0.08

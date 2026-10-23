@@ -146,7 +146,8 @@ def test_tags_are_virtual_folders(conn, shelf: Path, library) -> None:
     assert repository.tag_counts(conn) == [("Exam prep", 2), ("Taxes", 1)]
     assert tagged_files(conn, "exam prep") == sorted([invoice, kmeans], key=str)
     entry = repository.list_history(conn, 1)[0]
-    assert (entry.action, entry.reason, entry.state) == ("tag", "Tagged 'Taxes'", "done")
+    assert (entry.action, entry.reason, entry.state) == ("tag", "tag", "done")
+    assert entry.details == {"tag": "Taxes"}
 
     assert untag_file(conn, invoice, "Taxes", shelf)
     assert not untag_file(conn, invoice, "Taxes", shelf)

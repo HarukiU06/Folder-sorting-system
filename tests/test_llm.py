@@ -194,3 +194,28 @@ def test_make_provider() -> None:
     local = llm.make_provider("ollama", "", ollama_url="http://127.0.0.1:9999")
     assert (local.url, local.model) == ("http://127.0.0.1:9999", "qwen2.5")
     assert llm.default_model("claude") == claude.MODELS[0]
+
+
+def test_bulk_tasks_default_to_the_cheapest_claude_model() -> None:
+    assert llm.bulk_model("claude", "", "") == "claude-haiku-5-5"
+    assert llm.bulk_model("claude", "claude-sonnet-5-5", "") == "claude-haiku-5-5"
+    assert llm.bulk_model("claude", "", "claude-opus-5-5") == "claude-opus-5-5"  # chosen
+    assert llm.bulk_model("ollama", "llama3.2", "") == "llama3.2"  # one local model
+    assert llm.bulk_model("ollama", "", "") == "qwen2.5"
+    assert set(claude.MODELS) >= {"claude-opus-5-5", "claude-sonnet-5-5", claude.BULK_MODEL}
+
+
+def test_the_app_uses_the_bulk_model_for_summaries_names_and_cards(
+    paths, memory_keyring: dict
+) -> None:
+    from dataclasses import replace
+
+    from autoshelf.app_service import AppService
+
+    service = AppService(paths)
+    service.save_api_key("sk-ant-test")
+    service.save_settings(replace(service.settings(), llm_provider="claude"))
+    assert service.provider().model == "claude-opus-5-5"  # questions, reading lists
+    assert service.provider(bulk=True).model == "claude-haiku-5-5"
+    service.save_settings(replace(service.settings(), llm_bulk_model="claude-sonnet-5-5"))
+    assert service.provider(bulk=True).model == "claude-sonnet-5-5"

@@ -15,6 +15,7 @@ from autoshelf.ml.classifier import (
     is_related,
     score_folders,
 )
+from autoshelf.wording import reason_text
 
 THRESHOLD = 0.4
 MARGIN = 0.1
@@ -53,12 +54,12 @@ def test_threshold_is_inclusive() -> None:
 def test_two_close_folders_ask() -> None:
     classification = choose(scores(Finance=0.60, Taxes=0.55), THRESHOLD, MARGIN)
     assert classification.choice is None
-    assert "too close" in classification.explanation
+    assert "too close" in reason_text(classification.reason)
 
 
 def test_low_score_explanation_names_the_threshold() -> None:
     classification = choose(scores(Finance=0.2), THRESHOLD, MARGIN)
-    assert "below the 0.40" in classification.explanation
+    assert "below the 0.40" in reason_text(classification.reason)
 
 
 def test_single_folder_needs_only_the_threshold() -> None:
@@ -68,7 +69,7 @@ def test_single_folder_needs_only_the_threshold() -> None:
 def test_no_folders_asks() -> None:
     classification = choose([], THRESHOLD, MARGIN)
     assert classification.choice is None
-    assert "no folders" in classification.explanation
+    assert "no folders" in reason_text(classification.reason)
 
 
 def test_confident_subfolder_wins_even_though_its_parent_scores_close() -> None:
@@ -97,7 +98,7 @@ def test_subfolders_that_fit_equally_well_ask_instead_of_using_the_parent() -> N
     )
     assert classification.choice is None
     assert "'ML/Unsupervised' (0.58) is too close to 'ML/Deep' (0.56)" in (
-        classification.explanation
+        reason_text(classification.reason)
     )
 
 
@@ -108,7 +109,7 @@ def test_tie_between_subfolders_asks_even_when_one_outscores_the_parent() -> Non
 def test_parent_fallback_explanation_is_plain() -> None:
     classification = choose(scores(ML=0.55, ML__Unsupervised=0.38, Fin=0.1), THRESHOLD, MARGIN)
     assert classification.choice.folder == "ML"
-    assert classification.explanation == "best match 'ML' 0.55, next 'Fin' 0.10"
+    assert reason_text(classification.reason) == "best match 'ML' 0.55, next 'Fin' 0.10"
 
 
 def test_unrelated_rival_of_the_parent_blocks_the_whole_branch() -> None:
@@ -131,7 +132,8 @@ def test_details_for_history_list_the_top_three() -> None:
     assert details["candidates"][0]["score"] == 0.9
     assert details["candidates"][0]["name"] == 0.9
     assert details["choice"] == "A"
-    assert details["explanation"]
+    assert details["reason"]["code"] == "clear_match"
+    assert "explanation" not in details  # data, not words
 
 
 @pytest.mark.parametrize(

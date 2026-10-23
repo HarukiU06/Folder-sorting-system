@@ -20,33 +20,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autoshelf import wording
 from autoshelf.actions.undo import UndoError
 from autoshelf.app_service import AppService
 from autoshelf.db.repository import UNDOABLE_ACTIONS, HistoryEntry
 from autoshelf.layout import INBOX_DIRNAME, RESERVED_PREFIX
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.why_panel import WhyPanel
+from autoshelf.ui.widgets import plain_tooltip
 
 COLUMNS = ("When", "File", "From", "To", "Why", "Score", "State")
-_REASONS = {
-    "auto": "Sorted automatically",
-    "ask": "Not sure: sent to Inbox",
-    "user": "You chose",
-    "organize": "Organized (you approved)",
-}
 FORCE_HINT = "; use --force to undo anyway"  # CLI advice; the app asks instead
 _STATES = {"done": "Done", "undone": "Undone", "failed": "Failed", "pending": "In progress"}
 
 
 def describe_reason(entry: HistoryEntry) -> str:
     """A readable version of a history row's reason."""
-    if entry.action == "undo":
-        return f"Undo of #{entry.undo_of}" if entry.undo_of else "Undo"
-    if entry.reason == "user" and entry.details.get("corrects"):
-        return f"You corrected #{entry.details['corrects']}"
-    if entry.reason.startswith("duplicate of "):
-        return f"Set aside: {entry.reason}"
-    return _REASONS.get(entry.reason, entry.reason)
+    return wording.history_reason(entry)
 
 
 def folder_of(path: str | None, root: str | None) -> str:
@@ -165,9 +155,9 @@ class HistoryView(QWidget):
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, entry.id)
-                tip = entry.details.get("explanation") or entry.details.get("note") or ""
+                tip = wording.explanation(entry.details) or entry.details.get("note") or ""
                 if tip:
-                    item.setToolTip(f"#{entry.id}: {tip}")
+                    item.setToolTip(plain_tooltip(f"#{entry.id}: {tip}"))
                 self.table.setItem(row, column, item)
         if selected is not None:
             ids = [entry.id for entry in entries]

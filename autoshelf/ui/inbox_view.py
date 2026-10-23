@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from autoshelf import wording
 from autoshelf.actions.inbox import InboxItem
 from autoshelf.app_service import AppService
 from autoshelf.ui.tasks import TaskRunner
@@ -232,7 +233,7 @@ class InboxView(QWidget):
         self.name.setText(item.path.name)
         self.title.setText(f"Title: {item.title}" if item.title else "")
         self.title.setVisible(bool(item.title))
-        self.why.setText(f"Why it's here: {item.explanation}")
+        self.why.setText(f"Why it's here: {wording.reason_text(item.reason)}")
         self.preview.setPlainText(item.excerpt or "")
         root = item.path.parent.parent  # the file is in <root>/_Inbox
         self.why_panel.show_details(item.details, root)
@@ -283,6 +284,9 @@ class InboxView(QWidget):
             self.detail.setEnabled(True)
             self.moved.emit(f"Moved {path.name} to {folder}")
             self.refresh()
+            self.runner.run(
+                lambda: self.service.rule_suggestion_for(folder), self.offer_rule, lambda exc: None
+            )
 
         def failed(exc: Exception) -> None:
             self.detail.setEnabled(True)
@@ -290,6 +294,26 @@ class InboxView(QWidget):
             self.refresh()
 
         self.runner.run(lambda: self.service.assign(path, folder, tags), done, failed)
+
+    def offer_rule(self, suggestion) -> None:
+        """After an answer: offer the rule the user's choices point to, if there is one."""
+        if suggestion is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Make this a rule?",
+            wording.rule_suggestion(suggestion)
+            + "\n\nA rule would send such files there by itself; you can change or remove it "
+            "on the Rules tab. (No: don't suggest it again.)",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.runner.run(
+                lambda: self.service.add_suggested_rule(suggestion),
+                lambda rule: self.moved.emit(f"Added the rule {rule.name!r}"),
+                lambda exc: QMessageBox.warning(self, "Couldn't add the rule", str(exc)),
+            )
+        else:
+            self.runner.run(lambda: self.service.dismiss_rule_suggestion(suggestion.key))
 
     def _rename(self) -> None:
         item = self._current_item()

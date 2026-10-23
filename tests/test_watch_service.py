@@ -173,3 +173,121 @@ def test_file_deleted_while_paused_is_forgotten(root: Path, run_service) -> None
     service.resume()
     time.sleep(1.0)
     assert recorder.outcomes == []
+
+
+# --- the periodic sweep and rescanning only when needed (Phase 9) -------------------------------
+
+
+def test_sweep_offers_loose_files_but_not_known_unchanged_ones(
+    root: Path, conn, paths: AppPaths
+) -> None:
+    from autoshelf.pipeline import Pipeline
+
+    service = WatchService(root, paths.db_path)
+    waiting = Pipeline(conn, root).process(make(root / "_Inbox" / "from iPhone.pdf", "x"))
+    assert waiting.kind == "waiting"  # recorded as waiting in _Inbox
+    undone = make(root / "undone.pdf", "put back by an undo")
+    record_id = repository.upsert_file(
+        conn, undone, sha256=None, size=undone.stat().st_size, mtime=undone.stat().st_mtime
+    )
+    repository.set_file_status(conn, record_id, "ignored")
+    missed = make(root / "missed.pdf", "its event was lost")
+
+    assert service.offer_loose_files(conn) == 1
+    assert service.tracker.poll() == []  # not stable yet, but tracked:
+    assert len(service.tracker) == 1
+
+    # A waiting file that changed is looked at again.
+    (root / "_Inbox" / "from iPhone.pdf").write_text("edited on the phone", encoding="utf-8")
+    assert service.offer_loose_files(conn) == 2
+    assert missed.exists()
+
+
+def test_dry_run_sweep_reports_each_file_once(root: Path, conn, paths: AppPaths) -> None:
+    from autoshelf.pipeline import Outcome, OutcomeKind
+
+    service = WatchService(root, paths.db_path, dry_run=True)
+    report = make(root / "report.pdf", "quarterly report")
+    service._report(Outcome(OutcomeKind.WOULD_MOVE, report, "would wait in _Inbox"))
+    assert service.offer_loose_files(conn) == 0
+    report.write_text("quarterly report, revised", encoding="utf-8")
+    assert service.offer_loose_files(conn) == 1
+
+
+def test_folder_events_mark_the_library_for_a_rescan(root: Path, paths: AppPaths) -> None:
+    service = WatchService(root, paths.db_path)
+    dirty = service._library_dirty
+
+    for reserved in (root / "_Inbox", root / "_Duplicates"):
+        service.folder_changed(reserved)
+    service.forget(root / "_Inbox" / "a.pdf", removed=True)
+    # AutoShelf's own move (Windows reports one between folders as deleted + created).
+    service.self_moves.expect_move(root / "Finance" / "a.pdf", root / "Travel" / "a.pdf")
+    service.forget(root / "Finance" / "a.pdf", removed=True)
+    assert not dirty.is_set()
+
+    service.folder_changed(root / "New folder")  # appeared empty: no file event follows
+    assert dirty.is_set()
+    dirty.clear()
+    service.forget(root / "Finance" / "Old" / "a.pdf", removed=True)  # file or folder: rescan
+    assert dirty.is_set()
+    dirty.clear()
+    service.forget(root / "Finance", removed=True)  # Windows says "deleted", not "folder"
+    assert dirty.is_set()
+
+
+def test_a_new_empty_folder_is_sorted_into_right_away(root: Path, run_service) -> None:
+    (root / "Finance").mkdir()
+    recorder = run_service(
+        make_library=lambda c: LibraryIndex(c, root, FakeEmbedder()), threshold=0.3, margin=0.1
+    )
+    make(root / "invoice.txt", "invoice total tax due bank")
+    recorder.wait_for(outcome_for("invoice.txt"))
+
+    # Only a folder event says it exists: no file event, no description (no version bump).
+    (root / "Recipe").mkdir()
+    time.sleep(0.5)
+    make(root / "banana bread recipe.txt", "recipe baking banana oven")
+    recorder.wait_for(outcome_for("banana bread recipe.txt"))
+
+    assert (root / "Recipe" / "banana bread recipe.txt").exists()
+
+
+def test_the_sweep_finds_files_whose_events_were_lost(
+    root: Path, run_service, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.watcher import service as service_module
+
+    # Windows dropped every event on this busy folder.
+    monkeypatch.setattr(service_module._EventHandler, "on_any_event", lambda self, event: None)
+    recorder = run_service(sweep_interval=0.5)
+    time.sleep(0.3)  # after the files present at the start were looked at
+    make(root / "arrived quietly.pdf", "no event for this one")
+
+    recorder.wait_for(outcome_for("arrived quietly.pdf"))
+    assert (root / "_Inbox" / "arrived quietly.pdf").exists()
+
+
+def test_sorting_dropped_files_doesnt_rescan_the_library(
+    root: Path, conn, run_service, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ml import library as library_module
+
+    make(root / "Recipes" / "curry.txt", "recipe curry onion simmer")
+    repository.set_folder_description(conn, "Recipes", "recipe cooking baking oven")
+    (root / "Finance").mkdir()
+    scans: list[int] = []
+    real = library_module.scan_library
+    monkeypatch.setattr(
+        library_module, "scan_library", lambda *args, **kw: scans.append(1) or real(*args, **kw)
+    )
+    recorder = run_service(
+        make_library=lambda c: LibraryIndex(c, root, FakeEmbedder()), threshold=0.3, margin=0.1
+    )
+    for name in ("banana bread recipe.txt", "apple pie recipe.txt", "plum cake recipe.txt"):
+        make(root / name, "recipe baking oven sugar")
+        recorder.wait_for(outcome_for(name))
+    time.sleep(2.5)  # past the delay after which changed folders are rescanned
+
+    assert len(list((root / "Recipes").iterdir())) == 4
+    assert len(scans) == 1  # only when the watcher started

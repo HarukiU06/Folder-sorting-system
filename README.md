@@ -7,11 +7,13 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** all eight phases of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–15 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
-> your corrections, follows your rules, explains every decision, and helps you search and
-> tidy your library. Optional AI features (off by default) add summaries, better names,
+> your corrections, follows your rules, explains every decision, helps you search and tidy
+> your library, and makes smaller copies or copies in other formats. It adds itself to
+> Explorer's right-click menu, answers from notification buttons, comes with an installer, and
+> sums up your week. Optional AI features (off by default) add summaries, better names,
 > answers from your files and study tools.
 
 | Inbox | Why did it go there? | Search |
@@ -27,7 +29,10 @@ AutoShelf moves real files, so:
 - it **never deletes** a file and **never overwrites** one: name clashes get ` (2)`, ` (3)`, …;
 - it only works inside the root you choose, and refuses paths that lead outside it;
 - it records every move in its history **before** doing it, so every move can be undone;
-- it never creates category folders (it only creates its own `_Inbox/` when first needed);
+- it never creates category folders (only its own `_Inbox/`, `_Duplicates/` and `_Trash/`,
+  when first needed);
+- compressing or converting a file always makes a **new** file next to it; the original
+  stays as it is, and undoing sets the new file aside in `_Trash/`;
 - it only moves a file on its own when one folder is a clear match; otherwise it asks;
 - it waits until a file has stopped changing for 3 seconds and no program is still writing it;
 - it ignores temporary and partial files (`~$*`, `*.tmp`, `*.crdownload`, `*.part`,
@@ -39,6 +44,7 @@ AutoShelf moves real files, so:
 ```
 AutoShelf/                  <- the root you pass with --root
 ├── _Inbox/                 <- files waiting for your decision
+├── _Trash/                 <- copies AutoShelf made and you undid (delete them yourself)
 ├── Finance/                <- your own folders; files you put here are never moved
 ├── Machine Learning/
 │   └── Unsupervised/
@@ -89,15 +95,28 @@ start paused so you can look first. AutoShelf then lives in the system tray:
 - **Tidy up:** organize a messy folder (preview, then one undoable batch), find identical
   files and possible versions.
 - **Dashboard:** files per folder, files added per month, how many automatic moves you
-  kept, the most corrected folders, and files not opened for six months.
+  kept, the most corrected folders, and files untouched for six months (not changed, added
+  or opened from AutoShelf: Windows doesn't reliably record when you open a file elsewhere).
 - **Ask** (only with AI on): questions about your files, answered with citations.
-- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications,
-  which files to ignore, and other folders to watch (optional, e.g. Downloads).
+- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications
+  (and their buttons), start with Windows, the Explorer menu, which files to ignore, how
+  often to look for missed files, files sorted by name only (to read them again), and other
+  folders to watch (optional, e.g. Downloads).
 
 When a file needs your decision, a notification asks "Where should *file* go?" with the best
-guesses; click it to open the Inbox with that file selected. (Notifications have no buttons
-of their own: answering from inside a notification needs the app to be registered with
-Windows by an installer, and AutoShelf installs nothing.) The tray menu can pause sorting: new files then wait until you resume.
+guesses; click it to open the Inbox with that file selected. When AutoShelf is installed
+with the installer (or Settings → "Buttons in notifications" is on), the notification also
+has a button for each of the best three folders and "Leave in Inbox": a folder button puts
+the file there (AutoShelf learns from it, as from the Inbox, and History can undo it), even
+if AutoShelf was closed in the meantime. The buttons open `autoshelf:` links, which carry
+only a random code that works once and expires after 14 days, never a file name, so a link
+on a web page can't make AutoShelf move anything. Once a week a notification sums up what AutoShelf did: "This week: 23 sorted, 3 waiting
+in Inbox, 1 correction learned" (files put into your folders and not undone, files in the
+Inbox now, and Inbox answers and corrections it learned from); clicking it opens the
+Dashboard. As AutoShelf isn't always running, it looks when it starts and then every hour;
+the first start only starts counting, and a week with nothing to tell is skipped. Settings
+turns it off; `autoshelf digest` prints the same line any time. The tray menu can pause
+sorting: new files then wait until you resume.
 Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.
@@ -108,6 +127,28 @@ Settings → "Start AutoShelf when I sign in to Windows" (or `autoshelf config -
 adds an entry to your user's startup programs (the registry's `Run` key; no administrator
 rights). AutoShelf then starts in the tray without opening its window. Turn it off the same
 way. `autoshelf --background` starts it like that by hand.
+
+### Explorer's right-click menu
+
+Settings → "Add AutoShelf to Explorer's right-click menu" (or
+`autoshelf config --explorer-menu on`) adds, for your Windows user only (no administrator
+rights):
+
+- **AutoShelf ▸ Sort with AutoShelf:** a preview (Tidy up → Organize) of where the selected
+  files would go. Nothing moves until you click Apply, and the moves form one batch you can
+  undo. Files outside your library can come from a folder on the same drive; a file on
+  another drive gets a message instead, because AutoShelf only moves files (it never copies
+  and deletes them).
+- **AutoShelf ▸ Why is this here?** what AutoShelf did with the file and why, or that it has
+  no record of moving it.
+- **AutoShelf ▸ Compress** and **Convert with AutoShelf ▸** (only on file types it can
+  convert, with the formats available on your PC): see [Compress and convert](#compress-and-convert).
+
+On Windows 11 the entries are under "Show more options". Several selected files are handled
+together (one ZIP, one PDF of several images, one preview). If AutoShelf isn't running, the
+menu starts it. The same commands work from a terminal: `AutoShelf.exe --sort FILE ...`,
+`--why FILE`, `--compress FILE ...`, `--convert pdf FILE ...` (from source:
+`.venv\Scripts\python.exe -m autoshelf --sort FILE ...`).
 
 ## Building the app (no Python needed to run it)
 
@@ -122,6 +163,30 @@ and `autoshelf-cli.exe`, the command line. Copy the whole folder anywhere and ru
 source. The build uses a hand-written PyInstaller spec (`packaging\autoshelf.spec`) and
 builds one folder rather than one file, so it starts quickly and its libraries stay
 replaceable.
+
+### The installer
+
+```powershell
+winget install JRSoftware.InnoSetup                                # once: Inno Setup 6
+powershell -ExecutionPolicy Bypass -File packaging\installer.ps1   # after build.ps1
+```
+
+This makes `dist\AutoShelf-<version>-setup.exe` (`packaging\autoshelf.iss`). It installs for
+your Windows user only, without administrator rights, into
+`%LOCALAPPDATA%\Programs\AutoShelf`, with a Start-menu shortcut. It registers AutoShelf with
+Windows for notification buttons and, if you leave the options ticked, adds the Explorer menu
+and starts AutoShelf when you sign in. Uninstalling (Settings → Apps) quits AutoShelf and
+removes all of that again, including the menu entries, the sign-in entry and the
+`autoshelf:` link, but keeps `%APPDATA%\AutoShelf` (your history and settings, so earlier
+moves stay undoable if you reinstall). Your files are never touched. The installer isn't
+code-signed, so Windows SmartScreen may warn before it runs ("More info" → "Run anyway").
+
+### Releases
+
+Pushing a tag that matches the version in `autoshelf\__init__.py` (for example `v0.1.0`)
+runs `.github\workflows\release.yml`: it builds the app and the installer on GitHub's
+Windows runner and attaches `AutoShelf-<version>-setup.exe` and a ZIP of the app folder to
+a GitHub Release.
 
 ## Command line
 
@@ -170,6 +235,8 @@ Rules, learning and explanations:
 .venv\Scripts\python.exe -m autoshelf rules add Invoices --name-matches "invoice|receipt" --to Finance
 .venv\Scripts\python.exe -m autoshelf rules add Notebooks --extension .ipynb --to "Machine Learning"
 .venv\Scripts\python.exe -m autoshelf rules add Syllabus --text-contains Syllabus --to University
+.venv\Scripts\python.exe -m autoshelf rules add "Old scans" --extension pdf --size-min 1MB --date-to 2020-12-31 --tag Old --rename "{year} {name}"
+.venv\Scripts\python.exe -m autoshelf rules suggest                # rules your choices point to
 .venv\Scripts\python.exe -m autoshelf rules                      # list (also: remove/enable/disable/up/down ID)
 .venv\Scripts\python.exe -m autoshelf rules test "C:\path\to\a file.pdf"
 
@@ -196,6 +263,10 @@ Searching and tidying up:
 .venv\Scripts\python.exe -m autoshelf stats
 
 .venv\Scripts\python.exe -m autoshelf config --watch "$env:USERPROFILE\Downloads"   # opt in a folder to watch
+
+.venv\Scripts\python.exe -m autoshelf compress "<file>" ["<file>" ...]   # smaller copy, or a ZIP of several
+.venv\Scripts\python.exe -m autoshelf compress "<file>" --zip            # a ZIP even of one PDF or image
+.venv\Scripts\python.exe -m autoshelf convert "<file>" --to pdf          # also: docx, png, jpg, webp, bmp, tiff
 ```
 
 Better names and new folders (no AI needed), and the optional AI:
@@ -216,11 +287,16 @@ Better names and new folders (no AI needed), and the optional AI:
 
 Other commands: `extract FILE` shows the text AutoShelf reads from a file, `index` reads the
 files already in your folders ahead of time (the watcher also does this when it starts),
-and `config` shows or changes settings. Every command that needs the root accepts `--root`.
+`skipped` lists files sorted by name only because AutoShelf stopped while reading them
+(`skipped --clear [FILE ...]` reads them again), `calibrate [--apply]` tests how well
+AutoShelf would sort your library at each confidence level (see below), and `config` shows
+or changes settings. Every command that needs the root accepts `--root`.
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
-unchanged before it is processed. A file you undo is put back where it was and left alone
-from then on. Undo refuses (and changes nothing) if the file has been edited since it was
+unchanged before it is processed. Windows can miss file events in busy iCloud folders, so
+every 5 minutes the watcher also looks at the root and `_Inbox` again for files it missed
+(files it already knows, unchanged, aren't read again); Settings changes the interval or
+turns it off. A file you undo is put back where it was and left alone from then on. Undo refuses (and changes nothing) if the file has been edited since it was
 moved (`--force` overrides), was moved elsewhere, or if its original folder no longer exists.
 
 The log file is `%APPDATA%\AutoShelf\logs\autoshelf.log`. Set `AUTOSHELF_HOME` to use a
@@ -256,14 +332,41 @@ model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`); a differe
 A dry run moves nothing and records no history, but it does save the vectors of the files
 already in your folders, so the next start is faster.
 
+## How well would it sort your library?
+
+Settings → "How well would AutoShelf sort my library?" (or `autoshelf calibrate`) sorts
+every file already in your folders as if it had just arrived, leaving it out of its own
+folder's examples, and compares the result with where the file is. Nothing is moved. For
+each slider position you see a line like "At Balanced: 87% correct, 9% to the Inbox, 4%
+wrong", and a recommended position: the most automatic one that puts at most 5% of the
+files in a wrong folder ("Use the recommended setting", or `autoshelf calibrate --apply`).
+AutoShelf offers this test once, when your folders hold at least 10 files. Files that are
+iCloud online-only are left out of the test (they aren't read).
+
 ## Rules
 
-Rules override the AI. Each one says "when the file name matches / the extension is / the
-text contains …, move it to this folder". They are checked from top to bottom before
-AutoShelf reads a file's meaning, and the first one that matches decides. A rule-based move
-is logged as "Rule: *name*" and can be undone like any other. Rules never create folders: if
-a rule's folder is gone, the file waits in the Inbox. Edit them on the Rules tab (where you
-can also test them on any file) or with `autoshelf rules`.
+Rules override the AI. Each one has one or more conditions, which must all hold (or any
+one of them): the file name matches a pattern, the extension is …, the text contains …, the
+size is between …, or the file's date is between …. When they hold, the rule does one or more
+things:
+
+- **move** the file to a folder (logged as "Rule: *name*");
+- **tag** it;
+- **rename** it from a template such as `{date} {title}` (fields: `{name}` `{title}` `{date}`
+  `{year}` `{month}` `{day}` `{folder}`; the extension is kept). A rule you wrote counts as
+  your approval: the new name is given without asking, logged in History and can be undone.
+
+A rule that doesn't move lets AutoShelf decide the folder; its tags and new name still apply
+(a file that stays waiting in the Inbox is renamed there). Rules are checked from top to
+bottom before AutoShelf reads a file's meaning, and the first one that applies decides. Rules
+never create folders: if a rule's folder is gone, the file waits in the Inbox. Edit them on
+the Rules tab (where you can also test them on any file) or with `autoshelf rules`.
+
+**Suggested rules:** when several files you put in a folder share a word in their names or
+an extension (at least 3, and most such files you placed went there), AutoShelf suggests a
+rule, if the files already in your folders agree. The Rules tab lists suggestions ("Make this
+a rule" or "Don't suggest it"), the Inbox offers one right after you answer, and
+`autoshelf rules suggest` lists them (`--add N`, `--dismiss N`).
 
 ## Learning from your corrections
 
@@ -288,7 +391,10 @@ Every decision is stored with its explanation: the three best folders and how ea
 made (similarity to the folder's name and description, to the files in it, and anything
 learned), the most similar files already in the chosen folder, the words the file has in
 common with that folder (ranked by TF-IDF; for Japanese, kanji and katakana words), or the
-rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshelf why ID`.
+rule that fired and what it matched. See it in the History and Inbox "Why?" panels, or with
+`autoshelf why ID`. The explanation is stored as data (the reason, folders, scores, rule), and
+the sentence is written when it is shown, so the app and the command line say the same thing;
+entries from older versions, stored as text, are shown as they are.
 
 ## Search, tags and tidying up
 
@@ -312,6 +418,30 @@ rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshe
   already there and subfolders are left alone, the folder must be on the same drive as
   your library (files are only ever moved, never copied and deleted), and undo puts a file
   back where it came from.
+
+## Compress and convert
+
+In the Library (or with `autoshelf compress` / `autoshelf convert`), pick a file in your
+library and:
+
+- **Compress:** a PDF gets a smaller copy with its images re-compressed
+  (`report (smaller).pdf`), an image gets a smaller copy in its own format (a HEIC photo
+  becomes a JPG), at most 2560 pixels on the long side, and anything else, or several files,
+  goes into a ZIP. If the copy would not
+  be smaller, AutoShelf says so and makes nothing.
+- **Convert to:** images between PNG, JPG, WEBP, BMP and TIFF (transparency becomes white
+  in a JPG), images to PDF (several images make one PDF, a page each), PDF to Word (`.docx`;
+  the layout is only approximated, so check it), and Word, PowerPoint and Excel files to
+  PDF (this uses Microsoft Office if it is installed, otherwise LibreOffice; without either
+  the option is hidden). HEIC photos are supported only if the optional `pillow-heif`
+  package is installed.
+
+The new file is made in AutoShelf's working folder (`%APPDATA%\AutoShelf\cache\work`) and
+then placed next to the original, with ` (2)` if the name is taken. The original is never
+changed. History lists it ("Made a PDF version of …"), and undo moves the new file into
+`_Trash/` in your root, where you can delete it yourself. A copy made in one of your
+folders stays there; one made in the root or in `_Inbox` is left where it is, unless you
+turn on Settings → "Sort compressed and converted copies like new files".
 
 ## Better names and new folders
 
@@ -340,8 +470,10 @@ on your own PC, e.g. `ollama pull qwen2.5`). Then:
 
 Privacy: with AI on, the text of the files you ask about is sent to the provider (to
 Anthropic's servers for the Claude API; it stays on your PC with Ollama). Sorting never
-uses the AI, and nothing is sent unless you ask for one of the features above. The default
-Claude model is `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` are cheaper.
+uses the AI, and nothing is sent unless you ask for one of the features above. Questions and
+reading lists use `claude-opus-5-5` by default; summaries, names and flashcards (many small
+requests) use the cheaper `claude-haiku-5-5`. Choose other models in Settings, or with
+`config --ai-model` and `config --ai-bulk-model`.
 
 ## What AutoShelf reads
 
@@ -362,8 +494,9 @@ Only the filename and text, never images or audio content (no OCR, no transcript
 A file that can't be parsed (corrupt, password-protected, or an Office or EPUB file that would
 unpack to over 300 MB, as a "zip bomb" does) is still handled using its name. So is a file that
 made AutoShelf stop while reading it: it isn't read again (so it can't crash AutoShelf at every
-start) until its content changes. They are listed in `%APPDATA%\AutoShelf\reading.json`; delete
-that file to have them read again.
+start) until its content changes. A power cut or a forced restart while a file is being read
+looks the same, so Settings lists these files ("Files sorted by name only"), and "Read again"
+(or `autoshelf skipped --clear`) has AutoShelf read them on its next look.
 
 ## Development
 
@@ -371,6 +504,7 @@ that file to have them read again.
 .venv\Scripts\python.exe -m pytest -q                                   # run the tests
 .venv\Scripts\ruff.exe check . ; .venv\Scripts\ruff.exe format .       # lint and format
 .venv\Scripts\python.exe scripts\make_screenshots.py --model-cache "$env:APPDATA\AutoShelf\cache\models"
+.venv\Scripts\python.exe scripts\benchmark.py --model-cache "$env:APPDATA\AutoShelf\cache\models"
 ```
 
 Tests only use temporary folders, never your real files or `%APPDATA%`. They also replace
@@ -380,12 +514,29 @@ access. GitHub Actions runs the same lint and tests on Windows with Python 3.12 
 (`.github/workflows/tests.yml`). The screenshots are made from a demo library in a
 temporary folder.
 
+`scripts/benchmark.py` checks the classifier's hand-tuned constants. It generates a sample
+library (`scripts/sample_corpus.py`: eleven English and Japanese folders, some close to
+each other, some without a description, files with meaningless names, and "habits" such as
+hotel invoices kept under Travel), or reads a folder you name with `--library` (read only).
+It reports leave-one-out results per slider position, the effect of `NEIGHBOR_WEIGHT`,
+`FULL_POOL`, `NEIGHBORS` and `HEADER_WEIGHT`, a threshold × margin grid, and a simulation of
+files arriving one by one with the user correcting mistakes, for several
+`SIMILAR_FROM`/`SIMILAR_FULL` values. `--fake` runs it without the language model. On the
+generated library (default model, 8 seeds) Balanced sorted 86% of files correctly, sent 12%
+to the Inbox and 1.5% to a wrong folder. `NEIGHBOR_WEIGHT` 0.7–0.8 and `HEADER_WEIGHT` 0.3
+did 1–3% better, and learning from corrections mainly made sorting more cautious. The
+constants were kept, because the generated texts are cleaner than real documents. Run it
+with `--library` on a copy of a real library before changing them.
+
 ## License
 
 AutoShelf's own code is MIT-licensed (see [LICENSE](LICENSE)). It uses, among others:
 PySide6 / Qt (LGPL-3.0), PyMuPDF (AGPL-3.0), ebooklib (AGPL-3.0), mutagen (GPL-2.0-or-later),
 PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
-openpyxl, Pillow, beautifulsoup4, striprtf and keyring (BSD, MIT, Apache-2.0 or similar).
+openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools, fire,
+windows-toasts and the winrt packages (BSD, MIT, Apache-2.0 or similar), and
+opencv-python-headless (Apache-2.0, needed by pdf2docx; it includes an FFmpeg library under
+LGPL-2.1). The installer is made with Inno Setup, whose license allows that.
 The packaged app in `dist\AutoShelf\` bundles all of them, so sharing that folder means
 following their licenses too, notably the AGPL and GPL ones (for example by pointing to this
 repository's source).

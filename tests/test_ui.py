@@ -3,6 +3,7 @@
 import html
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -13,7 +14,9 @@ from helpers import make
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from autoshelf import commands
 from autoshelf.app_service import AppService
+from autoshelf.commands import Command, encode
 from autoshelf.config import CONFIDENCE_LEVELS, AppPaths
 from autoshelf.pipeline import Outcome, OutcomeKind
 from autoshelf.ui import app as app_module
@@ -62,10 +65,16 @@ def settle(qtbot, runner: TaskRunner) -> None:
 
 @pytest.fixture(autouse=True)
 def no_dialogs(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    """Modal dialogs would block forever; record them instead."""
+    """Modal dialogs would block forever; record them instead (questions get "No")."""
     shown: list[tuple] = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: shown.append(args))
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: shown.append(args))
+
+    def no(*args):
+        shown.append(args)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", no)
     return shown
 
 
@@ -371,40 +380,197 @@ def test_server_name_is_per_data_folder(paths: AppPaths, tmp_path: Path) -> None
     assert app_module.server_name(paths) == app_module.server_name(AppPaths(paths.home))
 
 
-def test_later_launches_and_tools_can_show_or_quit_the_app(
-    qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from PySide6.QtNetwork import QLocalServer
+class Receiver:
+    """Stands in for the app: records the commands it receives."""
 
-    shown, quits = [], []
+    def __init__(self) -> None:
+        self.received: list[Command] = []
 
-    class FakeApp:
-        def show_window(self) -> None:
-            shown.append(True)
+    def receive(self, command: Command) -> None:
+        self.received.append(command)
 
-    monkeypatch.setattr(app_module.QApplication, "quit", lambda: quits.append(True))
+
+def start_sender(name: str, command: Command, wait_seconds: float = 0.0) -> subprocess.Popen:
+    """A later launch is another process; send_command blocks until acknowledged."""
+    code = (
+        "import sys; from autoshelf.ui.app import send_command; "
+        "from autoshelf.commands import decode; "
+        f"sys.exit(0 if send_command({name!r}, decode({encode(command)[:-1]!r}), "
+        f"wait_seconds={wait_seconds}) else 1)"
+    )
+    return subprocess.Popen([sys.executable, "-c", code])
+
+
+def sent(qtbot, sender: subprocess.Popen) -> bool:
+    qtbot.waitUntil(lambda: sender.poll() is not None, timeout=WAIT_MS * 3)
+    return sender.returncode == 0
+
+
+def test_later_launches_hand_their_command_to_the_app(qtbot, tmp_path: Path) -> None:
     name = app_module.server_name(AppPaths(tmp_path))
-    server = QLocalServer()
-    QLocalServer.removeServer(name)
-    assert server.listen(name)
-    app_module._serve_commands(server, FakeApp())
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
 
-    def send(command: bytes) -> bool:
-        # A later launch is another process; send_command blocks until acknowledged.
-        code = (
-            "import sys; from autoshelf.ui.app import send_command; "
-            f"sys.exit(0 if send_command({name!r}, {command!r}) else 1)"
-        )
-        sender = subprocess.Popen([sys.executable, "-c", code])
-        qtbot.waitUntil(lambda: sender.poll() is not None, timeout=WAIT_MS * 3)
-        return sender.returncode == 0
-
-    assert send(app_module.SHOW_COMMAND)
-    assert shown == [True]
-    assert send(app_module.QUIT_COMMAND)
-    qtbot.waitUntil(lambda: quits == [True], timeout=WAIT_MS)
+    unicode_file = Command(commands.COMPRESS, (str(tmp_path / "写真 2024 ★.png"),))
+    assert sent(qtbot, start_sender(name, app_module.SHOW_COMMAND))
+    assert sent(qtbot, start_sender(name, unicode_file))
+    assert receiver.received == [app_module.SHOW_COMMAND, unicode_file]
     server.close()
-    assert not send(app_module.SHOW_COMMAND)
+    assert not sent(qtbot, start_sender(name, app_module.SHOW_COMMAND))  # nobody listens
+
+
+def test_a_launch_waits_for_the_app_another_launch_is_starting(qtbot, tmp_path: Path) -> None:
+    name = app_module.server_name(AppPaths(tmp_path))
+    sender = start_sender(name, Command(commands.SORT, ("a.txt",)), wait_seconds=20)
+    qtbot.wait(1500)  # the app isn't listening yet
+    assert sender.poll() is None
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
+    assert sent(qtbot, sender)
+    assert receiver.received == [Command(commands.SORT, ("a.txt",))]  # once
+    server.close()
+
+
+def test_the_app_refuses_nonsense(qtbot, tmp_path: Path) -> None:
+    from PySide6.QtNetwork import QLocalSocket
+
+    name = app_module.server_name(AppPaths(tmp_path))
+    server = app_module.listen(name)
+    receiver = Receiver()
+    app_module._serve_commands(server, receiver)
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    assert socket.waitForConnected(WAIT_MS)
+    socket.write(b'{"action": "format_disk"}\n')
+    socket.flush()
+    answer = b""
+    qtbot.waitUntil(lambda: socket.bytesAvailable() > 0, timeout=WAIT_MS)
+    answer = bytes(socket.readAll().data())
+    assert answer == commands.REFUSED
+    assert receiver.received == []
+    server.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named pipes are Windows'")
+def test_a_launch_knows_which_process_it_talks_to(qtbot, tmp_path: Path) -> None:
+    import os
+
+    from PySide6.QtNetwork import QLocalSocket
+
+    name = app_module.server_name(AppPaths(tmp_path))
+    server = app_module.listen(name)
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    assert socket.waitForConnected(WAIT_MS)
+    assert app_module.server_process(socket) == os.getpid()
+    socket.abort()
+    server.close()
+
+
+QUITTING_APP = """
+import sys, time
+from PySide6.QtCore import QCoreApplication, QTimer
+from autoshelf.ui import app as app_module
+
+class Slow:
+    def receive(self, command):
+        QTimer.singleShot(1500, QCoreApplication.quit)  # shutting down takes a while
+
+qapp = QCoreApplication([])
+server = app_module.listen(sys.argv[1])
+app_module._serve_commands(server, Slow())
+print("listening", flush=True)
+qapp.exec()
+time.sleep(1)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="waits on a Windows process handle")
+def test_quit_waits_until_the_app_has_ended(tmp_path: Path) -> None:
+    name = app_module.server_name(AppPaths(tmp_path))
+    running = subprocess.Popen(
+        [sys.executable, "-c", QUITTING_APP, name], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert running.stdout.readline().strip() == "listening"
+        started = time.monotonic()
+        assert app_module.send_command(name, app_module.QUIT_COMMAND, exit_seconds=20)
+        assert time.monotonic() - started >= 2.0  # it waited for the app to end (~2.5 s)
+        running.wait(timeout=10)
+    finally:
+        running.kill()
+
+
+def test_why_for_a_file_autoshelf_made(qtbot, service: AppService, shelf: Path) -> None:
+    from autoshelf.ui.why_panel import WhyDialog
+
+    made = service.compress([shelf / "Finance" / "invoice 2024.txt"])
+    dialog = WhyDialog(service.why_here(made.dst))
+    qtbot.addWidget(dialog)
+    text = dialog.panel.toPlainText()
+    assert text.count("a ZIP of invoice 2024.txt") == 1  # said once
+
+
+def test_quit_and_show_commands(qtbot, app, monkeypatch: pytest.MonkeyPatch) -> None:
+    quits = []
+    monkeypatch.setattr(app_module.QApplication, "quit", lambda: quits.append(True))
+    app.receive(app_module.SHOW_COMMAND)
+    assert app.window.isVisible()
+    app.receive(app_module.QUIT_COMMAND)
+    qtbot.waitUntil(lambda: quits == [True], timeout=WAIT_MS)
+
+
+def test_files_right_clicked_together_make_one_zip(qtbot, app, shelf: Path) -> None:
+    a = make(shelf / "Finance" / "a.txt", "a")
+    b = make(shelf / "Finance" / "b.txt", "b")
+    app.receive(Command(commands.COMPRESS, (str(a),)))
+    app.receive(Command(commands.COMPRESS, (str(b),)))
+    qtbot.waitUntil(lambda: (shelf / "Finance" / "a and 1 more.zip").exists(), timeout=WAIT_MS)
+    status = app.window.statusBar()
+    qtbot.waitUntil(lambda: "Made a and 1 more.zip" in status.currentMessage(), timeout=WAIT_MS)
+    assert not (shelf / "Finance" / "a.zip").exists()
+
+
+def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: Path) -> None:
+    bill = make(tmp_path / "Downloads" / "bill.txt", "invoice tax due to the bank")
+    app.run_command(Command(commands.SORT, (str(bill),)))
+    page = app.window.tidy.organize
+    qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
+    assert app.window.tabs.currentWidget() is app.window.tidy
+    assert page.source.currentText() == "Files chosen in Explorer"
+    assert page.table.item(0, 2).text() == "Downloads"  # the folder, not its whole path
+    assert page.table.cellWidget(0, 3).currentText() == "Finance"
+    page.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    page.apply()
+    qtbot.waitUntil(lambda: (shelf / "Finance" / "bill.txt").exists(), timeout=WAIT_MS)
+    assert not bill.exists()
+
+
+def test_sort_explains_files_it_cant_take(
+    qtbot, app, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warnings = []
+    monkeypatch.setattr(
+        "autoshelf.ui.tidy_view.QMessageBox.warning", lambda *args: warnings.append(args[2])
+    )
+    kept = make(shelf / "_Trash" / "x.txt", "x")
+    app.run_command(Command(commands.SORT, (str(kept),)))
+    qtbot.waitUntil(lambda: bool(warnings), timeout=WAIT_MS)
+    assert "AutoShelf's own folders" in warnings[0]
+
+
+def test_why_is_this_here_opens_a_dialog(qtbot, app, shelf: Path) -> None:
+    from autoshelf.ui.why_panel import WhyDialog
+
+    mine = make(shelf / "Finance" / "mine.txt", "x")
+    app.run_command(Command(commands.WHY, (str(mine),)))
+    qtbot.waitUntil(lambda: bool(app._dialogs), timeout=WAIT_MS)
+    dialog = app._dialogs[-1]
+    assert isinstance(dialog, WhyDialog) and dialog.isVisible()
+    assert "no record of moving mine.txt" in dialog.panel.toPlainText()
+    dialog.close()
 
 
 # --- Phase 5: "Why here?", corrections and rules -------------------------------------------
@@ -460,15 +626,23 @@ def test_rules_view_adds_toggles_tests_and_deletes(
     assert "No rules yet" in view.status.text()
 
     monkeypatch.setattr(RuleDialog, "exec", lambda self: RuleDialog.DialogCode.Accepted)
-    monkeypatch.setattr(
-        RuleDialog, "values", lambda self: ("Invoices", "name", "invoice", "Finance", True)
-    )
+    values = {
+        "name": "Invoices",
+        "conditions": [{"kind": "name", "pattern": "invoice"}],
+        "match_any": False,
+        "target": "Finance",
+        "tags": ["Taxes"],
+        "rename_template": "",
+        "enabled": True,
+    }
+    monkeypatch.setattr(RuleDialog, "values", lambda self: dict(values))
     with qtbot.waitSignal(view.changed, timeout=WAIT_MS):
         view.add_rule()
         settle(qtbot, runner)
     settle(qtbot, runner)
     assert view.table.rowCount() == 1
     assert view.table.item(0, 2).text() == "file name matches /invoice/"
+    assert view.table.item(0, 3).text() == "move to Finance; tag Taxes"
 
     view.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     settle(qtbot, runner)
@@ -493,17 +667,65 @@ def test_rules_view_adds_toggles_tests_and_deletes(
     assert service.rules() == []
 
 
-def test_rule_dialog_offers_folders_and_kinds(qtbot) -> None:
-    from autoshelf.ui.rules_view import RuleDialog
+def test_rule_dialog_takes_several_conditions_and_actions(qtbot) -> None:
+    from autoshelf.ui.rules_view import DONT_MOVE, RuleDialog
 
     dialog = RuleDialog(["Finance", "Recipes"])
     qtbot.addWidget(dialog)
-    dialog.name.setText("Notebooks")
-    dialog.kind.setCurrentIndex(dialog.kind.findData("extension"))
-    dialog.pattern.setText(".ipynb")
-    dialog.target.setCurrentText("Recipes")
-    assert dialog.values() == ("Notebooks", "extension", ".ipynb", "Recipes", True)
-    assert "extensions" in dialog.hint.text()
+    dialog.name.setText("Big scans")
+    first = dialog.rows[0]
+    first.kind.setCurrentIndex(first.kind.findData("extension"))
+    first.first.setText(".pdf")
+    assert first.second.isHidden()
+    second = dialog.add_condition(None)
+    second.kind.setCurrentIndex(second.kind.findData("size"))
+    assert not second.second.isHidden()
+    second.first.setText("1MB")
+    third = dialog.add_condition({"kind": "date", "from": "2025-01-01", "to": None})
+    dialog._remove_condition(third)
+    dialog.match.setCurrentIndex(1)
+    assert dialog.target.itemText(0) == DONT_MOVE
+    dialog.tags.setText("Scans, 2025 ")
+    dialog.rename.setText("{date} {title}")
+
+    assert dialog.values() == {
+        "name": "Big scans",
+        "conditions": [
+            {"kind": "extension", "pattern": ".pdf"},
+            {"kind": "size", "min": "1MB", "max": None},
+        ],
+        "match_any": True,
+        "target": "",
+        "tags": ["Scans", "2025"],
+        "rename_template": "{date} {title}",
+        "enabled": True,
+    }
+
+
+def test_rule_dialog_shows_a_saved_rule(qtbot) -> None:
+    from autoshelf.db.repository import RuleRecord
+    from autoshelf.ui.rules_view import RuleDialog
+
+    rule = RuleRecord(
+        1,
+        "Old big files",
+        1,
+        True,
+        (
+            {"kind": "size", "min": 1536, "max": None},
+            {"kind": "date", "from": None, "to": "2020-12-31"},
+        ),
+        "Recipes",
+        tags=("Old",),
+        rename_template="{year} {name}",
+    )
+    dialog = RuleDialog(["Finance", "Recipes"], rule)
+    qtbot.addWidget(dialog)
+    assert dialog.rows[0].first.text() == "1.5KB"
+    assert dialog.rows[1].second.text() == "2020-12-31"
+    assert dialog.target.currentText() == "Recipes"
+    values = dialog.values()
+    assert (values["tags"], values["rename_template"]) == (["Old"], "{year} {name}")
 
 
 # --- Phase 6: Library, Tidy up, Dashboard, watched folders -----------------------------------
@@ -668,7 +890,7 @@ def fake_ai(service, monkeypatch: pytest.MonkeyPatch):
     from fakes import FakeProvider
 
     provider = FakeProvider("A short summary.")
-    monkeypatch.setattr(service, "provider", lambda: provider)
+    monkeypatch.setattr(service, "provider", lambda bulk=False: provider)
     return provider
 
 
@@ -752,6 +974,39 @@ def test_library_summarizes_and_renames(
     assert (shelf / "Finance" / "Hosting Invoice 2024.txt").exists()
 
 
+def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) -> None:
+    from PIL import Image
+
+    from autoshelf.ui.library_view import LibraryView
+
+    Image.new("RGB", (30, 20), (10, 120, 200)).save(shelf / "Finance" / "receipt photo.png")
+    service.inbox()
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.query.setText("receipt photo")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.name.text() == "receipt photo.png"
+    labels = [action.text() for action in view.convert_menu.actions()]
+    assert view.convert_button.isEnabled() and "JPG image" in labels
+
+    view.convert_menu.actions()[labels.index("JPG image")].trigger()
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "receipt photo.jpg").exists()
+    assert "Made receipt photo.jpg" in view.summary.text()
+    assert (shelf / "Finance" / "receipt photo.png").exists()  # the original stays
+
+    view.query.setText("invoice")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert not view.convert_button.isEnabled()  # nothing to convert a .txt to
+    view.compress_file()
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "invoice 2024.zip").exists()
+
+
 def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None:
     make(shelf / "_Inbox" / "scan_0034.txt", "Quarterly Report\nrevenue grew")
     view = InboxView(service, runner)
@@ -825,3 +1080,344 @@ def test_study_dialog_makes_and_reviews_cards(
     )
     dialog.export()
     assert target.read_text(encoding="utf-8").splitlines()[0] == "What is due?,Tax"
+
+
+# --- Phase 9: missed files, skipped files, the bulk AI model ------------------------------------
+
+_unfinished_reads: list = []  # kept referenced: a collected context manager would clean up
+
+
+def crash_while_reading(paths: AppPaths, path: Path) -> None:
+    """What the sorting process leaves behind when it dies while reading ``path``."""
+    from autoshelf.extract import guard
+
+    reading = guard.ReadGuard(paths.home / guard.STATE_FILENAME, record=True).reading(path)
+    reading.__enter__()
+    _unfinished_reads.append(reading)
+
+
+def test_settings_show_the_sweep_and_the_bulk_model(qtbot, service, runner) -> None:
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.sweep.value() == 5
+    view.sweep.setValue(0)
+    assert view.sweep.text() == "never"
+    view._apply_files()
+    settle(qtbot, runner)
+    assert service.settings().sweep_minutes == 0
+
+    view.ai_provider.setCurrentIndex(view.ai_provider.findData("claude"))
+    assert view.ai_model.currentText() == "claude-opus-5-5"
+    assert view.ai_bulk_model.currentText() == "claude-haiku-5-5"
+    view._apply_ai()
+    settle(qtbot, runner)
+    assert service.settings().llm_bulk_model == ""  # follows the default
+    view.ai_bulk_model.setCurrentText("claude-sonnet-5-5")
+    view._apply_ai()
+    settle(qtbot, runner)
+    assert service.settings().llm_bulk_model == "claude-sonnet-5-5"
+
+
+def test_settings_list_skipped_files_and_read_them_again(
+    qtbot, service, runner, paths: AppPaths, shelf: Path
+) -> None:
+    from autoshelf.extract import guard
+
+    doc = make(shelf / "_Inbox" / "agenda.txt", "agenda")
+    crash_while_reading(paths, doc)
+    guard.start(paths.home, record=True)
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    messages: list[str] = []
+    view.message.connect(messages.append)
+    view.load()
+    settle(qtbot, runner)
+    assert not view.skipped_box.isHidden()
+    assert [view.skipped.item(i).text() for i in range(view.skipped.count())] == ["agenda.txt"]
+
+    view.skipped.item(0).setSelected(True)
+    view.clear_selected_skipped()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert messages == ["AutoShelf will read 1 file(s) again"]
+    assert view.skipped.count() == 0
+    assert view.skipped_box.isHidden()
+    assert not guard.crashed_before(doc)
+
+
+def test_the_app_says_which_files_stopped_its_last_run(
+    qtbot, service, paths: AppPaths, shelf: Path
+) -> None:
+    doc = make(shelf / "broken.pdf", "%PDF")
+    crash_while_reading(paths, doc)
+    assert service.acquire()  # starts the guard: broken.pdf is skipped from now on
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=False)
+    assert "AutoShelf stopped while reading broken.pdf" in app.window.statusBar().currentMessage()
+    app.runner.wait()
+
+
+# --- Phase 10: how well would AutoShelf sort my library? -------------------------------------
+
+
+@pytest.fixture
+def full_shelf(shelf: Path) -> Path:
+    for number in range(5):
+        make(shelf / "Finance" / f"invoice {number}.txt", f"invoice total tax due bank {number}")
+        make(shelf / "Recipes" / f"cake {number}.txt", f"recipe baking oven flour sugar {number}")
+    return shelf
+
+
+def test_settings_test_sorting_and_use_the_recommendation(
+    qtbot, service, runner, full_shelf: Path
+) -> None:
+    service.set_level(0)  # very cautious
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.calibration_text.isHidden()
+
+    view.calibrate()
+    settle(qtbot, runner)
+    text = view.calibration_text.text()
+    assert "Each of the 11 files in your 2 folders" in text
+    assert "At Balanced:" in text and "Recommended:" in text
+    assert not view.use_recommended.isHidden()
+
+    view._use_recommended()
+    settle(qtbot, runner)
+    assert view.use_recommended.isHidden()
+    assert service.settings().auto_threshold != CONFIDENCE_LEVELS[0].threshold
+
+
+def test_the_app_offers_the_test_once(
+    qtbot, service, full_shelf: Path, no_dialogs: list, monkeypatch
+) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=True)
+    qtbot.waitUntil(lambda: service.settings().calibration_offered, timeout=WAIT_MS)
+    asked = [args for args in no_dialogs if len(args) > 1 and "sort your files" in str(args[1])]
+    assert len(asked) == 1  # answered "No" by the test
+
+    app.show_window()  # opened again: not asked again
+    app.runner.wait()
+    asked = [args for args in no_dialogs if len(args) > 1 and "sort your files" in str(args[1])]
+    assert len(asked) == 1
+    app.runner.wait()
+
+
+def test_a_small_library_is_not_offered_the_test(qtbot, service, no_dialogs: list) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, tray=Tray())
+    qtbot.addWidget(app.window)
+    app.start(show=True)
+    app.runner.wait()
+    qtbot.wait(100)
+    assert not service.settings().calibration_offered
+    assert not any("sort your files" in str(args[1]) for args in no_dialogs if len(args) > 1)
+
+
+# --- Phase 11: files AutoShelf made ---------------------------------------------------------------
+
+
+def test_history_offers_undo_for_a_file_autoshelf_made(
+    qtbot, service, runner, shelf: Path, tmp_path: Path
+) -> None:
+    from autoshelf.actions.create import place_new_file
+    from autoshelf.db.connection import open_database
+    from autoshelf.ui.history_view import can_undo
+
+    source = make(shelf / "Finance" / "report.txt", "report")
+    made = make(tmp_path / "work" / "report.zip", "zip")
+    conn = open_database(service.paths.db_path)
+    try:
+        created = place_new_file(
+            conn, made, source.parent, "report.zip", root=shelf, operation="zip", sources=[source]
+        )
+    finally:
+        conn.close()
+    view = HistoryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    row = [entry.id for entry in view._entries].index(created.history_id)
+    assert view.table.item(row, 4).text() == "Made a ZIP of report.txt"
+    assert can_undo(view._entries[row])
+    view.table.selectRow(row)
+    view.undo_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "_Trash" / "report.zip").exists()
+    assert source.exists()
+
+
+# --- Phase 12: rules suggested after an Inbox answer -----------------------------------------
+
+
+def test_an_inbox_answer_can_become_a_rule(
+    qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.db import repository
+    from autoshelf.db.connection import open_database
+
+    conn = open_database(service.paths.db_path)
+    try:
+        for number in range(2):
+            path = make(shelf / "Finance" / f"receipt {number}.txt", "x")
+            st = path.stat()
+            file_id = repository.upsert_file(
+                conn, path, sha256=None, size=st.st_size, mtime=st.st_mtime
+            )
+            repository.record_correction(
+                conn, file_id=file_id, from_folder=None, to_folder="Finance", source="inbox"
+            )
+    finally:
+        conn.close()
+    make(shelf / "_Inbox" / "receipt 3.txt", "anything at all")
+    asked: list[str] = []
+
+    def yes(parent, title, text, *rest):
+        asked.append(text)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", yes)
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    view.move_to("Finance")
+    for _ in range(4):
+        settle(qtbot, runner)
+    assert asked and "into Finance. Make this a rule?" in asked[0]
+    assert [rule.target_folder for rule in service.rules()] == ["Finance"]
+
+
+# --- Phase 14: notification buttons ----------------------------------------------------------
+
+
+class FakeToaster:
+    def __init__(self, broken: bool = False) -> None:
+        self.notes = []
+        self.broken = broken
+
+    def show(self, note) -> None:
+        if self.broken:
+            raise OSError("no notifications here")
+        self.notes.append(note)
+
+
+def test_notification_buttons_put_a_file_away(
+    qtbot, service: AppService, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toaster = FakeToaster()
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    app._notifications = True
+    app.start(show=False)
+    try:
+        make(shelf / "notes.txt", "call mom buy milk")
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        note = toaster.notes[0]
+        assert note.title == "Where should notes.txt go?" and note.dismiss == "Leave in Inbox"
+        folder, url = note.buttons[0]
+
+        app.receive(Command(commands.URL, url=url))  # Windows ran: AutoShelf.exe --url <url>
+        qtbot.waitUntil(lambda: (shelf / folder / "notes.txt").exists(), timeout=WAIT_MS)
+        status = app.window.statusBar()
+        qtbot.waitUntil(lambda: "Put notes.txt into" in status.currentMessage(), timeout=WAIT_MS)
+
+        warnings = []
+        monkeypatch.setattr(app_module.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+        app.run_command(Command(commands.URL, url=url))  # the same button again
+        qtbot.waitUntil(lambda: bool(warnings), timeout=WAIT_MS)
+        assert "already been answered" in warnings[0]
+        assert (shelf / folder / "notes.txt").exists()
+    finally:
+        app.shutdown()
+
+
+def test_a_click_on_the_notification_opens_the_inbox(qtbot, app, shelf: Path) -> None:
+    waiting = make(shelf / "_Inbox" / "scan.txt", "x")
+    token = app.service.offer(waiting, ["Finance"])
+    app.run_command(Command(commands.URL, url=f"autoshelf:inbox?offer={token}"))
+    qtbot.waitUntil(lambda: app.window.isVisible(), timeout=WAIT_MS)
+    assert app.window.tabs.currentWidget() is app.window.inbox
+    app.run_command(Command(commands.URL, url="autoshelf:nonsense"))  # ignored, no error
+
+
+def test_without_buttons_notifications_still_arrive(
+    qtbot, service: AppService, shelf: Path
+) -> None:
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: FakeToaster(broken=True))
+    qtbot.addWidget(app.window)
+    app._notifications = True
+    app.start(show=False)
+    try:
+        make(shelf / "notes.txt", "call mom buy milk")
+        status = app.window.statusBar()
+        qtbot.waitUntil(
+            lambda: "Where should notes.txt go?" in status.currentMessage(), timeout=WAIT_MS
+        )
+    finally:
+        app.shutdown()
+
+
+# --- Phase 15: the weekly digest -------------------------------------------------------------
+
+
+def test_the_weekly_digest_opens_the_dashboard(qtbot, service: AppService, shelf: Path) -> None:
+    from autoshelf.features.digest import Digest
+
+    toaster = FakeToaster()
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    try:
+        app.show_digest(Digest(23, 3, 1, since=None))
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        note = toaster.notes[0]
+        assert note.message == "This week: 23 sorted, 3 waiting in Inbox, 1 correction learned"
+        assert note.launch == "autoshelf:dashboard" and note.buttons == ()
+        app.run_command(Command(commands.URL, url=note.launch))
+        assert app.window.tabs.currentWidget() is app.window.dashboard
+    finally:
+        app.shutdown()
+
+
+def test_a_plain_digest_notification_also_opens_the_dashboard(qtbot, app) -> None:
+    from autoshelf.features.digest import Digest
+
+    app._toaster = lambda: None  # no buttons: the tray's notification
+    app.show_digest(Digest(1, 0, 0, since=None))
+    status = app.window.statusBar()
+    qtbot.waitUntil(lambda: "This week: 1 sorted" in status.currentMessage(), timeout=WAIT_MS)
+    app.tray.message_clicked.emit()
+    assert app.window.tabs.currentWidget() is app.window.dashboard
+    app._clicked_opens = "inbox"
+    app.tray.message_clicked.emit()
+    assert app.window.tabs.currentWidget() is app.window.inbox
+
+
+def test_the_weekly_digest_can_be_turned_off(qtbot, service, runner) -> None:
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.weekly.isChecked()
+    view.weekly.setChecked(False)
+    settle(qtbot, runner)
+    assert not service.settings().weekly_digest
+
+
+def test_the_app_starts_counting_weeks_on_its_first_start(qtbot, app) -> None:
+    app.start(show=False)
+    qtbot.waitUntil(lambda: bool(app.service.settings().digest_shown), timeout=WAIT_MS)
+    assert app._digest_timer.isActive()

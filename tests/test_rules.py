@@ -11,7 +11,6 @@ from autoshelf.actions.inbox import AssignError
 from autoshelf.actions.rules import (
     RuleError,
     check_rule,
-    describe_condition,
     extensions,
     first_match,
     match_rule,
@@ -27,7 +26,8 @@ from autoshelf.pipeline import OutcomeKind, Pipeline
 
 
 def rule(kind: str, pattern: str, target: str = "Finance", **changes) -> RuleRecord:
-    return replace(RuleRecord(1, "Test rule", 1, True, kind, pattern, target), **changes)
+    conditions = ({"kind": kind, "pattern": pattern},)
+    return replace(RuleRecord(1, "Test rule", 1, True, conditions, target), **changes)
 
 
 def extraction(text: str = "", title: str | None = None, **metadata: str) -> Extraction:
@@ -48,12 +48,12 @@ def extraction(text: str = "", title: str | None = None, **metadata: str) -> Ext
 )
 def test_invalid_rules_are_refused(kind: str, pattern: str, message: str) -> None:
     with pytest.raises(RuleError, match=message):
-        check_rule("My rule", kind, pattern)
+        check_rule("My rule", [{"kind": kind, "pattern": pattern}], target="Finance")
 
 
 def test_rule_needs_a_name() -> None:
     with pytest.raises(RuleError, match="name"):
-        check_rule(" ", "extension", ".pdf")
+        check_rule(" ", [{"kind": "extension", "pattern": ".pdf"}], target="Finance")
 
 
 def test_extensions_are_normalised() -> None:
@@ -62,7 +62,7 @@ def test_extensions_are_normalised() -> None:
 
 def test_name_rule_searches_the_file_name_in_any_case() -> None:
     found = match_rule(rule("name", "invoice|receipt"), Path("Amazon RECEIPT 2025.pdf"), None)
-    assert found == "'Amazon RECEIPT 2025.pdf' contains 'RECEIPT'"
+    assert found == ({"kind": "name", "name": "Amazon RECEIPT 2025.pdf", "found": "RECEIPT"},)
     assert match_rule(rule("name", "invoice"), Path("notes.txt"), None) is None
 
 
@@ -97,9 +97,13 @@ def test_first_enabled_rule_in_order_wins() -> None:
 
 
 def test_conditions_read_well() -> None:
-    assert describe_condition("name", "invoice|receipt") == "file name matches /invoice|receipt/"
-    assert describe_condition("extension", "pdf .docx") == "extension is .docx, .pdf"
-    assert describe_condition("text", "Syllabus") == 'text contains "Syllabus"'
+    from autoshelf.wording import condition
+
+    assert condition({"kind": "name", "pattern": "invoice|receipt"}) == (
+        "file name matches /invoice|receipt/"
+    )
+    assert condition({"kind": "extension", "pattern": "pdf .docx"}) == "extension is .docx, .pdf"
+    assert condition({"kind": "text", "pattern": "Syllabus"}) == 'text contains "Syllabus"'
 
 
 # --- storage ---------------------------------------------------------------------------
@@ -153,7 +157,9 @@ def test_rule_overrides_the_classifier(conn, shelf: Path, smart: Pipeline) -> No
     assert entry.reason == "Rule: Scans"
     assert entry.confidence is None
     assert entry.details["rule"]["name"] == "Scans"
-    assert entry.details["rule"]["condition"] == r"file name matches /^scan_\d+/"
+    assert entry.details["rule"]["conditions"] == [{"kind": "name", "pattern": r"^scan_\d+"}]
+    assert entry.details["reason"]["code"] == "rule"
+    assert "explanation" not in entry.details  # data, not words
     assert entry.details["candidates"][0]["folder"] == "Finance"  # what the AI thought
     assert repository.get_file_by_path(conn, outcome.dst).suggestion == "Recipes"
 
@@ -235,7 +241,8 @@ def test_app_adds_validates_reorders_and_tests_rules(service: AppService, shelf:
     assert result.target == "Finance"
     assert service.test_rules(make(shelf.parent / "x.ipynb")).rule is None  # switched off
 
-    service.update_rule(replace(service.rules()[1], pattern="bill"))
+    bill = ({"kind": "name", "pattern": "bill"},)
+    service.update_rule(replace(service.rules()[1], conditions=bill))
     assert service.test_rules(sample).rule is None
     service.delete_rule(first.id)
     assert [rule.name for rule in service.rules()] == ["Notebooks"]
@@ -250,8 +257,8 @@ def test_cli_rules(service: AppService, shelf: Path, capsys: pytest.CaptureFixtu
     assert main(["rules", "down", "1"]) == 0
     assert main(["rules", "disable", "2"]) == 0
     output = capsys.readouterr().out
-    assert "1. #2 Notebooks: extension is .ipynb -> Recipes  (off)" in output
-    assert "2. #1 Invoices: file name matches /invoice/ -> Finance" in output
+    assert "1. #2 Notebooks: extension is .ipynb -> move to Recipes  (off)" in output
+    assert "2. #1 Invoices: file name matches /invoice/ -> move to Finance" in output
 
     sample = make(shelf.parent / "invoice.txt")
     assert main(["rules", "test", str(sample)]) == 0
@@ -262,3 +269,263 @@ def test_cli_rules(service: AppService, shelf: Path, capsys: pytest.CaptureFixtu
     assert main(["rules"]) == 0
     assert "Invoices" not in capsys.readouterr().out
     assert main(["rules", "enable", "9"]) == 1
+
+
+# --- Phase 12: richer conditions -------------------------------------------------------------
+
+
+def test_size_date_and_any_or_all_conditions(tmp_path: Path) -> None:
+    import os
+
+    from autoshelf.actions.rules import check_condition, parse_size
+
+    big = make(tmp_path / "scan.pdf", "x" * 3000)
+    os.utime(big, (1_600_000_000, 1_600_000_000))  # 2020-09-13
+    assert parse_size("2KB") == 2048 and parse_size("1.5 MB") == 1572864 and parse_size("10") == 10
+    with pytest.raises(RuleError, match="isn't a size"):
+        parse_size("lots")
+    assert check_condition({"kind": "size", "min": "2KB", "max": None}) == {
+        "kind": "size",
+        "min": 2048,
+        "max": None,
+    }
+    with pytest.raises(RuleError, match="larger than"):
+        check_condition({"kind": "size", "min": "2MB", "max": "1MB"})
+    with pytest.raises(RuleError, match="isn't a date"):
+        check_condition({"kind": "date", "from": "yesterday"})
+
+    big_old = (
+        {"kind": "size", "min": 2048, "max": None},
+        {"kind": "date", "from": None, "to": "2020-12-31"},
+    )
+    both = replace(rule("name", "x"), conditions=big_old)
+    assert match_rule(both, big, None) == (
+        {"kind": "size", "found": 3000},
+        {"kind": "date", "found": "2020-09-13"},
+    )
+    small = make(tmp_path / "small.pdf", "x")
+    os.utime(small, (1_600_000_000, 1_600_000_000))
+    assert match_rule(both, small, None) is None  # all must hold
+    either = replace(both, match_any=True)
+    assert match_rule(either, small, None) == ({"kind": "date", "found": "2020-09-13"},)
+
+
+def test_rename_templates(tmp_path: Path) -> None:
+    import os
+
+    from autoshelf.actions.rules import check_template, new_name
+
+    path = make(tmp_path / "scan_0034.pdf", "x")
+    os.utime(path, (1_741_000_000, 1_741_000_000))
+    day = __import__("datetime").datetime.fromtimestamp(1_741_000_000).strftime("%Y-%m-%d")
+    renaming = replace(rule("name", "scan"), rename_template="{date} {title}")
+    assert new_name(renaming, path, extraction(title="Invoice: March?")) == (
+        f"{day} Invoice March.pdf"  # made safe for Windows
+    )
+    assert new_name(renaming, path, None) == f"{day} scan_0034.pdf"
+    same = replace(renaming, rename_template="{name}")
+    assert new_name(same, path, None) is None  # it already has that name
+    with pytest.raises(RuleError, match="Unknown field"):
+        check_template("{author} {title}")
+    with pytest.raises(RuleError, match="needs something to do"):
+        check_rule("Nothing", [{"kind": "extension", "pattern": ".pdf"}])
+
+
+def test_a_rule_moves_renames_and_tags_and_undo_puts_it_back(
+    conn, shelf: Path, smart: Pipeline
+) -> None:
+    from autoshelf.actions.undo import undo
+
+    repository.insert_rule(
+        conn,
+        name="Scans",
+        conditions=[{"kind": "name", "pattern": r"^scan_\d+"}],
+        target_folder="Finance",
+        tags=["Scanned"],
+        rename_template="Scanned {name}",
+    )
+    src = make(shelf / "scan_0034.txt", "something")
+
+    outcome = smart.process(src)
+
+    assert outcome.dst == shelf / "Finance" / "Scanned scan_0034.txt"
+    entry = repository.get_history(conn, outcome.history_id)
+    assert (entry.action, entry.reason) == ("move", "Rule: Scans")
+    assert entry.details["renamed_from"] == "scan_0034.txt"
+    assert entry.details["rule"]["rename"] == "Scanned {name}"
+    record = repository.get_file_by_path(conn, outcome.dst)
+    assert repository.tags_of(conn, record.id) == ["Scanned"]
+    assert "renamed to 'Scanned scan_0034.txt'" in outcome.message
+
+    undo(conn, outcome.history_id)
+    assert src.exists()  # back where it was, with its old name
+
+
+def test_a_rule_without_a_folder_lets_autoshelf_decide(conn, shelf: Path, smart: Pipeline) -> None:
+    repository.insert_rule(
+        conn,
+        name="Dated",
+        conditions=[{"kind": "extension", "pattern": ".txt"}],
+        target_folder="",
+        rename_template="{year} {name}",
+    )
+    outcome = smart.process(make(shelf / "invoice 2025.txt", "invoice total tax due"))
+    assert outcome.dst.parent == shelf / "Finance"  # the classifier chose
+    assert outcome.dst.name.endswith(" invoice 2025.txt")
+    assert repository.get_history(conn, outcome.history_id).reason == "auto"
+
+    # A file that stays waiting in the Inbox is renamed where it is.
+    waiting = make(shelf / "_Inbox" / "call mom.txt", "call mom buy milk")
+    outcome = smart.process(waiting)
+    assert outcome.kind is OutcomeKind.WAITING
+    assert outcome.dst.parent == shelf / "_Inbox"
+    assert outcome.dst.name.endswith(" call mom.txt")
+    renamed = repository.list_history(conn, 1)[0]
+    assert (renamed.action, renamed.reason) == ("rename", "Rule: Dated")
+    assert repository.get_file_by_path(conn, outcome.dst).status == "inbox"
+
+
+def test_app_test_on_a_file_shows_every_action(service: AppService, shelf: Path) -> None:
+    from autoshelf.wording import rule_test
+
+    service.add_rule(
+        "Invoices",
+        conditions=[
+            {"kind": "name", "pattern": "invoice"},
+            {"kind": "extension", "pattern": "txt"},
+        ],
+        target="finance",
+        tags=["Bills", " Bills "],
+        rename_template="Bill {name}",
+    )
+    (saved,) = service.rules()
+    assert saved.tags == ("Bills",)
+    result = service.test_rules(make(shelf.parent / "invoice 9.txt", "x"))
+    assert result.new_name == "Bill invoice 9.txt"
+    assert rule_test(result) == (
+        "Rule 'Invoices' matches ('invoice 9.txt' contains 'invoice' and the extension is "
+        ".txt): it would go to Finance, be tagged Bills, be renamed to 'Bill invoice 9.txt'"
+    )
+
+
+def test_cli_adds_a_rich_rule(service: AppService, capsys: pytest.CaptureFixture[str]) -> None:
+    command = [
+        "rules",
+        "add",
+        "Old scans",
+        "--extension",
+        "pdf",
+        "--size-min",
+        "1MB",
+        "--date-to",
+        "2020-12-31",
+        "--any",
+        "--tag",
+        "Old",
+        "--rename",
+        "{year} {name}",
+    ]
+    assert main(command) == 0
+    out = capsys.readouterr().out
+    assert (
+        "Old scans: extension is .pdf or size is at least 1.0 MB or date is 2020-12-31 or "
+        "earlier -> AutoShelf decides the folder; tag Old; rename to {year} {name}"
+    ) in out
+    assert main(["rules", "add", "Nothing", "--to", "Finance"]) == 1
+    assert "at least one condition" in capsys.readouterr().err
+
+
+def test_old_rules_keep_working_after_the_upgrade(paths) -> None:
+    from autoshelf.db import schema
+    from autoshelf.db.connection import connect, open_database
+
+    conn = connect(paths.db_path)
+    script = "".join((schema.V1, schema.V2, schema.V3, schema.V4, schema.V5))
+    conn.executescript(f"BEGIN;{script}PRAGMA user_version = 5; COMMIT;")
+    conn.execute(
+        "INSERT INTO rules (name, priority, enabled, kind, pattern, target_folder)"
+        " VALUES ('Invoices', 1, 1, 'name', 'invoice', 'Finance')"
+    )
+    conn.close()
+    conn = open_database(paths.db_path)
+    try:
+        (old,) = repository.list_rules(conn)
+        assert old.conditions == ({"kind": "name", "pattern": "invoice"},)
+        assert (old.target_folder, old.match_any, old.tags, old.rename_template) == (
+            "Finance",
+            False,
+            (),
+            "",
+        )
+    finally:
+        conn.close()
+
+
+# --- Phase 12: rules suggested from your choices --------------------------------------------
+
+
+def _choose(conn, path: Path, folder: str) -> None:
+    """The user put ``path`` (already there) into ``folder``."""
+    st = path.stat()
+    file_id = repository.upsert_file(conn, path, sha256=None, size=st.st_size, mtime=st.st_mtime)
+    repository.record_correction(
+        conn, file_id=file_id, from_folder=None, to_folder=folder, source="inbox"
+    )
+
+
+def test_a_rule_is_suggested_when_choices_share_a_word(conn, shelf: Path) -> None:
+    from autoshelf.features.rule_suggestions import suggest_rules
+
+    for number in range(3):
+        _choose(conn, make(shelf / "Finance" / f"Invoice_{number} ACME.txt", "x"), "Finance")
+    _choose(conn, make(shelf / "Recipes" / "pancakes.txt", "x"), "Recipes")
+
+    by_key = {item.key: item for item in suggest_rules(conn, shelf)}
+
+    item = by_key["name:invoice->Finance"]
+    assert item.condition == {"kind": "name", "pattern": "invoice"}
+    assert len(item.files) == 3
+    assert "name:acme->Finance" in by_key  # also shared
+    assert not any(key.endswith("->Recipes") for key in by_key)  # only one file
+
+    dismissed = suggest_rules(conn, shelf, dismissed=["name:invoice->Finance"])
+    assert "name:invoice->Finance" not in {item.key for item in dismissed}
+    repository.insert_rule(
+        conn, name="Invoices", kind="name", pattern="invoice", target_folder="Finance"
+    )
+    assert "name:invoice->Finance" not in {item.key for item in suggest_rules(conn, shelf)}
+
+
+def test_no_rule_is_suggested_against_the_library(conn, shelf: Path) -> None:
+    from autoshelf.features.rule_suggestions import suggest_rules
+
+    for number in range(3):
+        _choose(conn, make(shelf / "Recipes" / f"notes {number}.md", "x"), "Recipes")
+    for number in range(4):  # most .md files in the library are elsewhere
+        make(shelf / "Finance" / f"budget {number}.md", "x")
+    keys = {item.key for item in suggest_rules(conn, shelf)}
+    assert "extension:.md->Recipes" not in keys
+    assert "name:notes->Recipes" in keys
+
+
+def test_suggestions_in_the_app_and_the_cli(
+    conn, service: AppService, shelf: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for number in range(3):
+        _choose(conn, make(shelf / "Finance" / f"receipt {number}.pdf", "x"), "Finance")
+    assert service.rule_suggestion_for("recipes") is None
+    found = service.rule_suggestion_for("finance")
+    assert found.key in {"name:receipt->Finance", "extension:.pdf->Finance"}
+
+    assert main(["rules", "suggest"]) == 0
+    out = capsys.readouterr().out
+    assert "You put 3 files with 'receipt' in their names into Finance" in out
+    assert main(["rules", "suggest", "--add", "1"]) == 0
+    assert "Added rule #" in capsys.readouterr().out
+    (made,) = service.rules()
+    assert made.target_folder == "Finance"
+    for item in service.rule_suggestions():
+        service.dismiss_rule_suggestion(item.key)
+    assert service.rule_suggestions() == []
+    assert main(["rules", "suggest"]) == 0
+    assert "No rule to suggest" in capsys.readouterr().out

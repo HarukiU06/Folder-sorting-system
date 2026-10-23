@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from autoshelf import reasons
 from autoshelf.actions import learning
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
@@ -17,6 +18,7 @@ from autoshelf.features.tags import suggest_tags
 from autoshelf.layout import PROCESSED_ZONES, inbox_dir, zone_of
 from autoshelf.ml.classifier import Classification
 from autoshelf.ml.library import TEXT_EXCERPT_CHARS, LibraryIndex, scan_library
+from autoshelf.reasons import Reason
 from autoshelf.watcher.ignore import ignore_reason
 
 log = logging.getLogger(__name__)
@@ -41,11 +43,11 @@ class InboxItem:
     rename: RenameProposal | None = None  # a better name, for junk names like scan_0034.pdf
 
     @property
-    def explanation(self) -> str:
-        """Why it is waiting."""
+    def reason(self) -> Reason:
+        """Why it is waiting, as data (``wording.reason_text`` puts it in words)."""
         if self.classification is None:
-            return "it can't be sorted by content right now"
-        return self.classification.explanation
+            return reasons.reason(reasons.NO_CLASSIFIER)
+        return self.classification.reason
 
 
 def waiting_files(

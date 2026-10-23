@@ -2,11 +2,16 @@
 
 Files the user keeps in category folders are the classifier's labelled examples.
 ``LibraryIndex`` holds a vector for each of them, kept in step with the disk: every
-``refresh`` rescans the folders (cheap), but only reads and embeds files that are new
-or changed. Vectors are cached in the database, so a restart doesn't recompute them.
+``refresh`` rescans the folders, but only reads and embeds files that are new or
+changed. Vectors are cached in the database, so a restart doesn't recompute them.
 A new file that turns out to be a known file the user moved is adopted instead (see
 ``actions.learning``), which is how corrections made in Explorer or on the iPhone are
 learned.
+
+A rescan lists every folder, so the watcher doesn't rescan before every file: it marks
+the index dirty when its folders change (``mark_dirty``) and calls ``ensure_current``,
+which rescans only then, or when the library version in the database changed (another
+process edited a folder description, which no file event shows).
 """
 
 import logging
@@ -21,10 +26,10 @@ import numpy as np
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.db.connection import transaction
-from autoshelf.extract import FILENAME_ONLY, Extraction, extract
+from autoshelf.extract import FILENAME_ONLY, Extraction, extract, guard
 from autoshelf.extract.filename import filename_tokens, name_tokens
 from autoshelf.fsutil import is_online_only, sha256_file
-from autoshelf.layout import RESERVED_PREFIX
+from autoshelf.layout import RESERVED_PREFIX, Zone, zone_of
 from autoshelf.ml import explain
 from autoshelf.ml.classifier import Classification, FolderProfile, choose, score_folders
 from autoshelf.ml.embedder import Embedder
@@ -139,12 +144,19 @@ class IndexedFile:
     source: str
     vector: np.ndarray
 
+    def matches(self, item: LibraryFile) -> bool:
+        """True if the vector was made from the file at its current size and time."""
+        return self.size == item.size and abs(self.mtime - item.mtime) <= _MTIME_TOLERANCE
+
     def is_current(self, item: LibraryFile) -> bool:
         """True if the vector still describes ``item`` as it is on disk."""
-        if self.size != item.size or abs(self.mtime - item.mtime) > _MTIME_TOLERANCE:
+        if not self.matches(item):
             return False
-        # A name-only vector is upgraded once the online-only file has been downloaded.
-        return not (self.source == NAME_ONLY and not item.online_only)
+        if self.source != NAME_ONLY or item.online_only:
+            return True
+        # A name-only vector is upgraded once the online-only file has been downloaded,
+        # or once a file that crashed AutoShelf is cleared to be read again (Settings).
+        return guard.crashed_before(item.path)
 
 
 @dataclass(frozen=True)
@@ -166,6 +178,12 @@ def store_content(conn: sqlite3.Connection, file_id: int, extraction: Extraction
         title=extraction.title,
         text_excerpt=extraction.text[:TEXT_EXCERPT_CHARS] or None,
     )
+
+
+def vector_source(extraction: Extraction) -> str:
+    """How a vector made from ``extraction`` is stored: from the content, or from the name
+    only (a file that crashed AutoShelf before; it is read again once cleared)."""
+    return NAME_ONLY if extraction.error == guard.CRASHED else CONTENT
 
 
 def store_vector(
@@ -216,11 +234,43 @@ class LibraryIndex:
         self._profile_vectors: dict[str, np.ndarray] = {}
         self._examples: list[Example] = []
         self._documents: dict[str, str] | None = None
+        self._dirty = True  # nothing scanned yet
+        self._version: int | None = None  # the library version the last refresh saw
 
     @property
     def model(self) -> str:
         """The embedding model this index uses."""
         return self.embedder.model_id
+
+    @property
+    def dirty(self) -> bool:
+        """True if the folders may have changed since the last ``refresh``."""
+        return self._dirty
+
+    def mark_dirty(self) -> None:
+        """Note that the folders changed on disk: ``ensure_current`` will rescan them."""
+        self._dirty = True
+
+    def ensure_current(
+        self, progress: Callable[[int, int], None] | None = None
+    ) -> RefreshStats | None:
+        """Rescan if the folders changed since the last refresh (``mark_dirty``) or the
+        library version in the database did. Returns the refresh's stats, or None."""
+        if not self._dirty and repository.library_version(self.conn) == self._version:
+            return None
+        return self.refresh(progress)
+
+    def add_file(self, path: Path, document: EmbeddedDocument, *, size: int, mtime: float) -> None:
+        """Count a file AutoShelf just sorted into a folder, without a rescan.
+
+        Its vector is stored by the caller; this only keeps the index in step.
+        """
+        folder = _folder_key(path, self.root)
+        if folder is None or folder not in self.folders:
+            self._dirty = True  # a folder the index doesn't know yet: rescan
+            return
+        self._entries[path] = IndexedFile(path, folder, size, mtime, CONTENT, document.vector)
+        self._documents = None
 
     def embed(self, extraction: Extraction, name: str) -> EmbeddedDocument:
         """Embed a file from what was extracted from it, keeping its chunks."""
@@ -245,6 +295,8 @@ class LibraryIndex:
             or abs(stored.mtime - st.st_mtime) > _MTIME_TOLERANCE
         ):
             return None
+        if stored.source == NAME_ONLY and not is_online_only(st) and not guard.crashed_before(path):
+            return None  # its content can be read now: make a vector from it
         return from_blob(stored.vector)
 
     def classify(
@@ -306,12 +358,13 @@ class LibraryIndex:
         """Text describing each folder: name, description, and its files' names and text."""
         if self._documents is None:
             descriptions = repository.folder_descriptions(self.conn)
+            contents = repository.file_contents(self.conn)  # one query for every file
             texts = {
                 key: [profile_text(key, descriptions.get(key.casefold(), ""))]
                 for key in self.folders
             }
             for entry in self._entries.values():
-                title, excerpt = self._content(entry.path)
+                title, excerpt = contents.get(str(entry.path).casefold(), (None, None))
                 words = " ".join(filename_tokens(entry.path.name))
                 for key in _self_and_parents(entry.folder):
                     if key in texts:
@@ -319,15 +372,14 @@ class LibraryIndex:
             self._documents = {key: explain.join_texts(parts) for key, parts in texts.items()}
         return self._documents
 
-    def _content(self, path: Path) -> tuple[str | None, str | None]:
-        record = repository.get_file_by_path(self.conn, path)
-        return repository.get_file_content(self.conn, record.id) if record else (None, None)
-
     def refresh(self, progress: Callable[[int, int], None] | None = None) -> RefreshStats:
         """Rescan the folders, embedding files that are new or changed since last time.
 
         ``progress(done, total)`` is called after each file that had to be looked at.
         """
+        # Cleared before scanning, so a change noticed during the scan isn't lost.
+        self._dirty = False
+        version = repository.library_version(self.conn)
         scan = scan_library(self.root, self.ignore_patterns)
         entries: dict[Path, IndexedFile] = {}
         stale: list[LibraryFile] = []
@@ -361,6 +413,7 @@ class LibraryIndex:
         self._entries = entries
         self._examples = self._load_examples()
         self._documents = None
+        self._version = version
         return RefreshStats(
             folders=len(scan.folders),
             files=len(entries),
@@ -401,12 +454,17 @@ class LibraryIndex:
 
     def files_in(self, folder: str) -> list[IndexedFile]:
         """Indexed files in ``folder`` and its subfolders."""
-        prefix = folder + "/"
-        return [
-            entry
-            for entry in self._entries.values()
-            if entry.folder == folder or entry.folder.startswith(prefix)
-        ]
+        return _files_in(folder, self._entries.values())
+
+    def entries(self) -> list[IndexedFile]:
+        """Every indexed file with its vector, as of the last refresh."""
+        return list(self._entries.values())
+
+    @property
+    def examples(self) -> list[Example]:
+        """The corrections learned from (files moved away from folders), as of the last
+        refresh."""
+        return list(self._examples)
 
     def direct_file_counts(self) -> dict[str, int]:
         """Number of indexed files directly in each folder."""
@@ -425,18 +483,8 @@ class LibraryIndex:
         if missing:
             for text, vector in zip(missing, self.embedder.embed(missing), strict=True):
                 self._profile_vectors[text] = vector
-        profiles = []
-        for key in self.folders:
-            vector = self._profile_vectors[texts[key]]
-            members = self.files_in(key)
-            pool = (
-                np.stack([entry.vector for entry in members])
-                if members
-                else np.empty((0, vector.shape[0]), dtype=np.float32)
-            )
-            paths = tuple(entry.path for entry in members)
-            profiles.append(FolderProfile(key, vector, pool, paths))
-        return profiles
+        vectors = {key: self._profile_vectors[texts[key]] for key in self.folders}
+        return build_profiles(vectors, self._entries.values())
 
     def _stored_entry(self, item: LibraryFile) -> IndexedFile | None:
         record = repository.get_file_by_path(self.conn, item.path)
@@ -464,8 +512,9 @@ class LibraryIndex:
                 extraction = Extraction(FILENAME_ONLY, tuple(filename_tokens(item.path.name)))
                 digest, source = None, NAME_ONLY
             else:
-                digest, source = digest or sha256_file(item.path), CONTENT
+                digest = digest or sha256_file(item.path)
                 extraction = self.extractor(item.path)
+                source = vector_source(extraction)
         except OSError as exc:
             log.warning("Couldn't read %s for the index: %s", item.path, exc)
             return None
@@ -486,6 +535,36 @@ class LibraryIndex:
                 source=source,
             )
         return IndexedFile(item.path, item.folder, item.size, item.mtime, source, document.vector)
+
+
+def build_profiles(
+    folder_vectors: dict[str, np.ndarray], entries: Iterable[IndexedFile]
+) -> list[FolderProfile]:
+    """Profiles of folders: each one's name/description vector, and the vectors of the
+    files in it and its subfolders."""
+    entries = list(entries)
+    profiles = []
+    for key, vector in folder_vectors.items():
+        members = _files_in(key, entries)
+        pool = (
+            np.stack([entry.vector for entry in members])
+            if members
+            else np.empty((0, vector.shape[0]), dtype=np.float32)
+        )
+        profiles.append(FolderProfile(key, vector, pool, tuple(entry.path for entry in members)))
+    return profiles
+
+
+def _files_in(folder: str, entries: Iterable[IndexedFile]) -> list[IndexedFile]:
+    prefix = folder + "/"
+    return [entry for entry in entries if entry.folder == folder or entry.folder.startswith(prefix)]
+
+
+def _folder_key(path: Path, root: Path) -> str | None:
+    """Key of the category folder a file is in ("A/B"), or None outside category folders."""
+    if zone_of(path, root) is not Zone.CATEGORY:
+        return None
+    return "/".join(path.relative_to(root).parts[:-1])
 
 
 def _self_and_parents(key: str) -> list[str]:

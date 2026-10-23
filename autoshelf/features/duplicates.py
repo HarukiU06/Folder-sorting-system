@@ -24,6 +24,7 @@ from autoshelf.layout import RESERVED_PREFIX, Zone, zone_of
 from autoshelf.ml.vectors import from_blob
 
 DUPLICATES_DIRNAME = RESERVED_PREFIX + "Duplicates"
+REASON_DUPLICATE = "duplicate"  # history reason; details name the copy that was kept
 # Similarity of file vectors (default model): near-identical documents ~0.87 and up,
 # while different files in one folder stay below ~0.75.
 VERSION_SIMILARITY = 0.85
@@ -111,7 +112,7 @@ def keep_one(
                     other,
                     target,
                     root=root,
-                    reason=f"duplicate of {keep.name}",
+                    reason=REASON_DUPLICATE,
                     sha256=digest,
                     batch_id=batch,
                     details={"duplicate_of": str(keep)},

@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from autoshelf.actions.create import ACTION_CREATE, record_settled
 from autoshelf.actions.mover import status_after_move
 from autoshelf.db import repository
 from autoshelf.fsutil import sha256_file
@@ -31,6 +32,13 @@ def reconcile_pending(conn: sqlite3.Connection) -> list[Reconciled]:
     """
     settled: list[Reconciled] = []
     for entry in repository.list_history_in_state(conn, "pending"):
+        if entry.action == ACTION_CREATE:
+            state, note = _settle_create(entry)
+            repository.set_history_state(conn, entry.id, state, note=note)
+            if state == "done":
+                record_settled(conn, entry)
+            settled.append(Reconciled(entry.id, state, note))
+            continue
         state, note = _settle(entry)
         repository.set_history_state(conn, entry.id, state, note=note)
         if state == "done" and entry.file_id is not None:
@@ -62,6 +70,15 @@ def _settle(entry: repository.HistoryEntry) -> tuple[str, str]:
     if src_exists and dst_exists:
         return "failed", "the move had not happened; another file took the destination name"
     return "failed", "the file is missing from both its source and destination"
+
+
+def _settle_create(entry: repository.HistoryEntry) -> tuple[str, str]:
+    """A new file is made by copying it in place; was it copied completely?"""
+    if not os.path.lexists(entry.dst):
+        return "failed", "the new file had not been made before a restart"
+    if entry.sha256 and _hash_or_none(Path(entry.dst)) != entry.sha256:
+        return "failed", "the new file is incomplete (AutoShelf stopped while making it)"
+    return "done", "the new file had been made before a restart"
 
 
 def _hash_or_none(path: Path) -> str | None:

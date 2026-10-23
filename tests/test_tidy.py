@@ -67,7 +67,8 @@ def test_exact_duplicates_are_found_and_extra_copies_set_aside(conn, shelf, libr
         shelf / "_Duplicates" / "invoice copy.txt"
     ).exists()
     entry = repository.get_history(conn, moved[0].history_id)
-    assert entry.reason == "duplicate of invoice 2024.txt"
+    assert entry.reason == "duplicate"
+    assert Path(entry.details["duplicate_of"]).name == "invoice 2024.txt"
     assert entry.batch_id
     undo_batch(conn, entry.batch_id)
     assert copy.exists()
@@ -246,6 +247,26 @@ def test_stats(conn, shelf, library) -> None:
 
     later = library_stats(conn, shelf, now=datetime.now(UTC) + timedelta(days=400))
     assert later.stale_total == 3
+
+
+def test_untouched_files_ignore_windows_last_access_time(conn, shelf, library) -> None:
+    import os
+
+    now = datetime.now(UTC) + timedelta(days=400)
+    cake = shelf / "Recipes" / "cake.txt"
+    invoice = shelf / "Finance" / "invoice 2024.txt"
+    # A backup or virus scan touched it just now: that isn't using it.
+    os.utime(cake, (now.timestamp(), cake.stat().st_mtime))
+    # Opened from AutoShelf recently: in use.
+    record = repository.get_file_by_path(conn, invoice)
+    conn.execute(
+        "UPDATE files SET last_opened_at = ? WHERE id = ?",
+        ((now - timedelta(days=3)).isoformat(), record.id),
+    )
+
+    stats = library_stats(conn, shelf, now=now)
+
+    assert [item.path for item in stats.stale] == [cake]
 
 
 # --- watched folders ------------------------------------------------------------------------

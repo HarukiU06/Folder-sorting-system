@@ -8,12 +8,15 @@ import sqlite3
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from autoshelf import __version__
+from autoshelf import __version__, wording
+from autoshelf import commands as app_commands
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
+from autoshelf.actions.create import CreateError
 from autoshelf.actions.inbox import (
     AssignError,
     assign,
@@ -37,7 +40,9 @@ from autoshelf.config import (
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
+from autoshelf.explorer import ExplorerError
 from autoshelf.extract import guard as read_guard
+from autoshelf.features.convert import ConvertError
 from autoshelf.features.duplicates import DuplicateError
 from autoshelf.features.new_folders import FolderNameError
 from autoshelf.features.rename import RenameError
@@ -46,7 +51,6 @@ from autoshelf.layout import INBOX_DIRNAME
 from autoshelf.llm.base import LLMError
 from autoshelf.llm.secrets import SecretError
 from autoshelf.logging_setup import setup_logging
-from autoshelf.ml import explain
 from autoshelf.ml.embedder import EmbedderError
 from autoshelf.startup import StartupError
 
@@ -72,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start the app in the tray without opening its window (used at sign-in)",
     )
+    app_commands.add_app_arguments(parser)
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     def with_root(command: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -152,6 +157,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ai", choices=["off", "claude", "ollama"], help="optional AI provider (off by default)"
     )
     config.add_argument("--ai-model", metavar="MODEL", help="model name ('' for the default)")
+    config.add_argument(
+        "--ai-bulk-model",
+        metavar="MODEL",
+        help="model for summaries, names and flashcards ('' for the default: the cheapest)",
+    )
     config.add_argument("--ollama-url", metavar="URL", help="Ollama server (default localhost)")
     config.add_argument(
         "--api-key",
@@ -161,6 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--forget-api-key", action="store_true", help="remove the saved key")
     config.add_argument(
         "--startup", choices=["on", "off"], help="start AutoShelf when you sign in to Windows"
+    )
+    config.add_argument(
+        "--explorer-menu",
+        choices=["on", "off"],
+        help="AutoShelf in Explorer's right-click menu (Sort, Why is this here?, Compress, "
+        "Convert)",
+    )
+    config.add_argument(
+        "--notification-buttons",
+        choices=["on", "off"],
+        help="folder buttons in notifications (registers the autoshelf: link with Windows)",
     )
 
     why = with_root(commands.add_parser("why", help="explain why a file went where it went"))
@@ -180,13 +201,29 @@ def build_parser() -> argparse.ArgumentParser:
     rule_commands = rules.add_subparsers(dest="rules_command", metavar="<action>")
     add = with_root(rule_commands.add_parser("add", help="add a rule (checked after the others)"))
     add.add_argument("name", help='a name for the rule, e.g. "Invoices"')
-    condition = add.add_mutually_exclusive_group(required=True)
-    condition.add_argument(
+    when = add.add_argument_group("conditions (all must hold, or any one with --any)")
+    when.add_argument(
         "--name-matches", metavar="REGEX", help='file name matches, e.g. "invoice|receipt"'
     )
-    condition.add_argument("--extension", metavar="EXT", help='extension(s), e.g. ".ipynb"')
-    condition.add_argument("--text-contains", metavar="TEXT", help='e.g. "Syllabus"')
-    add.add_argument("--to", required=True, metavar="FOLDER", help="an existing folder")
+    when.add_argument("--extension", metavar="EXT", help='extension(s), e.g. ".ipynb"')
+    when.add_argument("--text-contains", metavar="TEXT", help='e.g. "Syllabus"')
+    when.add_argument("--size-min", metavar="SIZE", help="at least this big, e.g. 1MB")
+    when.add_argument("--size-max", metavar="SIZE", help="at most this big, e.g. 500KB")
+    when.add_argument("--date-from", metavar="DATE", help="changed on or after, e.g. 2025-01-01")
+    when.add_argument("--date-to", metavar="DATE", help="changed on or before")
+    when.add_argument("--any", action="store_true", help="any one condition is enough")
+    then = add.add_argument_group("what to do (one or more)")
+    then.add_argument("--to", metavar="FOLDER", help="move it to this existing folder")
+    then.add_argument("--tag", action="append", default=[], metavar="TAG", help="add a tag")
+    then.add_argument(
+        "--rename",
+        metavar="TEMPLATE",
+        help='rename it, e.g. "{date} {title}" (fields: {name} {title} {date} {year} '
+        "{month} {day} {folder})",
+    )
+    suggest = with_root(rule_commands.add_parser("suggest", help="rules your choices point to"))
+    suggest.add_argument("--add", type=int, metavar="N", help="make suggestion N a rule")
+    suggest.add_argument("--dismiss", type=int, metavar="N", help="don't suggest N again")
     for action, text in (
         ("remove", "delete a rule"),
         ("enable", "switch a rule on"),
@@ -236,6 +273,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     with_root(commands.add_parser("stats", help="numbers about your library"))
+    with_root(commands.add_parser("digest", help="what AutoShelf did in the last seven days"))
+    calibrate = with_root(
+        commands.add_parser("calibrate", help="how well would AutoShelf sort your library?")
+    )
+    calibrate.add_argument(
+        "--apply", action="store_true", help="switch to the recommended confidence level"
+    )
+
+    compress = with_root(
+        commands.add_parser(
+            "compress", help="make a smaller copy, or a ZIP, next to the files (they stay)"
+        )
+    )
+    compress.add_argument("files", nargs="+", type=Path, help="files in your library")
+    compress.add_argument(
+        "--zip", action="store_true", help="make a ZIP even of a single PDF or image"
+    )
+    convert = with_root(
+        commands.add_parser("convert", help="make a copy in another format (the original stays)")
+    )
+    convert.add_argument("files", nargs="+", type=Path, help="files in your library")
+    convert.add_argument(
+        "--to",
+        required=True,
+        metavar="FORMAT",
+        help="pdf, docx, png, jpg, webp, bmp or tiff (what each file allows)",
+    )
+
+    skipped = commands.add_parser(
+        "skipped", help="files only sorted by name because AutoShelf stopped while reading them"
+    )
+    skipped.add_argument("files", nargs="*", type=Path, help="with --clear: just these files")
+    skipped.add_argument("--clear", action="store_true", help="read them (or all) again")
 
     # Optional AI (needs `config --ai claude|ollama`)
     summarize = with_root(commands.add_parser("summarize", help="summarize a file (AI)"))
@@ -281,11 +351,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     _make_console_safe()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(app_commands.safe_url_argv(argv))
     if args.command is None:
         from autoshelf.ui.app import run_app  # imports Qt; only needed for the app
 
-        return run_app(verbose=args.verbose, show=not args.background)
+        try:
+            command = app_commands.from_args(args)
+        except app_commands.CommandError as exc:
+            parser.error(str(exc))
+        return run_app(verbose=args.verbose, show=not args.background, command=command)
     try:
         paths = get_app_paths()
         setup_logging(paths.log_dir, verbose=args.verbose)
@@ -315,6 +390,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "versions": _cmd_versions,
             "organize": _cmd_organize,
             "stats": _cmd_stats,
+            "digest": _cmd_digest,
+            "calibrate": _cmd_calibrate,
+            "skipped": _cmd_skipped,
+            "compress": _cmd_compress,
+            "convert": _cmd_convert,
             "summarize": _cmd_summarize,
             "rename-suggestions": _cmd_rename_suggestions,
             "rename": _cmd_rename,
@@ -346,6 +426,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         FolderNameError,
         FileExistsError,
         StartupError,
+        ExplorerError,
+        ConvertError,
+        CreateError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -413,6 +496,7 @@ def _watch(args: argparse.Namespace, paths: AppPaths, settings: Settings, root: 
         margin=settings.auto_margin,
         watched=valid_watched(paths, settings, root),
         watched_extensions=settings.watched_extensions,
+        sweep_interval=settings.sweep_minutes * 60,
     )
     mode = "DRY RUN: nothing will be moved" if args.dry_run else "files will be moved"
     log.info("Watching %s (%s). Data folder: %s", root, mode, paths.home)
@@ -507,7 +591,7 @@ def _cmd_classify(args: argparse.Namespace, paths: AppPaths) -> int:
         print(f"Decision:  move to {classification.choice.folder!r} automatically")
     else:
         print(f"Decision:  ask you (it would wait in {INBOX_DIRNAME})")
-    print(f"Why:       {classification.explanation}")
+    print(f"Why:       {wording.reason_text(classification.reason)}")
     if classification.scores:
         print("Folders (score = similarity to the folder's name/description and its files):")
     for item in classification.top(5):
@@ -652,6 +736,9 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         if args.ai_model is not None:
             settings.llm_model = args.ai_model.strip()
             changed = True
+        if args.ai_bulk_model is not None:
+            settings.llm_bulk_model = args.ai_bulk_model.strip()
+            changed = True
         if args.ollama_url is not None:
             settings.ollama_url = args.ollama_url.strip()
             changed = True
@@ -661,6 +748,20 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
         from autoshelf import startup
 
         startup.set_enabled(args.startup == "on")
+    if args.explorer_menu is not None:
+        from autoshelf import explorer
+
+        if args.explorer_menu == "on":
+            explorer.add()
+        else:
+            explorer.remove()
+    if args.notification_buttons is not None:
+        from autoshelf import explorer
+
+        if args.notification_buttons == "on":
+            explorer.add_link()
+        else:
+            explorer.remove_link()
     if args.api_key:
         from autoshelf.llm.secrets import set_api_key
 
@@ -685,15 +786,21 @@ def _cmd_config(args: argparse.Namespace, paths: AppPaths) -> int:
     print(f"Stable seconds:   {settings.stable_seconds:g}")
     print(f"Watched folders:  {', '.join(settings.watched_folders) or '(none)'}")
     print(f"  taking:         {', '.join(settings.watched_extensions) or '(nothing)'}")
-    from autoshelf.llm import PROVIDER_NAMES, default_model
+    from autoshelf.llm import BULK_TASKS, PROVIDER_NAMES, bulk_model, default_model
 
     ai = PROVIDER_NAMES.get(settings.llm_provider, settings.llm_provider)
     if settings.llm_provider != "off":
-        ai += f", model {settings.llm_model or default_model(settings.llm_provider)}"
+        model = settings.llm_model or default_model(settings.llm_provider)
+        bulk = bulk_model(settings.llm_provider, settings.llm_model, settings.llm_bulk_model)
+        ai += f", model {model}"
+        if bulk != model:
+            ai += f" ({BULK_TASKS}: {bulk})"
     print(f"AI (optional):    {ai}")
-    from autoshelf import startup
+    from autoshelf import explorer, startup
 
     print(f"Start with Windows: {'on' if startup.is_enabled() else 'off'}")
+    print(f"Explorer menu:    {'on' if explorer.is_added() else 'off'}")
+    print(f"Notification buttons: {'on' if explorer.link_ready() else 'off'}")
     print(f"Data folder:      {paths.home}")
     if args.model is not None and settings.embedding_model != DEFAULT_EMBEDDING_MODEL:
         print(
@@ -711,7 +818,7 @@ def _cmd_why(args: argparse.Namespace, paths: AppPaths) -> int:
         return 1
     print(format_history_entry(entry))
     root = Path(entry.root) if entry.root else None
-    lines = explain.describe(entry.details, root)
+    lines = wording.decision_lines(entry.details, root)
     if entry.reason == "user" and not entry.details.get("corrects"):
         lines.insert(0, "You chose this folder.")
     print("\n".join(lines) if lines else "No explanation was stored for this entry.")
@@ -753,18 +860,21 @@ def _cmd_rules(args: argparse.Namespace, paths: AppPaths) -> int:
     action = args.rules_command
     if action == "test":
         return _rules_test(args, paths)
+    if action == "suggest":
+        return _rules_suggest(args, paths)
+    if action == "add":
+        service = _service(args, paths)
+        rule = service.add_rule(
+            args.name,
+            conditions=_rule_conditions(args),
+            match_any=args.any,
+            target=args.to or "",
+            tags=args.tag,
+            rename_template=args.rename or "",
+        )
+        print(f"Added rule #{rule.id}.")
     with contextlib.closing(open_database(paths.db_path)) as conn:
-        if action == "add":
-            settings = _settings(paths)
-            root = _root(args, settings, paths)
-            kind, pattern = _rule_condition(args)
-            rule_engine.check_rule(args.name, kind, pattern)
-            key = resolve_folder(root, args.to, settings.ignore_patterns)
-            rule_id = repository.insert_rule(
-                conn, name=args.name.strip(), kind=kind, pattern=pattern.strip(), target_folder=key
-            )
-            print(f"Added rule #{rule_id}.")
-        elif action is not None:
+        if action not in (None, "add"):
             rule = repository.get_rule(conn, args.id)
             if rule is None:
                 print(f"error: there is no rule #{args.id}", file=sys.stderr)
@@ -774,13 +884,51 @@ def _cmd_rules(args: argparse.Namespace, paths: AppPaths) -> int:
     return 0
 
 
-def _rule_condition(args: argparse.Namespace) -> tuple[str, str]:
-    """(kind, pattern) from whichever of the condition options was given."""
-    if args.name_matches is not None:
-        return "name", args.name_matches
-    if args.extension is not None:
-        return "extension", args.extension
-    return "text", args.text_contains
+def _rule_conditions(args: argparse.Namespace) -> list[dict]:
+    """The conditions given as options (RuleError if there are none)."""
+    found = []
+    for kind, value in (
+        ("name", args.name_matches),
+        ("extension", args.extension),
+        ("text", args.text_contains),
+    ):
+        if value is not None:
+            found.append({"kind": kind, "pattern": value})
+    if args.size_min is not None or args.size_max is not None:
+        found.append({"kind": "size", "min": args.size_min, "max": args.size_max})
+    if args.date_from is not None or args.date_to is not None:
+        found.append({"kind": "date", "from": args.date_from, "to": args.date_to})
+    if not found:
+        raise rule_engine.RuleError(
+            "Give at least one condition, e.g. --name-matches, --extension or --text-contains"
+        )
+    return found
+
+
+def _rules_suggest(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    suggestions = service.rule_suggestions()
+    chosen = args.add or args.dismiss
+    if chosen is not None:
+        if not 1 <= chosen <= len(suggestions):
+            print(f"error: choose a suggestion from 1 to {len(suggestions)}", file=sys.stderr)
+            return 1
+        item = suggestions[chosen - 1]
+        if args.add:
+            rule = service.add_suggested_rule(item)
+            print(f"Added rule #{rule.id} {rule.name!r}.")
+        else:
+            service.dismiss_rule_suggestion(item.key)
+            print("It won't be suggested again.")
+        return 0
+    if not suggestions:
+        print("No rule to suggest yet: your choices share no simple pattern.")
+        return 0
+    for number, item in enumerate(suggestions, start=1):
+        print(f"{number}. {wording.rule_suggestion(item)}")
+        print(f"   files: {', '.join(item.files[:5])}" + (" ..." if len(item.files) > 5 else ""))
+    print("Make one a rule with: autoshelf rules suggest --add N (or --dismiss N)")
+    return 0
 
 
 def _change_rule(conn: sqlite3.Connection, rule: repository.RuleRecord, action: str) -> None:
@@ -788,18 +936,7 @@ def _change_rule(conn: sqlite3.Connection, rule: repository.RuleRecord, action: 
         repository.delete_rule(conn, rule.id)
         print(f"Removed rule #{rule.id} {rule.name!r}.")
     elif action in ("enable", "disable"):
-        repository.update_rule(
-            conn,
-            repository.RuleRecord(
-                rule.id,
-                rule.name,
-                rule.priority,
-                action == "enable",
-                rule.kind,
-                rule.pattern,
-                rule.target_folder,
-            ),
-        )
+        repository.update_rule(conn, replace(rule, enabled=action == "enable"))
     else:
         ids = [item.id for item in repository.list_rules(conn)]
         index = ids.index(rule.id)
@@ -818,26 +955,15 @@ def _print_rules(rules: list[repository.RuleRecord]) -> None:
     print("Rules, checked in this order (the first match wins):")
     for number, rule in enumerate(rules, start=1):
         state = "" if rule.enabled else "  (off)"
-        condition = rule_engine.describe_condition(rule.kind, rule.pattern)
-        print(f"  {number}. #{rule.id} {rule.name}: {condition} -> {rule.target_folder}{state}")
+        does = wording.rule_actions(rule.target_folder, rule.tags, rule.rename_template)
+        print(f"  {number}. #{rule.id} {rule.name}: {wording.conditions(rule)} -> {does}{state}")
 
 
 def _rules_test(args: argparse.Namespace, paths: AppPaths) -> int:
-    from autoshelf.extract import extract
-
     if not args.file.is_file():
         print(f"error: not a file: {args.file}", file=sys.stderr)
         return 1
-    with contextlib.closing(open_database(paths.db_path)) as conn:
-        rules = repository.list_rules(conn, enabled_only=True)
-    match = rule_engine.first_match(rules, args.file, extract(args.file))
-    if match is None:
-        print("No rule matches; AutoShelf would decide by the file's content.")
-    else:
-        print(
-            f"Rule {match.rule.name!r} matches ({match.match}): "
-            f"it would go to {match.rule.target_folder}"
-        )
+    print(wording.rule_test(AppService(paths).test_rules(args.file)))
     return 0
 
 
@@ -956,7 +1082,7 @@ def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
         mark = "[x]" if item.selected else "[ ]"
         score = f"{item.confidence:.2f}" if item.confidence is not None else "    "
         print(f"  {mark} {score}  {item.path.name}: {item.current} -> {item.target or '?'}")
-        print(f"            {item.explanation}")
+        print(f"            {wording.reason_text(item.why)}")
     if not args.apply:
         print("Nothing was moved. Add --apply to move the [x] files (as one undoable batch).")
         return 0
@@ -967,6 +1093,12 @@ def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
     if result.moved:
         print(f"Undo all of them with: autoshelf undo --batch {result.batch_id}")
     return 1 if result.failed else 0
+
+
+def _cmd_digest(args: argparse.Namespace, paths: AppPaths) -> int:
+    week = _service(args, paths).digest()
+    print(wording.digest(week.sorted, week.waiting, week.learned))
+    return 0
 
 
 def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
@@ -988,9 +1120,85 @@ def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:
         for source, target, count in stats.corrected_pairs:
             print(f"  {count:3}x  {source} -> {target}")
     if stats.stale_total:
-        print(f"Not opened in 6+ months: {stats.stale_total} file(s), e.g.:")
+        print(
+            f"Untouched for 6+ months (not changed, added or opened from AutoShelf): "
+            f"{stats.stale_total} file(s), e.g.:"
+        )
         for item in stats.stale[:5]:
             print(f"  {item.last_used:%Y-%m-%d}  {item.path.name}")
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace, paths: AppPaths) -> int:
+    from autoshelf import wording
+    from autoshelf.config import CONFIDENCE_LEVELS, confidence_level
+
+    service = _service(args, paths)
+
+    def progress(done: int, total: int) -> None:
+        if done == total or done % 50 == 0:
+            print(f"Testing: {done}/{total}", file=sys.stderr)
+
+    result = service.calibrate(progress=progress)
+    settings = service.settings()
+    current = confidence_level(settings.auto_threshold, settings.auto_margin)
+    for line in wording.calibration(result, current):
+        print(line)
+    if result.recommended is None or result.recommended == current:
+        return 0
+    level = CONFIDENCE_LEVELS[result.recommended]
+    if not args.apply:
+        print("Switch to it with: autoshelf calibrate --apply")
+        return 0
+    service.set_level(result.recommended)
+    print(
+        f"Now sorting at {level.name} (threshold {level.threshold:.2f}, margin "
+        f"{level.margin:.2f}); restart a running watcher to apply it."
+    )
+    return 0
+
+
+def _cmd_compress(args: argparse.Namespace, paths: AppPaths) -> int:
+    created = _service(args, paths).compress(args.files, zip_always=args.zip)
+    _print_created([created])
+    return 0
+
+
+def _cmd_convert(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    created = service.convert(args.files, args.to)
+    _print_created(created)
+    if args.to.casefold().lstrip(".") == "docx":
+        print("Note: a PDF's layout is only approximated in Word; check the result.")
+    return 0
+
+
+def _print_created(created) -> None:
+    for item in created:
+        print(f"Made {item.dst} (undo with: autoshelf undo {item.history_id})")
+
+
+def _cmd_skipped(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = AppService(paths)
+    if args.files and not args.clear:
+        print("error: add --clear to read these files again", file=sys.stderr)
+        return EXIT_USAGE
+    if args.clear:
+        files = [path.resolve() for path in args.files] or None
+        cleared = service.clear_skipped(files)
+        print(f"{cleared} file(s) will be read again." if cleared else "No such skipped files.")
+        return 0
+    skipped = service.skipped_files()
+    if not skipped:
+        print("No skipped files: AutoShelf reads every file.")
+        return 0
+    print(
+        "AutoShelf stopped while reading these files (a crash, or a power cut or forced "
+        "restart), so it sorts them by name only:"
+    )
+    for item in skipped:
+        print(f"  {item.path}")
+    print("Read them again with: autoshelf skipped --clear [FILE ...]")
     return 0
 
 

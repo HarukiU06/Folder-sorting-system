@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.settings, "Settings")
         self.tabs.setTabVisible(self.tabs.indexOf(self.ask), False)  # only with AI on
         self.settings.ai_state.connect(self.set_ai_enabled)
+        self.settings.message.connect(self.show_message)
         self.setCentralWidget(self.tabs)
         self.state = QLabel()
         self.statusBar().addPermanentWidget(self.state)

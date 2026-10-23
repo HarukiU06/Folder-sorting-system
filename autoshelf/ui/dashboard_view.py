@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from autoshelf.app_service import AppService
-from autoshelf.features.stats import LibraryStats
+from autoshelf.features.stats import STALE_NOTE, LibraryStats
 from autoshelf.ui.tasks import TaskRunner
 
 BAR_COLOUR = QColor("#3b82a0")
@@ -106,7 +106,9 @@ class DashboardView(QWidget):
         self.per_month = BarChart()
         self.corrected = QListWidget()
         self.stale = QListWidget()
-        self.stale_title = QLabel("Not opened in 6+ months")
+        self.stale_title = QLabel("Untouched for 6+ months")
+        for widget in (self.stale, self.stale_title):
+            widget.setToolTip(STALE_NOTE)
 
         charts = QGridLayout()
         charts.addWidget(QLabel("<b>Files per folder</b>"), 0, 0)
@@ -169,7 +171,7 @@ class DashboardView(QWidget):
             self.corrected.addItem(f"{count}x  {source} -> {target}")
         if not stats.corrected_pairs:
             self.corrected.addItem("No corrections yet.")
-        self.stale_title.setText(f"<b>Not opened in 6+ months ({stats.stale_total})</b>")
+        self.stale_title.setText(f"<b>Untouched for 6+ months ({stats.stale_total})</b>")
         self.stale.clear()
         for item in stats.stale:
             self.stale.addItem(f"{item.last_used:%Y-%m-%d}  {item.path.name}")

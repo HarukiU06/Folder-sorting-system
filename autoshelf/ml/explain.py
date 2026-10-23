@@ -7,7 +7,8 @@ For every decision AutoShelf stores, next to the top three folders and their sco
 - any penalty learned from the user's corrections,
 - or the rule that fired.
 
-``describe`` turns those stored details back into readable lines (CLI and app).
+Everything is stored as data; ``wording.decision_lines`` turns it into readable lines
+(CLI and app) when it is shown.
 """
 
 import math
@@ -15,10 +16,10 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from pathlib import Path
 
 from autoshelf.ml.classifier import Classification, FolderScore
 from autoshelf.ml.learned import Adjustment
+from autoshelf.reasons import RULE, reason
 
 TOP_KEYWORDS = 6
 SIMILAR_FILES = 3
@@ -170,66 +171,30 @@ def _focus(classification: Classification, folder: str | None) -> FolderScore | 
     return classification.scores[0] if classification.scores else None
 
 
-def rule_details(rule_name: str, condition: str, target: str, match: str) -> dict:
-    """What is stored when a rule decided."""
-    return {
-        "rule": {"name": rule_name, "condition": condition, "target": target, "match": match},
-        "explanation": f"rule {rule_name!r} matched ({match})",
+def rule_details(
+    name: str,
+    conditions: Sequence[Mapping],
+    target: str,
+    matched: Sequence[Mapping],
+    *,
+    tags: Sequence[str] = (),
+    rename: str = "",
+) -> dict:
+    """What is stored when a rule applied: the rule as it was, and what it found."""
+    rule = {
+        "name": name,
+        "conditions": [dict(item) for item in conditions],
+        "target": target,
+        "matched": [dict(item) for item in matched],
     }
-
-
-def describe(details: Mapping, root: Path | None = None) -> list[str]:
-    """Readable lines explaining a stored decision (empty if nothing was stored)."""
-    lines: list[str] = []
-    rule = details.get("rule")
-    if rule:
-        lines.append(f"Rule {rule['name']!r}: {rule['condition']} -> {rule['target']}")
-        if rule.get("match"):
-            lines.append(f"  matched: {rule['match']}")
-    if details.get("explanation") and not rule:
-        lines.append(f"Decision: {details['explanation']}")
-    candidates = details.get("candidates") or []
-    if candidates:
-        lines.append("Best folders:")
-        for item in candidates:
-            parts = []
-            if "name" in item:
-                parts.append(f"name/description {item['name']:.2f}")
-            if "files" in item:
-                parts.append(f"files {item['files']:.2f}")
-            if item.get("learned"):
-                parts.append(f"learned {item['learned']:+.2f}")
-            detail = f"  ({', '.join(parts)})" if parts else ""
-            lines.append(f"  {item['score']:.2f}  {item['folder']}{detail}")
-    focus = details.get("focus")
-    similar = details.get("similar_files") or []
-    if similar:
-        lines.append(f"Most similar files in {focus}:")
-        for item in similar:
-            lines.append(f"  {item['similarity']:.2f}  {_shown_path(item['path'], root)}")
-    keywords = details.get("keywords") or []
-    if keywords:
-        lines.append(f"Words in common with {focus}: {', '.join(keywords)}")
-    for adjustment in details.get("learned") or []:
-        examples = ", ".join(
-            f"{item['file'] or 'a file'} -> {item['to']}" for item in adjustment["examples"]
-        )
-        lines.append(
-            f"Learned {adjustment['amount']:+.2f} for {adjustment['folder']}: you moved "
-            f"similar files away from it ({examples})"
-        )
-    if details.get("corrects"):
-        lines.append(f"You moved it here, correcting #{details['corrects']}")
-    return lines
-
-
-def _shown_path(path: str, root: Path | None) -> str:
-    if root is not None:
-        try:
-            return Path(path).relative_to(root).as_posix()
-        except ValueError:
-            pass
-    return Path(path).name
+    if tags:
+        rule["tags"] = list(tags)
+    if rename:
+        rule["rename"] = rename
+    return {
+        "rule": rule,
+        "reason": reason(RULE, rule=name, matched=[dict(item) for item in matched]),
+    }
 
 
 def keyword_text(name: str, title: str | None, text: str) -> str:

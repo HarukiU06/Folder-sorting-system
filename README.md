@@ -7,12 +7,14 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** phases 0–13 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–15 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
 > your corrections, follows your rules, explains every decision, helps you search and tidy
-> your library, and makes smaller copies or copies in other formats. Optional AI features
-> (off by default) add summaries, better names, answers from your files and study tools.
+> your library, and makes smaller copies or copies in other formats. It adds itself to
+> Explorer's right-click menu, answers from notification buttons, comes with an installer, and
+> sums up your week. Optional AI features (off by default) add summaries, better names,
+> answers from your files and study tools.
 
 | Inbox | Why did it go there? | Search |
 |---|---|---|
@@ -108,7 +110,13 @@ has a button for each of the best three folders and "Leave in Inbox": a folder b
 the file there (AutoShelf learns from it, as from the Inbox, and History can undo it), even
 if AutoShelf was closed in the meantime. The buttons open `autoshelf:` links, which carry
 only a random code that works once and expires after 14 days, never a file name, so a link
-on a web page can't make AutoShelf move anything. The tray menu can pause sorting: new files then wait until you resume.
+on a web page can't make AutoShelf move anything. Once a week a notification sums up what AutoShelf did: "This week: 23 sorted, 3 waiting
+in Inbox, 1 correction learned" (files put into your folders and not undone, files in the
+Inbox now, and Inbox answers and corrections it learned from); clicking it opens the
+Dashboard. As AutoShelf isn't always running, it looks when it starts and then every hour;
+the first start only starts counting, and a week with nothing to tell is skipped. Settings
+turns it off; `autoshelf digest` prints the same line any time. The tray menu can pause
+sorting: new files then wait until you resume.
 Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.

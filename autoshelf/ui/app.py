@@ -19,7 +19,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
-from autoshelf import commands, explorer, links
+from autoshelf import commands, explorer, links, wording
 from autoshelf.app_service import AppService, WhyHere
 from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 APP_USER_MODEL_ID = explorer.APP_ID
 NOTIFY_DELAY_MSECS = 1500  # files arriving together get one notification
 REFRESH_DELAY_MSECS = 700
+DIGEST_CHECK_MSECS = 60 * 60 * 1000  # the weekly digest is looked at every hour
 # Explorer starts one AutoShelf per selected file; what arrives within this long of the
 # previous one is handled together (ten right-clicked images: one ZIP).
 BATCH_MSECS = 1500
@@ -137,6 +138,10 @@ class AutoShelfApp(QObject):
 
         self.tray.open_requested.connect(lambda: self.show_window())
         self.tray.inbox_requested.connect(self._open_inbox_from_tray)
+        self.tray.message_clicked.connect(self._message_clicked)
+        self._clicked_opens = "inbox"  # what clicking the last plain notification opens
+        self._digest_timer = QTimer(self, interval=DIGEST_CHECK_MSECS)
+        self._digest_timer.timeout.connect(self.check_digest)
         self.tray.pause_toggled.connect(self.set_paused)
         self.tray.quit_requested.connect(QApplication.quit)
         settings = self.window.settings
@@ -160,6 +165,8 @@ class AutoShelfApp(QObject):
             return
         self.service.start()
         self.runner.run(self.service.repair_integration, None, lambda exc: None)
+        self.check_digest()
+        self._digest_timer.start()
         self.window.set_state("Paused" if settings.paused else "Starting...")
         self.window.refresh_all()
         if show:
@@ -387,6 +394,9 @@ class AutoShelfApp(QObject):
                 lambda exc: self._warn("Couldn't put the file away", str(exc)),
             )
             return
+        if link.action == links.DASHBOARD:
+            self.show_window(self.window.dashboard)
+            return
         token = link.offer
 
         def show(path: Path | None) -> None:
@@ -450,6 +460,7 @@ class AutoShelfApp(QObject):
             return
         title, message = notification_text(pending)
         self._notify_path = pending[0].dst if len(pending) == 1 else None
+        self._clicked_opens = "inbox"
 
         def with_buttons() -> bool:
             toaster = self._toaster()
@@ -472,6 +483,43 @@ class AutoShelfApp(QObject):
         self.show_window()
         self.window.show_inbox(self._notify_path)
         self._notify_path = None
+
+    def _message_clicked(self) -> None:
+        if self._clicked_opens == "dashboard":
+            self.show_window(self.window.dashboard)
+        else:
+            self._open_inbox_from_tray()
+
+    def check_digest(self) -> None:
+        """Show the weekly digest if a week has passed since the last one."""
+
+        def show(week) -> None:
+            if week is not None:
+                self.show_digest(week)
+
+        self.runner.run(self.service.digest_due, show, lambda exc: None)
+
+    def show_digest(self, week) -> None:
+        """The weekly digest as a notification; clicking it opens the Dashboard."""
+        title = "AutoShelf this week"
+        message = wording.digest(week.sorted, week.waiting, week.learned)
+        note = Note(title, message, launch=links.link(links.DASHBOARD))
+
+        def with_toast() -> bool:
+            toaster = self._toaster()
+            if toaster is None:
+                return False
+            toaster.show(note)
+            return True
+
+        def plain(shown: bool) -> None:
+            if shown:
+                return
+            self._clicked_opens = "dashboard"
+            if not self.tray.notify(title, message):
+                self.window.show_message(message)
+
+        self.runner.run(with_toast, plain, lambda exc: plain(False))
 
     def _refresh_after_outcomes(self) -> None:
         self.window.inbox.refresh()

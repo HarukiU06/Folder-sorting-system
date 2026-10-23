@@ -13,6 +13,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from autoshelf import links, llm
@@ -37,6 +38,7 @@ from autoshelf.db.connection import open_database
 from autoshelf.extract import guard as read_guard
 from autoshelf.features import ask as ask_features
 from autoshelf.features import convert as convert_features
+from autoshelf.features import digest as digest_features
 from autoshelf.features import duplicates as duplicate_features
 from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
@@ -833,6 +835,31 @@ class AppService:
         root = self._require_root()
         with self._connect() as conn:
             return library_stats(conn, root, self.settings().ignore_patterns)
+
+    def digest(self, now: datetime | None = None) -> digest_features.Digest:
+        """What AutoShelf did in the last seven days."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return digest_features.weekly_digest(
+                conn, root, self.settings().ignore_patterns, now=now
+            )
+
+    def digest_due(self, now: datetime | None = None) -> digest_features.Digest | None:
+        """The weekly digest, if it is on and seven days have passed since it was last
+        shown (it then counts as shown). The first time, only the date is remembered, and
+        a week in which nothing happened is skipped."""
+        now = now or datetime.now(UTC)
+        settings = self.settings()
+        if not settings.weekly_digest or settings.root is None:
+            return None
+        if settings.digest_shown and not digest_features.due(settings.digest_shown, now):
+            return None
+        first = not settings.digest_shown
+        self.save_settings(replace(settings, digest_shown=now.isoformat(timespec="seconds")))
+        if first:
+            return None
+        week = self.digest(now)
+        return None if week.empty else week
 
     # --- watched folders ------------------------------------------------------------------
 

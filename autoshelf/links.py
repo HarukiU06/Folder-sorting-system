@@ -22,7 +22,8 @@ from autoshelf.db import repository
 SCHEME = "autoshelf"
 INBOX = "inbox"  # open the Inbox (on the offered file, if any)
 ASSIGN = "assign"  # put the offered file into one of the offered folders
-ACTIONS = frozenset({INBOX, ASSIGN})
+DASHBOARD = "dashboard"  # open the Dashboard (the weekly digest)
+ACTIONS = frozenset({INBOX, ASSIGN, DASHBOARD})
 OFFER_PREFIX = "offer:"
 OFFER_DAYS = 14  # a notification older than this does nothing
 MAX_OFFERS = 100  # older offers are forgotten first

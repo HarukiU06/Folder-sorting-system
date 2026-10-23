@@ -112,6 +112,10 @@ class SettingsView(QWidget):
         self.paused.toggled.connect(self._paused_changed)
         self.notifications = QCheckBox("Notify me when a file needs my decision")
         self.notifications.toggled.connect(self._notifications_changed)
+        self.weekly = QCheckBox(
+            "Once a week, tell me what AutoShelf did (sorted, waiting, learned)"
+        )
+        self.weekly.toggled.connect(lambda on: self._update(None, False, weekly_digest=on))
         self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
         self.startup.toggled.connect(self._startup_changed)
         self.explorer_menu = QCheckBox(
@@ -157,6 +161,7 @@ class SettingsView(QWidget):
         sorting.addWidget(self.calibration_text)
         sorting.addWidget(self.paused)
         sorting.addWidget(self.notifications)
+        sorting.addWidget(self.weekly)
         sorting.addWidget(self.startup)
         sorting.addWidget(self.explorer_menu)
         sorting.addWidget(self.buttons)
@@ -405,6 +410,7 @@ class SettingsView(QWidget):
             self.slider,
             self.paused,
             self.notifications,
+            self.weekly,
             self.ai_provider,
             self.sort_created,
         )
@@ -424,6 +430,7 @@ class SettingsView(QWidget):
             self.level_text.setText(describe_level(level))
         self.paused.setChecked(settings.paused)
         self.notifications.setChecked(settings.notifications)
+        self.weekly.setChecked(settings.weekly_digest)
         self.stable.setValue(settings.stable_seconds)
         self.sweep.setValue(settings.sweep_minutes)
         self.sort_created.setChecked(settings.sort_created_files)

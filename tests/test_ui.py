@@ -1368,3 +1368,56 @@ def test_without_buttons_notifications_still_arrive(
         )
     finally:
         app.shutdown()
+
+
+# --- Phase 15: the weekly digest -------------------------------------------------------------
+
+
+def test_the_weekly_digest_opens_the_dashboard(qtbot, service: AppService, shelf: Path) -> None:
+    from autoshelf.features.digest import Digest
+
+    toaster = FakeToaster()
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    try:
+        app.show_digest(Digest(23, 3, 1, since=None))
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        note = toaster.notes[0]
+        assert note.message == "This week: 23 sorted, 3 waiting in Inbox, 1 correction learned"
+        assert note.launch == "autoshelf:dashboard" and note.buttons == ()
+        app.run_command(Command(commands.URL, url=note.launch))
+        assert app.window.tabs.currentWidget() is app.window.dashboard
+    finally:
+        app.shutdown()
+
+
+def test_a_plain_digest_notification_also_opens_the_dashboard(qtbot, app) -> None:
+    from autoshelf.features.digest import Digest
+
+    app._toaster = lambda: None  # no buttons: the tray's notification
+    app.show_digest(Digest(1, 0, 0, since=None))
+    status = app.window.statusBar()
+    qtbot.waitUntil(lambda: "This week: 1 sorted" in status.currentMessage(), timeout=WAIT_MS)
+    app.tray.message_clicked.emit()
+    assert app.window.tabs.currentWidget() is app.window.dashboard
+    app._clicked_opens = "inbox"
+    app.tray.message_clicked.emit()
+    assert app.window.tabs.currentWidget() is app.window.inbox
+
+
+def test_the_weekly_digest_can_be_turned_off(qtbot, service, runner) -> None:
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    view.load()
+    settle(qtbot, runner)
+    assert view.weekly.isChecked()
+    view.weekly.setChecked(False)
+    settle(qtbot, runner)
+    assert not service.settings().weekly_digest
+
+
+def test_the_app_starts_counting_weeks_on_its_first_start(qtbot, app) -> None:
+    app.start(show=False)
+    qtbot.waitUntil(lambda: bool(app.service.settings().digest_shown), timeout=WAIT_MS)
+    assert app._digest_timer.isActive()

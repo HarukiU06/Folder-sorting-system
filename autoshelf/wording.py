@@ -88,6 +88,15 @@ def created(reason: Mapping) -> str:
 # --- rules -----------------------------------------------------------------------------------
 
 
+def digest(sorted_files: int, waiting: int, learned: int) -> str:
+    """ "This week: 23 sorted, 3 waiting in Inbox, 1 correction learned"."""
+    corrections = "correction" if learned == 1 else "corrections"
+    return (
+        f"This week: {sorted_files} sorted, {waiting} waiting in Inbox, "
+        f"{learned} {corrections} learned"
+    )
+
+
 def size_text(size: int) -> str:
     """1536 -> "1.5 KB"."""
     value = float(size)

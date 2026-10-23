@@ -273,6 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     with_root(commands.add_parser("stats", help="numbers about your library"))
+    with_root(commands.add_parser("digest", help="what AutoShelf did in the last seven days"))
     calibrate = with_root(
         commands.add_parser("calibrate", help="how well would AutoShelf sort your library?")
     )
@@ -389,6 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "versions": _cmd_versions,
             "organize": _cmd_organize,
             "stats": _cmd_stats,
+            "digest": _cmd_digest,
             "calibrate": _cmd_calibrate,
             "skipped": _cmd_skipped,
             "compress": _cmd_compress,
@@ -1091,6 +1093,12 @@ def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
     if result.moved:
         print(f"Undo all of them with: autoshelf undo --batch {result.batch_id}")
     return 1 if result.failed else 0
+
+
+def _cmd_digest(args: argparse.Namespace, paths: AppPaths) -> int:
+    week = _service(args, paths).digest()
+    print(wording.digest(week.sorted, week.waiting, week.learned))
+    return 0
 
 
 def _cmd_stats(args: argparse.Namespace, paths: AppPaths) -> int:

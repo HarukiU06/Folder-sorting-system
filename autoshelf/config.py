@@ -220,6 +220,8 @@ class Settings:
     # or sorted like any new file (True). Copies in your folders always stay there.
     sort_created_files: bool = False
     notifications: bool = True  # notify when a file needs a decision
+    weekly_digest: bool = True  # a notification once a week: sorted, waiting, learned
+    digest_shown: str = ""  # when it was last shown (ISO time); "" before the first start
     # Opt-in folders outside the root (e.g. Downloads): new files there with one of
     # ``watched_extensions`` are moved into the root and sorted. None by default.
     watched_folders: list[str] = field(default_factory=list)

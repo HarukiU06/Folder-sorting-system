@@ -44,6 +44,7 @@ AutoShelf moves real files, so:
 ```
 AutoShelf/                  <- the root you pass with --root
 ├── _Inbox/                 <- files waiting for your decision
+├── _Duplicates/            <- copies you chose to set aside (delete them yourself)
 ├── _Trash/                 <- copies AutoShelf made and you undid (delete them yourself)
 ├── Finance/                <- your own folders; files you put here are never moved
 ├── Machine Learning/
@@ -89,7 +90,7 @@ start paused so you can look first. AutoShelf then lives in the system tray:
   last N, or move a file AutoShelf put in the wrong folder to the right one ("Move to another
   folder", which AutoShelf learns from).
 - **Library:** search your files by meaning or by exact words, browse tags, and see a
-  file's details, tags and related files.
+  file's details, tags and related files; compress or convert the selected files.
 - **Folders:** your folders with file counts; double-click a description to edit it.
 - **Rules:** rules that send matching files straight to a folder (see below).
 - **Tidy up:** organize a messy folder (preview, then one undoable batch), find identical
@@ -98,10 +99,11 @@ start paused so you can look first. AutoShelf then lives in the system tray:
   kept, the most corrected folders, and files untouched for six months (not changed, added
   or opened from AutoShelf: Windows doesn't reliably record when you open a file elsewhere).
 - **Ask** (only with AI on): questions about your files, answered with citations.
-- **Settings:** the folder to sort, a Cautious ↔ Automatic slider, pause, notifications
-  (and their buttons), start with Windows, the Explorer menu, which files to ignore, how
-  often to look for missed files, files sorted by name only (to read them again), and other
-  folders to watch (optional, e.g. Downloads).
+- **Settings:** the folder to sort, a Cautious ↔ Automatic slider (and "How well would
+  AutoShelf sort my library?"), pause, notifications (and their buttons), the weekly digest,
+  start with Windows, the Explorer menu, which files to ignore, how often to look for missed
+  files, files sorted by name only (to read them again), whether compressed and converted
+  copies are sorted, and other folders to watch (optional, e.g. Downloads).
 
 When a file needs your decision, a notification asks "Where should *file* go?" with the best
 guesses; click it to open the Inbox with that file selected. When AutoShelf is installed
@@ -110,14 +112,16 @@ has a button for each of the best three folders and "Leave in Inbox": a folder b
 the file there (AutoShelf learns from it, as from the Inbox, and History can undo it), even
 if AutoShelf was closed in the meantime. The buttons open `autoshelf:` links, which carry
 only a random code that works once and expires after 14 days, never a file name, so a link
-on a web page can't make AutoShelf move anything. Once a week a notification sums up what AutoShelf did: "This week: 23 sorted, 3 waiting
+on a web page can't make AutoShelf move anything.
+
+Once a week a notification sums up what AutoShelf did: "This week: 23 sorted, 3 waiting
 in Inbox, 1 correction learned" (files put into your folders and not undone, files in the
 Inbox now, and Inbox answers and corrections it learned from); clicking it opens the
 Dashboard. As AutoShelf isn't always running, it looks when it starts and then every hour;
 the first start only starts counting, and a week with nothing to tell is skipped. Settings
-turns it off; `autoshelf digest` prints the same line any time. The tray menu can pause
-sorting: new files then wait until you resume.
-Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
+turns it off; `autoshelf digest` prints the same line any time.
+
+The tray menu can pause sorting: new files then wait until you resume. Closing the window keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.
 
@@ -289,15 +293,16 @@ Other commands: `extract FILE` shows the text AutoShelf reads from a file, `inde
 files already in your folders ahead of time (the watcher also does this when it starts),
 `skipped` lists files sorted by name only because AutoShelf stopped while reading them
 (`skipped --clear [FILE ...]` reads them again), `calibrate [--apply]` tests how well
-AutoShelf would sort your library at each confidence level (see below), and `config` shows
-or changes settings. Every command that needs the root accepts `--root`.
+AutoShelf would sort your library at each confidence level (see below), `digest` prints the
+weekly digest's line, and `config` shows or changes settings. Every command that needs the root accepts `--root`.
 
 Options: `-v` shows debug output, `--stable-seconds N` changes how long a file must stay
 unchanged before it is processed. Windows can miss file events in busy iCloud folders, so
 every 5 minutes the watcher also looks at the root and `_Inbox` again for files it missed
 (files it already knows, unchanged, aren't read again); Settings changes the interval or
-turns it off. A file you undo is put back where it was and left alone from then on. Undo refuses (and changes nothing) if the file has been edited since it was
-moved (`--force` overrides), was moved elsewhere, or if its original folder no longer exists.
+turns it off. A file you undo is put back where it was and left alone from then on.
+
+Undo refuses (and changes nothing) if the file has been edited since it was moved (`--force` overrides), was moved elsewhere, or if its original folder no longer exists.
 
 The log file is `%APPDATA%\AutoShelf\logs\autoshelf.log`. Set `AUTOSHELF_HOME` to use a
 different data folder (handy for experiments).
@@ -509,8 +514,8 @@ looks the same, so Settings lists these files ("Files sorted by name only"), and
 
 Tests only use temporary folders, never your real files or `%APPDATA%`. They also replace
 the language model with a fake one, keep API keys in memory instead of the Windows
-Credential Manager, use a fake registry for "Start with Windows", and refuse any network
-access. GitHub Actions runs the same lint and tests on Windows with Python 3.12 and 3.13
+Credential Manager, use a fake registry for "Start with Windows", the Explorer menu and the
+`autoshelf:` link, never show real notifications, and refuse any network access. GitHub Actions runs the same lint and tests on Windows with Python 3.12 and 3.13
 (`.github/workflows/tests.yml`). The screenshots are made from a demo library in a
 temporary folder.
 
@@ -530,13 +535,26 @@ with `--library` on a copy of a real library before changing them.
 
 ## License
 
-AutoShelf's own code is MIT-licensed (see [LICENSE](LICENSE)). It uses, among others:
-PySide6 / Qt (LGPL-3.0), PyMuPDF (AGPL-3.0), ebooklib (AGPL-3.0), mutagen (GPL-2.0-or-later),
+Copyright (C) 2026 HarukiU06
+
+AutoShelf is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version. It is distributed in the
+hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full
+text. (Earlier versions of this repository were published under the MIT License.)
+
+Why the AGPL: AutoShelf reads PDFs with PyMuPDF and EPUBs with ebooklib, both under the
+AGPL-3.0, and the app that is built and released bundles them (PDF to Word and PDF
+compression need PyMuPDF too). One license for the source and the app keeps that simple.
+The source of each release is the commit its tag points to; GitHub attaches it to the
+Release as a ZIP.
+
+AutoShelf also uses, among others: PySide6 / Qt (LGPL-3.0), mutagen (GPL-2.0-or-later),
 PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
 openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools, fire,
 windows-toasts and the winrt packages (BSD, MIT, Apache-2.0 or similar), and
 opencv-python-headless (Apache-2.0, needed by pdf2docx; it includes an FFmpeg library under
-LGPL-2.1). The installer is made with Inno Setup, whose license allows that.
-The packaged app in `dist\AutoShelf\` bundles all of them, so sharing that folder means
-following their licenses too, notably the AGPL and GPL ones (for example by pointing to this
-repository's source).
+LGPL-2.1). All of them may be combined with an AGPL-3.0 program. The installer is made with
+Inno Setup, whose license allows that. The built app (`dist\AutoShelf\`, the installer and
+the release ZIP) includes the license as `LICENSE.txt`.

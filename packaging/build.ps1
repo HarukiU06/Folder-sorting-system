@@ -21,5 +21,7 @@ if ($LASTEXITCODE -ne 0) { throw "Couldn't make the icon" }
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 $out = Join-Path $root "dist\AutoShelf"
+# The AGPL's text goes with every copy of the app (and so into the installer and the ZIP).
+Copy-Item (Join-Path $root "LICENSE") (Join-Path $out "LICENSE.txt")
 Write-Host "Built $out"
 & (Join-Path $out "autoshelf-cli.exe") --version

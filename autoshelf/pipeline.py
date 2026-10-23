@@ -17,11 +17,11 @@ from pathlib import Path
 
 from autoshelf import wording
 from autoshelf.actions import rules as rule_engine
-from autoshelf.actions.mover import MoveError, free_destination, move_file
+from autoshelf.actions.mover import MoveError, MoveResult, free_destination, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
 from autoshelf.extract import Extraction, extract
-from autoshelf.features.tags import suggest_tags
+from autoshelf.features.tags import TagError, suggest_tags, tag_file
 from autoshelf.fsutil import sha256_file
 from autoshelf.layout import INBOX_DIRNAME, PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import explain
@@ -198,9 +198,9 @@ class Pipeline:
         rule = rule_engine.first_match(
             repository.list_rules(self.conn, enabled_only=True), path, extraction
         )
-        if rule is not None:
+        if rule is not None and rule.rule.target_folder:
             decision = self._rule_decision(zone, rule)
-        else:
+        else:  # no rule, or one that leaves the folder to AutoShelf
             decision = self._decide(zone, classification)
         if decision.target_dir is not None and not self._can_receive(decision.target_dir):
             decision = self._fallback_to_inbox(zone, decision)
@@ -209,6 +209,13 @@ class Pipeline:
             message = f"from {source.name}: {message}"
         details = self._details(path, extraction, classification, rule)
         details["reason"] = decision.why  # what decided, over the classifier's reason
+        # A rule the user wrote is their approval of its new name (SPEC Phase 12).
+        renamed = None
+        if rule is not None:
+            renamed = rule_engine.new_name(rule.rule, path, extraction, decision.suggestion)
+        if renamed is not None:
+            details["renamed_from"] = path.name
+            message += f"; renamed to {renamed!r} by rule {rule.rule.name!r}"
 
         def outcome(kind: OutcomeKind, **extra) -> Outcome:
             return Outcome(
@@ -224,11 +231,16 @@ class Pipeline:
             )
 
         if decision.target_dir is None:
-            if not self.dry_run:
-                self._record_waiting(path, digest, st, extraction, document, decision.suggestion)
-            return outcome(OutcomeKind.WAITING)
+            if self.dry_run:
+                return outcome(OutcomeKind.WAITING)
+            here = path
+            if renamed is not None:
+                here = self._rename_by_rule(path, renamed, rule, digest, details).dst
+            self._record_waiting(here, digest, st, extraction, document, decision.suggestion)
+            self._tag_by_rule(here, rule)
+            return outcome(OutcomeKind.WAITING, dst=here if here != path else None)
         if self.dry_run:
-            dst = self._planned_destination(decision.target_dir, path.name)
+            dst = self._planned_destination(decision.target_dir, renamed or path.name)
             return outcome(OutcomeKind.WOULD_MOVE, dst=dst)
 
         self._ensure_inbox_if_target(decision.target_dir)
@@ -244,7 +256,9 @@ class Pipeline:
             before_rename=self._expect_self_move,
             allowed_source=source,
             notify_library=False,  # its index learns of the file below, without a rescan
+            new_name=renamed,
         )
+        self._tag_by_rule(result.dst, rule)
         repository.set_suggestion(self.conn, result.file_id, decision.suggestion)
         store_content(self.conn, result.file_id, extraction)
         if document is not None:
@@ -329,9 +343,42 @@ class Pipeline:
                     rule_engine.conditions(rule.rule),
                     rule.rule.target_folder,
                     rule.matched,
+                    tags=rule.rule.tags,
+                    rename=rule.rule.rename_template,
                 )
             )
         return details
+
+    def _rename_by_rule(
+        self,
+        path: Path,
+        new_name: str,
+        match: rule_engine.RuleMatch,
+        digest: str,
+        details: dict,
+    ) -> MoveResult:
+        """Rename a file that stays where it is (in _Inbox), as its rule says (undoable)."""
+        return move_file(
+            self.conn,
+            path,
+            path.parent,
+            root=self.root,
+            reason=rule_engine.reason_for(match.rule),
+            action="rename",
+            new_name=new_name,
+            sha256=digest,
+            details={key: details[key] for key in ("rule", "renamed_from") if key in details},
+            before_rename=self._expect_self_move,
+            notify_library=False,
+        )
+
+    def _tag_by_rule(self, path: Path, match: rule_engine.RuleMatch | None) -> None:
+        if match is None or not match.rule.tags:
+            return
+        try:
+            tag_file(self.conn, path, list(match.rule.tags), self.root)
+        except (TagError, OSError) as exc:
+            log.warning("Couldn't tag %s as rule %r says: %s", path, match.rule.name, exc)
 
     def _can_receive(self, target_dir: Path) -> bool:
         """True if files can be moved to ``target_dir`` (``_Inbox`` is created when needed)."""

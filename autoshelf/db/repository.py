@@ -307,26 +307,54 @@ def learning_examples(conn: sqlite3.Connection, model: str) -> list[LearningExam
 
 @dataclass(frozen=True)
 class RuleRecord:
-    """A row of the ``rules`` table. Lower ``priority`` values are checked first."""
+    """A row of the ``rules`` table. Lower ``priority`` values are checked first.
+
+    ``conditions`` are dicts like ``{"kind": "name", "pattern": "invoice"}`` (see
+    ``actions.rules``); all must hold, or any one with ``match_any``. The actions:
+    move to ``target_folder`` ("" to let AutoShelf decide), add ``tags``, rename from
+    ``rename_template`` ("" for none).
+    """
 
     id: int
     name: str
     priority: int
     enabled: bool
-    kind: str
-    pattern: str
+    conditions: tuple[dict, ...]
     target_folder: str
+    match_any: bool = False
+    tags: tuple[str, ...] = ()
+    rename_template: str = ""
 
 
 def _rule_from_row(row: sqlite3.Row) -> RuleRecord:
+    conditions = tuple(json.loads(row["conditions_json"])) or (
+        {"kind": row["kind"], "pattern": row["pattern"]},
+    )
     return RuleRecord(
         id=row["id"],
         name=row["name"],
         priority=row["priority"],
         enabled=bool(row["enabled"]),
-        kind=row["kind"],
-        pattern=row["pattern"],
+        conditions=conditions,
         target_folder=row["target_folder"],
+        match_any=bool(row["match_any"]),
+        tags=tuple(json.loads(row["tags_json"])),
+        rename_template=row["rename_template"],
+    )
+
+
+def _rule_columns(
+    conditions: list[dict], match_any: bool, tags: list[str], template: str
+) -> tuple[str, str, str, int, str, str]:
+    """(kind, pattern, conditions_json, match_any, tags_json, rename_template) to store."""
+    first = conditions[0] if conditions else {"kind": "", "pattern": ""}
+    return (
+        str(first.get("kind", "")),
+        str(first.get("pattern", "")),
+        json.dumps(conditions),
+        int(match_any),
+        json.dumps(tags),
+        template,
     )
 
 
@@ -347,36 +375,43 @@ def insert_rule(
     conn: sqlite3.Connection,
     *,
     name: str,
-    kind: str,
-    pattern: str,
-    target_folder: str,
+    target_folder: str = "",
+    conditions: list[dict] | None = None,
+    kind: str | None = None,
+    pattern: str | None = None,
+    match_any: bool = False,
+    tags: list[str] | tuple[str, ...] = (),
+    rename_template: str = "",
     enabled: bool = True,
 ) -> int:
-    """Add a rule after all existing ones and return its id."""
+    """Add a rule after all existing ones and return its id.
+
+    Give ``conditions``, or (for a rule with one condition) ``kind`` and ``pattern``.
+    """
+    if conditions is None:
+        conditions = [{"kind": kind, "pattern": pattern}]
+    columns = _rule_columns(list(conditions), match_any, list(tags), rename_template)
     with transaction(conn):
         last = conn.execute("SELECT MAX(priority) FROM rules").fetchone()[0]
         cursor = conn.execute(
-            "INSERT INTO rules (name, priority, enabled, kind, pattern, target_folder)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (name, (last or 0) + 1, int(enabled), kind, pattern, target_folder),
+            "INSERT INTO rules (name, priority, enabled, target_folder, kind, pattern,"
+            " conditions_json, match_any, tags_json, rename_template)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, (last or 0) + 1, int(enabled), target_folder, *columns),
         )
     return cursor.lastrowid
 
 
 def update_rule(conn: sqlite3.Connection, rule: RuleRecord) -> None:
     """Store every field of ``rule`` (matched by id)."""
+    columns = _rule_columns(
+        list(rule.conditions), rule.match_any, list(rule.tags), rule.rename_template
+    )
     conn.execute(
-        "UPDATE rules SET name = ?, priority = ?, enabled = ?, kind = ?, pattern = ?,"
-        " target_folder = ? WHERE id = ?",
-        (
-            rule.name,
-            rule.priority,
-            int(rule.enabled),
-            rule.kind,
-            rule.pattern,
-            rule.target_folder,
-            rule.id,
-        ),
+        "UPDATE rules SET name = ?, priority = ?, enabled = ?, target_folder = ?, kind = ?,"
+        " pattern = ?, conditions_json = ?, match_any = ?, tags_json = ?, rename_template = ?"
+        " WHERE id = ?",
+        (rule.name, rule.priority, int(rule.enabled), rule.target_folder, *columns, rule.id),
     )
 
 

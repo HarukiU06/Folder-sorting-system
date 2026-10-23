@@ -466,15 +466,23 @@ def test_rules_view_adds_toggles_tests_and_deletes(
     assert "No rules yet" in view.status.text()
 
     monkeypatch.setattr(RuleDialog, "exec", lambda self: RuleDialog.DialogCode.Accepted)
-    monkeypatch.setattr(
-        RuleDialog, "values", lambda self: ("Invoices", "name", "invoice", "Finance", True)
-    )
+    values = {
+        "name": "Invoices",
+        "conditions": [{"kind": "name", "pattern": "invoice"}],
+        "match_any": False,
+        "target": "Finance",
+        "tags": ["Taxes"],
+        "rename_template": "",
+        "enabled": True,
+    }
+    monkeypatch.setattr(RuleDialog, "values", lambda self: dict(values))
     with qtbot.waitSignal(view.changed, timeout=WAIT_MS):
         view.add_rule()
         settle(qtbot, runner)
     settle(qtbot, runner)
     assert view.table.rowCount() == 1
     assert view.table.item(0, 2).text() == "file name matches /invoice/"
+    assert view.table.item(0, 3).text() == "move to Finance; tag Taxes"
 
     view.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     settle(qtbot, runner)
@@ -499,17 +507,65 @@ def test_rules_view_adds_toggles_tests_and_deletes(
     assert service.rules() == []
 
 
-def test_rule_dialog_offers_folders_and_kinds(qtbot) -> None:
-    from autoshelf.ui.rules_view import RuleDialog
+def test_rule_dialog_takes_several_conditions_and_actions(qtbot) -> None:
+    from autoshelf.ui.rules_view import DONT_MOVE, RuleDialog
 
     dialog = RuleDialog(["Finance", "Recipes"])
     qtbot.addWidget(dialog)
-    dialog.name.setText("Notebooks")
-    dialog.kind.setCurrentIndex(dialog.kind.findData("extension"))
-    dialog.pattern.setText(".ipynb")
-    dialog.target.setCurrentText("Recipes")
-    assert dialog.values() == ("Notebooks", "extension", ".ipynb", "Recipes", True)
-    assert "extensions" in dialog.hint.text()
+    dialog.name.setText("Big scans")
+    first = dialog.rows[0]
+    first.kind.setCurrentIndex(first.kind.findData("extension"))
+    first.first.setText(".pdf")
+    assert first.second.isHidden()
+    second = dialog.add_condition(None)
+    second.kind.setCurrentIndex(second.kind.findData("size"))
+    assert not second.second.isHidden()
+    second.first.setText("1MB")
+    third = dialog.add_condition({"kind": "date", "from": "2025-01-01", "to": None})
+    dialog._remove_condition(third)
+    dialog.match.setCurrentIndex(1)
+    assert dialog.target.itemText(0) == DONT_MOVE
+    dialog.tags.setText("Scans, 2025 ")
+    dialog.rename.setText("{date} {title}")
+
+    assert dialog.values() == {
+        "name": "Big scans",
+        "conditions": [
+            {"kind": "extension", "pattern": ".pdf"},
+            {"kind": "size", "min": "1MB", "max": None},
+        ],
+        "match_any": True,
+        "target": "",
+        "tags": ["Scans", "2025"],
+        "rename_template": "{date} {title}",
+        "enabled": True,
+    }
+
+
+def test_rule_dialog_shows_a_saved_rule(qtbot) -> None:
+    from autoshelf.db.repository import RuleRecord
+    from autoshelf.ui.rules_view import RuleDialog
+
+    rule = RuleRecord(
+        1,
+        "Old big files",
+        1,
+        True,
+        (
+            {"kind": "size", "min": 1536, "max": None},
+            {"kind": "date", "from": None, "to": "2020-12-31"},
+        ),
+        "Recipes",
+        tags=("Old",),
+        rename_template="{year} {name}",
+    )
+    dialog = RuleDialog(["Finance", "Recipes"], rule)
+    qtbot.addWidget(dialog)
+    assert dialog.rows[0].first.text() == "1.5KB"
+    assert dialog.rows[1].second.text() == "2020-12-31"
+    assert dialog.target.currentText() == "Recipes"
+    values = dialog.values()
+    assert (values["tags"], values["rename_template"]) == (["Old"], "{year} {name}")
 
 
 # --- Phase 6: Library, Tidy up, Dashboard, watched folders -----------------------------------
@@ -1006,3 +1062,44 @@ def test_history_offers_undo_for_a_file_autoshelf_made(
     settle(qtbot, runner)
     assert (shelf / "_Trash" / "report.zip").exists()
     assert source.exists()
+
+
+# --- Phase 12: rules suggested after an Inbox answer -----------------------------------------
+
+
+def test_an_inbox_answer_can_become_a_rule(
+    qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.db import repository
+    from autoshelf.db.connection import open_database
+
+    conn = open_database(service.paths.db_path)
+    try:
+        for number in range(2):
+            path = make(shelf / "Finance" / f"receipt {number}.txt", "x")
+            st = path.stat()
+            file_id = repository.upsert_file(
+                conn, path, sha256=None, size=st.st_size, mtime=st.st_mtime
+            )
+            repository.record_correction(
+                conn, file_id=file_id, from_folder=None, to_folder="Finance", source="inbox"
+            )
+    finally:
+        conn.close()
+    make(shelf / "_Inbox" / "receipt 3.txt", "anything at all")
+    asked: list[str] = []
+
+    def yes(parent, title, text, *rest):
+        asked.append(text)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", yes)
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    view.move_to("Finance")
+    for _ in range(4):
+        settle(qtbot, runner)
+    assert asked and "into Finance. Make this a rule?" in asked[0]
+    assert [rule.target_folder for rule in service.rules()] == ["Finance"]

@@ -7,7 +7,7 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** phases 0–11 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–12 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
 > your corrections, follows your rules, explains every decision, and helps you search and
@@ -172,6 +172,8 @@ Rules, learning and explanations:
 .venv\Scripts\python.exe -m autoshelf rules add Invoices --name-matches "invoice|receipt" --to Finance
 .venv\Scripts\python.exe -m autoshelf rules add Notebooks --extension .ipynb --to "Machine Learning"
 .venv\Scripts\python.exe -m autoshelf rules add Syllabus --text-contains Syllabus --to University
+.venv\Scripts\python.exe -m autoshelf rules add "Old scans" --extension pdf --size-min 1MB --date-to 2020-12-31 --tag Old --rename "{year} {name}"
+.venv\Scripts\python.exe -m autoshelf rules suggest                # rules your choices point to
 .venv\Scripts\python.exe -m autoshelf rules                      # list (also: remove/enable/disable/up/down ID)
 .venv\Scripts\python.exe -m autoshelf rules test "C:\path\to\a file.pdf"
 
@@ -276,12 +278,28 @@ iCloud online-only are left out of the test (they aren't read).
 
 ## Rules
 
-Rules override the AI. Each one says "when the file name matches / the extension is / the
-text contains …, move it to this folder". They are checked from top to bottom before
-AutoShelf reads a file's meaning, and the first one that matches decides. A rule-based move
-is logged as "Rule: *name*" and can be undone like any other. Rules never create folders: if
-a rule's folder is gone, the file waits in the Inbox. Edit them on the Rules tab (where you
-can also test them on any file) or with `autoshelf rules`.
+Rules override the AI. Each one has one or more conditions, which must all hold (or any
+one of them): the file name matches a pattern, the extension is …, the text contains …, the
+size is between …, or the file's date is between …. When they hold, the rule does one or more
+things:
+
+- **move** the file to a folder (logged as "Rule: *name*");
+- **tag** it;
+- **rename** it from a template such as `{date} {title}` (fields: `{name}` `{title}` `{date}`
+  `{year}` `{month}` `{day}` `{folder}`; the extension is kept). A rule you wrote counts as
+  your approval: the new name is given without asking, logged in History and can be undone.
+
+A rule that doesn't move lets AutoShelf decide the folder; its tags and new name still apply
+(a file that stays waiting in the Inbox is renamed there). Rules are checked from top to
+bottom before AutoShelf reads a file's meaning, and the first one that applies decides. Rules
+never create folders: if a rule's folder is gone, the file waits in the Inbox. Edit them on
+the Rules tab (where you can also test them on any file) or with `autoshelf rules`.
+
+**Suggested rules:** when several files you put in a folder share a word in their names or
+an extension (at least 3, and most such files you placed went there), AutoShelf suggests a
+rule, if the files already in your folders agree. The Rules tab lists suggestions ("Make this
+a rule" or "Don't suggest it"), the Inbox offers one right after you answer, and
+`autoshelf rules suggest` lists them (`--add N`, `--dismiss N`).
 
 ## Learning from your corrections
 

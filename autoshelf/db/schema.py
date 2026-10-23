@@ -204,3 +204,15 @@ CREATE INDEX history_state ON history (state);
 CREATE INDEX history_batch ON history (batch_id);
 CREATE INDEX history_file ON history (file_id);
 """
+
+V7 = """
+-- Rules with several conditions (all of them, or any one with match_any) and several
+-- actions (Phase 12): move (target_folder; '' to let AutoShelf decide), add tags, and
+-- rename from a template such as '{date} {title}'. kind and pattern keep the first
+-- condition. Existing rules become rules with one condition.
+ALTER TABLE rules ADD COLUMN conditions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE rules ADD COLUMN match_any INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rules ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE rules ADD COLUMN rename_template TEXT NOT NULL DEFAULT '';
+UPDATE rules SET conditions_json = json_array(json_object('kind', kind, 'pattern', pattern));
+"""

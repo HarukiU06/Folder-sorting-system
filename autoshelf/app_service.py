@@ -41,6 +41,7 @@ from autoshelf.features import study as study_features
 from autoshelf.features import summaries as summary_features
 from autoshelf.features import tags as tag_features
 from autoshelf.features.related import Related, related_files
+from autoshelf.features.rule_suggestions import RuleSuggestion, suggest_rules
 from autoshelf.features.search import SearchHit, SearchIndex, folder_label
 from autoshelf.features.stats import LibraryStats, library_stats
 from autoshelf.instance import LOCK_FILENAME, WatchLock
@@ -135,8 +136,9 @@ class RuleTest:
 
     path: Path
     rule: repository.RuleRecord | None  # None: no rule matches; the content decides
-    target: str | None  # the folder it would go to
+    target: str | None  # the folder it would go to (None: AutoShelf decides)
     matched: tuple[dict, ...] = ()  # what the rule's conditions found
+    new_name: str | None = None  # the name the rule would give it
 
 
 class AppService:
@@ -905,37 +907,104 @@ class AppService:
         with self._connect() as conn:
             return repository.list_rules(conn)
 
-    def _checked_rule(self, name: str, kind: str, pattern: str, target: str) -> str:
-        """Validate a rule and return the key of its (existing) folder."""
-        rule_engine.check_rule(name, kind, pattern)
-        root = self._require_root()
-        return resolve_folder(root, target, self.settings().ignore_patterns)
+    def _checked_rule(
+        self,
+        name: str,
+        conditions: list[dict],
+        target: str,
+        tags: list[str] | tuple[str, ...],
+        rename_template: str,
+    ) -> tuple[list[dict], str, list[str]]:
+        """Validate a rule: (its conditions, its existing folder's key or "", its tags).
+
+        Raises RuleError, AssignError (no such folder) or TagError.
+        """
+        cleaned = rule_engine.check_rule(
+            name, conditions, target=target, tags=tags, rename_template=rename_template
+        )
+        key = ""
+        if target.strip():
+            key = resolve_folder(self._require_root(), target, self.settings().ignore_patterns)
+        names = list(dict.fromkeys(tag_features.clean_tag(tag) for tag in tags if tag.strip()))
+        return cleaned, key, names
 
     def add_rule(
-        self, name: str, kind: str, pattern: str, target: str, *, enabled: bool = True
+        self,
+        name: str,
+        kind: str = "",
+        pattern: str = "",
+        target: str = "",
+        *,
+        conditions: list[dict] | None = None,
+        match_any: bool = False,
+        tags: list[str] | tuple[str, ...] = (),
+        rename_template: str = "",
+        enabled: bool = True,
     ) -> repository.RuleRecord:
-        """Add a rule after the existing ones. Raises RuleError or AssignError if invalid."""
-        key = self._checked_rule(name, kind, pattern, target)
+        """Add a rule after the existing ones: ``conditions`` (or, for one condition,
+        ``kind`` and ``pattern``) and what to do: move to ``target``, add ``tags``, rename
+        from ``rename_template``. Raises RuleError, AssignError or TagError if invalid."""
+        if conditions is None:
+            conditions = [{"kind": kind, "pattern": pattern}]
+        cleaned, key, names = self._checked_rule(name, conditions, target, tags, rename_template)
         with self._connect() as conn:
             rule_id = repository.insert_rule(
                 conn,
                 name=name.strip(),
-                kind=kind,
-                pattern=pattern.strip(),
+                conditions=cleaned,
                 target_folder=key,
+                match_any=match_any,
+                tags=names,
+                rename_template=rename_template.strip(),
                 enabled=enabled,
             )
             return repository.get_rule(conn, rule_id)
 
     def update_rule(self, rule: repository.RuleRecord) -> repository.RuleRecord:
         """Save changes to a rule (validated like a new one)."""
-        key = self._checked_rule(rule.name, rule.kind, rule.pattern, rule.target_folder)
+        cleaned, key, names = self._checked_rule(
+            rule.name, list(rule.conditions), rule.target_folder, rule.tags, rule.rename_template
+        )
         updated = replace(
-            rule, name=rule.name.strip(), pattern=rule.pattern.strip(), target_folder=key
+            rule,
+            name=rule.name.strip(),
+            conditions=tuple(cleaned),
+            target_folder=key,
+            tags=tuple(names),
+            rename_template=rule.rename_template.strip(),
         )
         with self._connect() as conn:
             repository.update_rule(conn, updated)
         return updated
+
+    def rule_suggestions(self) -> list[RuleSuggestion]:
+        """Rules your choices point to (e.g. files named "invoice" always go to Finance)."""
+        root = self._require_root()
+        settings = self.settings()
+        with self._connect() as conn:
+            return suggest_rules(
+                conn, root, settings.ignore_patterns, settings.dismissed_rule_suggestions
+            )
+
+    def rule_suggestion_for(self, folder: str) -> RuleSuggestion | None:
+        """A suggested rule that sends files to ``folder``, if any (after an Inbox answer)."""
+        wanted = folder.casefold()
+        return next(
+            (item for item in self.rule_suggestions() if item.target.casefold() == wanted), None
+        )
+
+    def add_suggested_rule(self, suggestion: RuleSuggestion) -> repository.RuleRecord:
+        """Turn a suggestion into a rule (checked after the existing ones)."""
+        return self.add_rule(
+            suggestion.name, conditions=[suggestion.condition], target=suggestion.target
+        )
+
+    def dismiss_rule_suggestion(self, key: str) -> None:
+        """Don't suggest this rule again."""
+        settings = self.settings()
+        if key not in settings.dismissed_rule_suggestions:
+            settings.dismissed_rule_suggestions = [*settings.dismissed_rule_suggestions, key]
+            self.save_settings(settings)
 
     def set_rule_enabled(self, rule_id: int, enabled: bool) -> None:
         """Switch a rule on or off."""
@@ -970,7 +1039,9 @@ class AppService:
         match = rule_engine.first_match(rules, path, extraction)
         if match is None:
             return RuleTest(path, None, None)
-        return RuleTest(path, match.rule, match.rule.target_folder, match.matched)
+        target = match.rule.target_folder or None
+        new_name = rule_engine.new_name(match.rule, path, extraction, target)
+        return RuleTest(path, match.rule, target, match.matched, new_name)
 
 
 def _is_waiting(conn: sqlite3.Connection, path: Path) -> bool:

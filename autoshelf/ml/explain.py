@@ -172,16 +172,27 @@ def _focus(classification: Classification, folder: str | None) -> FolderScore | 
 
 
 def rule_details(
-    name: str, conditions: Sequence[Mapping], target: str, matched: Sequence[Mapping]
+    name: str,
+    conditions: Sequence[Mapping],
+    target: str,
+    matched: Sequence[Mapping],
+    *,
+    tags: Sequence[str] = (),
+    rename: str = "",
 ) -> dict:
-    """What is stored when a rule decided: the rule as it was, and what it found."""
+    """What is stored when a rule applied: the rule as it was, and what it found."""
+    rule = {
+        "name": name,
+        "conditions": [dict(item) for item in conditions],
+        "target": target,
+        "matched": [dict(item) for item in matched],
+    }
+    if tags:
+        rule["tags"] = list(tags)
+    if rename:
+        rule["rename"] = rename
     return {
-        "rule": {
-            "name": name,
-            "conditions": [dict(item) for item in conditions],
-            "target": target,
-            "matched": [dict(item) for item in matched],
-        },
+        "rule": rule,
         "reason": reason(RULE, rule=name, matched=[dict(item) for item in matched]),
     }
 

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -184,13 +185,29 @@ def build_parser() -> argparse.ArgumentParser:
     rule_commands = rules.add_subparsers(dest="rules_command", metavar="<action>")
     add = with_root(rule_commands.add_parser("add", help="add a rule (checked after the others)"))
     add.add_argument("name", help='a name for the rule, e.g. "Invoices"')
-    condition = add.add_mutually_exclusive_group(required=True)
-    condition.add_argument(
+    when = add.add_argument_group("conditions (all must hold, or any one with --any)")
+    when.add_argument(
         "--name-matches", metavar="REGEX", help='file name matches, e.g. "invoice|receipt"'
     )
-    condition.add_argument("--extension", metavar="EXT", help='extension(s), e.g. ".ipynb"')
-    condition.add_argument("--text-contains", metavar="TEXT", help='e.g. "Syllabus"')
-    add.add_argument("--to", required=True, metavar="FOLDER", help="an existing folder")
+    when.add_argument("--extension", metavar="EXT", help='extension(s), e.g. ".ipynb"')
+    when.add_argument("--text-contains", metavar="TEXT", help='e.g. "Syllabus"')
+    when.add_argument("--size-min", metavar="SIZE", help="at least this big, e.g. 1MB")
+    when.add_argument("--size-max", metavar="SIZE", help="at most this big, e.g. 500KB")
+    when.add_argument("--date-from", metavar="DATE", help="changed on or after, e.g. 2025-01-01")
+    when.add_argument("--date-to", metavar="DATE", help="changed on or before")
+    when.add_argument("--any", action="store_true", help="any one condition is enough")
+    then = add.add_argument_group("what to do (one or more)")
+    then.add_argument("--to", metavar="FOLDER", help="move it to this existing folder")
+    then.add_argument("--tag", action="append", default=[], metavar="TAG", help="add a tag")
+    then.add_argument(
+        "--rename",
+        metavar="TEMPLATE",
+        help='rename it, e.g. "{date} {title}" (fields: {name} {title} {date} {year} '
+        "{month} {day} {folder})",
+    )
+    suggest = with_root(rule_commands.add_parser("suggest", help="rules your choices point to"))
+    suggest.add_argument("--add", type=int, metavar="N", help="make suggestion N a rule")
+    suggest.add_argument("--dismiss", type=int, metavar="N", help="don't suggest N again")
     for action, text in (
         ("remove", "delete a rule"),
         ("enable", "switch a rule on"),
@@ -779,18 +796,21 @@ def _cmd_rules(args: argparse.Namespace, paths: AppPaths) -> int:
     action = args.rules_command
     if action == "test":
         return _rules_test(args, paths)
+    if action == "suggest":
+        return _rules_suggest(args, paths)
+    if action == "add":
+        service = _service(args, paths)
+        rule = service.add_rule(
+            args.name,
+            conditions=_rule_conditions(args),
+            match_any=args.any,
+            target=args.to or "",
+            tags=args.tag,
+            rename_template=args.rename or "",
+        )
+        print(f"Added rule #{rule.id}.")
     with contextlib.closing(open_database(paths.db_path)) as conn:
-        if action == "add":
-            settings = _settings(paths)
-            root = _root(args, settings, paths)
-            kind, pattern = _rule_condition(args)
-            rule_engine.check_rule(args.name, kind, pattern)
-            key = resolve_folder(root, args.to, settings.ignore_patterns)
-            rule_id = repository.insert_rule(
-                conn, name=args.name.strip(), kind=kind, pattern=pattern.strip(), target_folder=key
-            )
-            print(f"Added rule #{rule_id}.")
-        elif action is not None:
+        if action not in (None, "add"):
             rule = repository.get_rule(conn, args.id)
             if rule is None:
                 print(f"error: there is no rule #{args.id}", file=sys.stderr)
@@ -800,13 +820,51 @@ def _cmd_rules(args: argparse.Namespace, paths: AppPaths) -> int:
     return 0
 
 
-def _rule_condition(args: argparse.Namespace) -> tuple[str, str]:
-    """(kind, pattern) from whichever of the condition options was given."""
-    if args.name_matches is not None:
-        return "name", args.name_matches
-    if args.extension is not None:
-        return "extension", args.extension
-    return "text", args.text_contains
+def _rule_conditions(args: argparse.Namespace) -> list[dict]:
+    """The conditions given as options (RuleError if there are none)."""
+    found = []
+    for kind, value in (
+        ("name", args.name_matches),
+        ("extension", args.extension),
+        ("text", args.text_contains),
+    ):
+        if value is not None:
+            found.append({"kind": kind, "pattern": value})
+    if args.size_min is not None or args.size_max is not None:
+        found.append({"kind": "size", "min": args.size_min, "max": args.size_max})
+    if args.date_from is not None or args.date_to is not None:
+        found.append({"kind": "date", "from": args.date_from, "to": args.date_to})
+    if not found:
+        raise rule_engine.RuleError(
+            "Give at least one condition, e.g. --name-matches, --extension or --text-contains"
+        )
+    return found
+
+
+def _rules_suggest(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    suggestions = service.rule_suggestions()
+    chosen = args.add or args.dismiss
+    if chosen is not None:
+        if not 1 <= chosen <= len(suggestions):
+            print(f"error: choose a suggestion from 1 to {len(suggestions)}", file=sys.stderr)
+            return 1
+        item = suggestions[chosen - 1]
+        if args.add:
+            rule = service.add_suggested_rule(item)
+            print(f"Added rule #{rule.id} {rule.name!r}.")
+        else:
+            service.dismiss_rule_suggestion(item.key)
+            print("It won't be suggested again.")
+        return 0
+    if not suggestions:
+        print("No rule to suggest yet: your choices share no simple pattern.")
+        return 0
+    for number, item in enumerate(suggestions, start=1):
+        print(f"{number}. {wording.rule_suggestion(item)}")
+        print(f"   files: {', '.join(item.files[:5])}" + (" ..." if len(item.files) > 5 else ""))
+    print("Make one a rule with: autoshelf rules suggest --add N (or --dismiss N)")
+    return 0
 
 
 def _change_rule(conn: sqlite3.Connection, rule: repository.RuleRecord, action: str) -> None:
@@ -814,18 +872,7 @@ def _change_rule(conn: sqlite3.Connection, rule: repository.RuleRecord, action: 
         repository.delete_rule(conn, rule.id)
         print(f"Removed rule #{rule.id} {rule.name!r}.")
     elif action in ("enable", "disable"):
-        repository.update_rule(
-            conn,
-            repository.RuleRecord(
-                rule.id,
-                rule.name,
-                rule.priority,
-                action == "enable",
-                rule.kind,
-                rule.pattern,
-                rule.target_folder,
-            ),
-        )
+        repository.update_rule(conn, replace(rule, enabled=action == "enable"))
     else:
         ids = [item.id for item in repository.list_rules(conn)]
         index = ids.index(rule.id)
@@ -844,26 +891,15 @@ def _print_rules(rules: list[repository.RuleRecord]) -> None:
     print("Rules, checked in this order (the first match wins):")
     for number, rule in enumerate(rules, start=1):
         state = "" if rule.enabled else "  (off)"
-        condition = " and ".join(wording.condition(item) for item in rule_engine.conditions(rule))
-        print(f"  {number}. #{rule.id} {rule.name}: {condition} -> {rule.target_folder}{state}")
+        does = wording.rule_actions(rule.target_folder, rule.tags, rule.rename_template)
+        print(f"  {number}. #{rule.id} {rule.name}: {wording.conditions(rule)} -> {does}{state}")
 
 
 def _rules_test(args: argparse.Namespace, paths: AppPaths) -> int:
-    from autoshelf.extract import extract
-
     if not args.file.is_file():
         print(f"error: not a file: {args.file}", file=sys.stderr)
         return 1
-    with contextlib.closing(open_database(paths.db_path)) as conn:
-        rules = repository.list_rules(conn, enabled_only=True)
-    match = rule_engine.first_match(rules, args.file, extract(args.file))
-    if match is None:
-        print("No rule matches; AutoShelf would decide by the file's content.")
-    else:
-        print(
-            f"Rule {match.rule.name!r} matches ({wording.rule_matches(match.matched)}): "
-            f"it would go to {match.rule.target_folder}"
-        )
+    print(wording.rule_test(AppService(paths).test_rules(args.file)))
     return 0
 
 

@@ -87,14 +87,56 @@ def created(reason: Mapping) -> str:
 # --- rules -----------------------------------------------------------------------------------
 
 
+def size_text(size: int) -> str:
+    """1536 -> "1.5 KB"."""
+    value = float(size)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{int(value):,} bytes" if unit == "bytes" else f"{value:.1f} {unit}"
+        value /= 1024
+    return str(size)
+
+
 def condition(item: Mapping) -> str:
     """A rule's condition in words, e.g. 'file name matches /invoice|receipt/'."""
-    kind, pattern = item.get("kind"), str(item.get("pattern", ""))
+    kind = item.get("kind")
+    label = RULE_KINDS.get(kind, str(kind))
+    if kind == "size":
+        low, high = item.get("min"), item.get("max")
+        if low is not None and high is not None:
+            return f"{label} {size_text(low)} to {size_text(high)}"
+        return (
+            f"{label} at least {size_text(low)}"
+            if low is not None
+            else (f"{label} at most {size_text(high)}")
+        )
+    if kind == "date":
+        start, end = item.get("from"), item.get("to")
+        if start and end:
+            return f"{label} {start} to {end}"
+        return f"{label} {start} or later" if start else f"{label} {end} or earlier"
+    pattern = str(item.get("pattern", ""))
     if kind == "name":
-        return f"{RULE_KINDS[kind]} /{pattern}/"
+        return f"{label} /{pattern}/"
     if kind == "extension":
-        return f"{RULE_KINDS[kind]} {', '.join(sorted(extensions(pattern)))}"
-    return f'{RULE_KINDS.get(kind, kind)} "{pattern}"'
+        return f"{label} {', '.join(sorted(extensions(pattern)))}"
+    return f'{label} "{pattern}"'
+
+
+def conditions(rule) -> str:
+    """All of a rule's conditions in one phrase (a ``RuleRecord``)."""
+    joiner = " or " if rule.match_any else " and "
+    return joiner.join(condition(item) for item in rule.conditions)
+
+
+def rule_actions(target: str, tags: Sequence[str] = (), rename: str = "") -> str:
+    """What a rule does: "move to Finance; tag Taxes; rename to {date} {title}"."""
+    parts = [f"move to {target}" if target else "AutoShelf decides the folder"]
+    if tags:
+        parts.append("tag " + ", ".join(tags))
+    if rename:
+        parts.append(f"rename to {rename}")
+    return "; ".join(parts)
 
 
 def rule_match(found: Mapping) -> str:
@@ -106,6 +148,10 @@ def rule_match(found: Mapping) -> str:
         return f"the extension is {found['found']}"
     if kind == "text":
         return f"the text contains {found['found']!r}"
+    if kind == "size":
+        return f"its size is {size_text(int(found['found']))}"
+    if kind == "date":
+        return f"it is dated {found['found']}"
     return str(found.get("found", ""))
 
 
@@ -118,10 +164,26 @@ def rule_test(test) -> str:
     """The answer to "which rule would handle this file?" (an ``AppService.RuleTest``)."""
     if test.rule is None:
         return "No rule matches this file; AutoShelf would decide by its content."
-    return (
-        f"Rule {test.rule.name!r} matches ({rule_matches(test.matched)}): it would go to "
-        f"{test.target}"
+    does = []
+    if test.target:
+        does.append(f"it would go to {test.target}")
+    else:
+        does.append("AutoShelf would decide its folder")
+    if test.rule.tags:
+        does.append("be tagged " + ", ".join(test.rule.tags))
+    if test.new_name:
+        does.append(f"be renamed to {test.new_name!r}")
+    return f"Rule {test.rule.name!r} matches ({rule_matches(test.matched)}): " + ", ".join(does)
+
+
+def rule_suggestion(item) -> str:
+    """A suggested rule in words (a ``features.rule_suggestions.RuleSuggestion``)."""
+    what = (
+        f"with {item.condition['pattern']!r} in their names"
+        if item.condition["kind"] == "name"
+        else f"ending in {item.condition['pattern']}"
     )
+    return f"You put {len(item.files)} files {what} into {item.target}. Make this a rule?"
 
 
 # --- the "Why?" of a history row ---------------------------------------------------------------
@@ -134,7 +196,8 @@ def decision_lines(details: Mapping, root: Path | None = None) -> list[str]:
     if rule:
         if "conditions" in rule:
             when = " and ".join(condition(item) for item in rule["conditions"])
-            lines.append(f"Rule {rule['name']!r}: {when} -> {rule['target']}")
+            does = rule_actions(rule["target"], rule.get("tags") or (), rule.get("rename", ""))
+            lines.append(f"Rule {rule['name']!r}: {when} -> {does}")
             if rule.get("matched"):
                 lines.append(f"  matched: {rule_matches(rule['matched'])}")
         else:  # written before rules were stored as data
@@ -177,6 +240,8 @@ def decision_lines(details: Mapping, root: Path | None = None) -> list[str]:
             f"Learned {adjustment['amount']:+.2f} for {adjustment['folder']}: you moved "
             f"similar files away from it ({examples})"
         )
+    if details.get("renamed_from"):
+        lines.append(f"Renamed by its rule; it was called {details['renamed_from']!r}")
     if details.get("corrects"):
         lines.append(f"You moved it here, correcting #{details['corrects']}")
     return lines

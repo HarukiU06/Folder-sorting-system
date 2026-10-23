@@ -165,7 +165,7 @@ def _propose(
             vector = library.vectorize(extraction, path.name)
         classification = library.classify(vector, threshold=threshold, margin=margin, exclude=path)
     details = classification.to_details() if classification else {}
-    if match is not None:
+    if match is not None and match.rule.target_folder:
         rule = match.rule
         suggested, confidence = rule.target_folder, None
         why = reasons.reason(reasons.RULE, rule=rule.name, matched=list(match.matched))

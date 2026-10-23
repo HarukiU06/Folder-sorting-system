@@ -102,7 +102,7 @@ def test_rule_details_read_well() -> None:
     assert details["reason"]["code"] == "rule"
     assert "explanation" not in details  # data, not words
     assert describe(details) == [
-        "Rule 'Invoices': file name matches /invoice/ -> Finance",
+        "Rule 'Invoices': file name matches /invoice/ -> move to Finance",
         "  matched: 'invoice.pdf' contains 'invoice'",
     ]
 

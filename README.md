@@ -7,7 +7,7 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** phases 0–10 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–11 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
 > your corrections, follows your rules, explains every decision, and helps you search and
@@ -306,7 +306,10 @@ Every decision is stored with its explanation: the three best folders and how ea
 made (similarity to the folder's name and description, to the files in it, and anything
 learned), the most similar files already in the chosen folder, the words the file has in
 common with that folder (ranked by TF-IDF; for Japanese, kanji and katakana words), or the
-rule that fired. See it in the History and Inbox "Why?" panels, or with `autoshelf why ID`.
+rule that fired and what it matched. See it in the History and Inbox "Why?" panels, or with
+`autoshelf why ID`. The explanation is stored as data (the reason, folders, scores, rule), and
+the sentence is written when it is shown, so the app and the command line say the same thing;
+entries from older versions, stored as text, are shown as they are.
 
 ## Search, tags and tidying up
 

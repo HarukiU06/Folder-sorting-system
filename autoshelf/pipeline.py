@@ -185,7 +185,11 @@ class Pipeline:
         known = repository.get_file_by_path(self.conn, path)
         if known is not None and known.sha256 == digest:
             if known.status == "ignored":
-                return Outcome(OutcomeKind.SKIPPED, path, "left in place: you undid its last move")
+                return Outcome(
+                    OutcomeKind.SKIPPED,
+                    path,
+                    "left in place: you undid its last move, or AutoShelf made it",
+                )
             if zone is Zone.INBOX and known.status == "inbox":
                 return Outcome(OutcomeKind.SKIPPED, path, "waiting in _Inbox for your decision")
         duplicates = self._duplicates_of(path, digest)

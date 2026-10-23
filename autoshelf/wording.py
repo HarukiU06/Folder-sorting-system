@@ -78,10 +78,10 @@ def created(reason: Mapping) -> str:
     if operation in ("shrink_pdf", "shrink_image"):
         return f"a smaller copy of {what}"
     if operation == "convert":
-        return f"{what} converted to {str(reason.get('to', '')).upper()}"
+        return f"a {str(reason.get('to', '')).upper()} version of {what}"
     if operation == "images_to_pdf":
         return f"a PDF of {what}"
-    return f"made from {what}" if sources else "made by AutoShelf"
+    return f"a new file from {what}" if sources else "a new file"
 
 
 # --- rules -----------------------------------------------------------------------------------
@@ -143,7 +143,9 @@ def decision_lines(details: Mapping, root: Path | None = None) -> list[str]:
                 lines.append(f"  matched: {rule['match']}")
     code = (details.get("reason") or {}).get("code", reasons.RULE)
     why = explanation(details)
-    if why and not (rule and code == reasons.RULE):
+    if code == reasons.CREATED:
+        lines.append(f"AutoShelf made {why}")
+    elif why and not (rule and code == reasons.RULE):
         lines.append(f"Decision: {why}")
     candidates = details.get("candidates") or []
     if candidates:
@@ -205,8 +207,7 @@ def history_reason(entry: HistoryEntry) -> str:
     if entry.action == "undo":
         return f"Undo of #{entry.undo_of}" if entry.undo_of else "Undo"
     if entry.action == "create":
-        made = created(entry.details.get("reason") or {})
-        return f"Created {made}"
+        return f"Made {created(entry.details.get('reason') or {})}"
     if entry.reason == "user" and entry.details.get("corrects"):
         return f"You corrected #{entry.details['corrects']}"
     if entry.reason == "duplicate":

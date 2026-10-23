@@ -972,3 +972,37 @@ def test_a_small_library_is_not_offered_the_test(qtbot, service, no_dialogs: lis
     qtbot.wait(100)
     assert not service.settings().calibration_offered
     assert not any("sort your files" in str(args[1]) for args in no_dialogs if len(args) > 1)
+
+
+# --- Phase 11: files AutoShelf made ---------------------------------------------------------------
+
+
+def test_history_offers_undo_for_a_file_autoshelf_made(
+    qtbot, service, runner, shelf: Path, tmp_path: Path
+) -> None:
+    from autoshelf.actions.create import place_new_file
+    from autoshelf.db.connection import open_database
+    from autoshelf.ui.history_view import can_undo
+
+    source = make(shelf / "Finance" / "report.txt", "report")
+    made = make(tmp_path / "work" / "report.zip", "zip")
+    conn = open_database(service.paths.db_path)
+    try:
+        created = place_new_file(
+            conn, made, source.parent, "report.zip", root=shelf, operation="zip", sources=[source]
+        )
+    finally:
+        conn.close()
+    view = HistoryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    row = [entry.id for entry in view._entries].index(created.history_id)
+    assert view.table.item(row, 4).text() == "Made a ZIP of report.txt"
+    assert can_undo(view._entries[row])
+    view.table.selectRow(row)
+    view.undo_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "_Trash" / "report.zip").exists()
+    assert source.exists()

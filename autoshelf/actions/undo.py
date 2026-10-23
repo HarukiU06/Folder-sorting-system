@@ -1,9 +1,15 @@
-"""Undo moves and renames recorded in history."""
+"""Undo moves, renames and new files recorded in history.
+
+Undoing a move or rename puts the file back. Undoing a file AutoShelf made (a compressed or
+converted copy) moves that file into ``_Trash/``, where the user can delete it: AutoShelf
+never deletes files.
+"""
 
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
+from autoshelf.actions.create import ACTION_CREATE, trash_dir
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.db import repository
 from autoshelf.fsutil import sha256_file
@@ -35,10 +41,12 @@ def undo(
         raise UndoError(f"There is no history entry #{history_id}")
     if entry.action not in repository.UNDOABLE_ACTIONS:
         raise UndoError(
-            f"#{history_id} is a {entry.action!r}; only moves and renames can be undone"
+            f"#{history_id} is a {entry.action!r}; only moves, renames and new files can be undone"
         )
     if entry.state != "done":
         raise UndoError(f"#{history_id} is {entry.state}, so there is nothing to undo")
+    if entry.action == ACTION_CREATE:
+        return _undo_create(conn, entry, force=force, before_rename=before_rename)
 
     current = Path(entry.dst)
     original = Path(entry.src)
@@ -76,6 +84,45 @@ def undo(
     except MoveError as exc:
         raise UndoError(str(exc)) from exc
     repository.set_history_state(conn, history_id, "undone")
+    return result
+
+
+def _undo_create(
+    conn: sqlite3.Connection,
+    entry: repository.HistoryEntry,
+    *,
+    force: bool,
+    before_rename: BeforeRename | None,
+) -> MoveResult:
+    """Set a file AutoShelf made aside in ``_Trash`` (never deleted)."""
+    current = Path(entry.dst)
+    if not current.is_file():
+        raise UndoError(
+            f"{current.name} is no longer in {current.parent}; "
+            "it was moved or deleted outside AutoShelf"
+        )
+    if not force and entry.sha256 and sha256_file(current) != entry.sha256:
+        raise UndoError(
+            f"{current.name} has changed since AutoShelf made it; use --force to undo anyway"
+        )
+    root = Path(entry.root)
+    trash = trash_dir(root)
+    if not trash.is_dir():
+        trash.mkdir()  # AutoShelf's own reserved folder, like _Inbox
+    try:
+        result = move_file(
+            conn,
+            current,
+            trash,
+            root=root,
+            reason="undo",
+            action="undo",
+            undo_of=entry.id,
+            before_rename=before_rename,
+        )
+    except MoveError as exc:
+        raise UndoError(str(exc)) from exc
+    repository.set_history_state(conn, entry.id, "undone")
     return result
 
 

@@ -449,7 +449,7 @@ def get_vector_blob(conn: sqlite3.Connection, file_id: int) -> tuple[str, bytes]
 
 # --- history ----------------------------------------------------------------
 
-UNDOABLE_ACTIONS = ("move", "rename")  # "create" joins once undo can put a file in _Trash
+UNDOABLE_ACTIONS = ("move", "rename", "create")  # undoing a create sets it aside in _Trash
 
 
 @dataclass(frozen=True)

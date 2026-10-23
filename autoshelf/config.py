@@ -216,6 +216,9 @@ class Settings:
     paused: bool = False  # automatic sorting paused (files wait until resumed)
     calibration_offered: bool = False  # "how well would AutoShelf sort?" was offered once
     dismissed_rule_suggestions: list[str] = field(default_factory=list)  # keys not to suggest
+    # A compressed or converted copy that lands in the root or _Inbox is left there (False)
+    # or sorted like any new file (True). Copies in your folders always stay there.
+    sort_created_files: bool = False
     notifications: bool = True  # notify when a file needs a decision
     # Opt-in folders outside the root (e.g. Downloads): new files there with one of
     # ``watched_extensions`` are moved into the root and sorted. None by default.

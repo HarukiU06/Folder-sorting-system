@@ -167,6 +167,14 @@ class SettingsView(QWidget):
         files = QFormLayout(files_box)
         files.addRow("Wait until a file is unchanged for", self.stable)
         files.addRow("Look for missed files every", self.sweep)
+        self.sort_created = QCheckBox(
+            "Sort compressed and converted copies like new files (when they land in the "
+            "root or the Inbox)"
+        )
+        self.sort_created.toggled.connect(
+            lambda checked: self._update(None, False, sort_created_files=checked)
+        )
+        files.addRow("", self.sort_created)
         files.addRow("Ignore files named like", self.patterns)
         apply_row = QHBoxLayout()
         apply_row.addStretch(1)
@@ -360,7 +368,13 @@ class SettingsView(QWidget):
     def show_settings(self, settings: Settings) -> None:
         """Fill in the widgets without triggering any changes."""
         self._settings = settings
-        widgets = (self.slider, self.paused, self.notifications, self.ai_provider)
+        widgets = (
+            self.slider,
+            self.paused,
+            self.notifications,
+            self.ai_provider,
+            self.sort_created,
+        )
         for widget in widgets:
             widget.blockSignals(True)
         self.root.setText(settings.root or "")
@@ -379,6 +393,7 @@ class SettingsView(QWidget):
         self.notifications.setChecked(settings.notifications)
         self.stable.setValue(settings.stable_seconds)
         self.sweep.setValue(settings.sweep_minutes)
+        self.sort_created.setChecked(settings.sort_created_files)
         self.patterns.setPlainText("\n".join(settings.ignore_patterns))
         self.watched.clear()
         self.watched.addItems(settings.watched_folders)

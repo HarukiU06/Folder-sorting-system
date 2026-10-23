@@ -7,12 +7,12 @@ reads each new file's **name and text**, and moves it into the right folder **th
 When it isn't confident, it asks. It learns from your corrections. The full design is in
 [SPEC.md](SPEC.md).
 
-> **Status:** phases 0–12 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
+> **Status:** phases 0–13 of [SPEC.md](SPEC.md) are built: a Windows tray app (and a
 > command-line tool) that reads each new file and either moves it into the right folder, when
 > it is sure, or into `_Inbox/` for you to decide, with full history and undo. It learns from
-> your corrections, follows your rules, explains every decision, and helps you search and
-> tidy your library. Optional AI features (off by default) add summaries, better names,
-> answers from your files and study tools.
+> your corrections, follows your rules, explains every decision, helps you search and tidy
+> your library, and makes smaller copies or copies in other formats. Optional AI features
+> (off by default) add summaries, better names, answers from your files and study tools.
 
 | Inbox | Why did it go there? | Search |
 |---|---|---|
@@ -27,7 +27,10 @@ AutoShelf moves real files, so:
 - it **never deletes** a file and **never overwrites** one: name clashes get ` (2)`, ` (3)`, …;
 - it only works inside the root you choose, and refuses paths that lead outside it;
 - it records every move in its history **before** doing it, so every move can be undone;
-- it never creates category folders (it only creates its own `_Inbox/` when first needed);
+- it never creates category folders (only its own `_Inbox/`, `_Duplicates/` and `_Trash/`,
+  when first needed);
+- compressing or converting a file always makes a **new** file next to it; the original
+  stays as it is, and undoing sets the new file aside in `_Trash/`;
 - it only moves a file on its own when one folder is a clear match; otherwise it asks;
 - it waits until a file has stopped changing for 3 seconds and no program is still writing it;
 - it ignores temporary and partial files (`~$*`, `*.tmp`, `*.crdownload`, `*.part`,
@@ -39,6 +42,7 @@ AutoShelf moves real files, so:
 ```
 AutoShelf/                  <- the root you pass with --root
 ├── _Inbox/                 <- files waiting for your decision
+├── _Trash/                 <- copies AutoShelf made and you undid (delete them yourself)
 ├── Finance/                <- your own folders; files you put here are never moved
 ├── Machine Learning/
 │   └── Unsupervised/
@@ -200,6 +204,10 @@ Searching and tidying up:
 .venv\Scripts\python.exe -m autoshelf stats
 
 .venv\Scripts\python.exe -m autoshelf config --watch "$env:USERPROFILE\Downloads"   # opt in a folder to watch
+
+.venv\Scripts\python.exe -m autoshelf compress "<file>" ["<file>" ...]   # smaller copy, or a ZIP of several
+.venv\Scripts\python.exe -m autoshelf compress "<file>" --zip            # a ZIP even of one PDF or image
+.venv\Scripts\python.exe -m autoshelf convert "<file>" --to pdf          # also: docx, png, jpg, webp, bmp, tiff
 ```
 
 Better names and new folders (no AI needed), and the optional AI:
@@ -352,6 +360,30 @@ entries from older versions, stored as text, are shown as they are.
   your library (files are only ever moved, never copied and deleted), and undo puts a file
   back where it came from.
 
+## Compress and convert
+
+In the Library (or with `autoshelf compress` / `autoshelf convert`), pick a file in your
+library and:
+
+- **Compress:** a PDF gets a smaller copy with its images re-compressed
+  (`report (smaller).pdf`), an image gets a smaller copy in its own format (a HEIC photo
+  becomes a JPG), at most 2560 pixels on the long side, and anything else, or several files,
+  goes into a ZIP. If the copy would not
+  be smaller, AutoShelf says so and makes nothing.
+- **Convert to:** images between PNG, JPG, WEBP, BMP and TIFF (transparency becomes white
+  in a JPG), images to PDF (several images make one PDF, a page each), PDF to Word (`.docx`;
+  the layout is only approximated, so check it), and Word, PowerPoint and Excel files to
+  PDF (this uses Microsoft Office if it is installed, otherwise LibreOffice; without either
+  the option is hidden). HEIC photos are supported only if the optional `pillow-heif`
+  package is installed.
+
+The new file is made in AutoShelf's working folder (`%APPDATA%\AutoShelf\cache\work`) and
+then placed next to the original, with ` (2)` if the name is taken. The original is never
+changed. History lists it ("Made a PDF version of …"), and undo moves the new file into
+`_Trash/` in your root, where you can delete it yourself. A copy made in one of your
+folders stays there; one made in the root or in `_Inbox` is left where it is, unless you
+turn on Settings → "Sort compressed and converted copies like new files".
+
 ## Better names and new folders
 
 - **Better names:** files called `scan_0034.pdf`, `document(3).docx`, `download.pdf` or a
@@ -442,7 +474,9 @@ with `--library` on a copy of a real library before changing them.
 AutoShelf's own code is MIT-licensed (see [LICENSE](LICENSE)). It uses, among others:
 PySide6 / Qt (LGPL-3.0), PyMuPDF (AGPL-3.0), ebooklib (AGPL-3.0), mutagen (GPL-2.0-or-later),
 PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
-openpyxl, Pillow, beautifulsoup4, striprtf and keyring (BSD, MIT, Apache-2.0 or similar).
+openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools and fire (BSD, MIT,
+Apache-2.0 or similar), and opencv-python-headless (Apache-2.0, needed by pdf2docx; it
+includes an FFmpeg library under LGPL-2.1).
 The packaged app in `dist\AutoShelf\` bundles all of them, so sharing that folder means
 following their licenses too, notably the AGPL and GPL ones (for example by pointing to this
 repository's source).

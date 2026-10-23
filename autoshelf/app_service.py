@@ -8,7 +8,9 @@ the language model are slow; the UI must not call them on its own thread.
 import contextlib
 import logging
 import sqlite3
+import tempfile
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,6 +19,7 @@ from autoshelf import llm
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
+from autoshelf.actions.create import Created, place_new_file
 from autoshelf.actions.inbox import InboxItem, assign, inbox_items, resolve_folder
 from autoshelf.actions.mover import BeforeRename, MoveResult
 from autoshelf.config import (
@@ -33,6 +36,7 @@ from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.extract import guard as read_guard
 from autoshelf.features import ask as ask_features
+from autoshelf.features import convert as convert_features
 from autoshelf.features import duplicates as duplicate_features
 from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
@@ -44,6 +48,7 @@ from autoshelf.features.related import Related, related_files
 from autoshelf.features.rule_suggestions import RuleSuggestion, suggest_rules
 from autoshelf.features.search import SearchHit, SearchIndex, folder_label
 from autoshelf.features.stats import LibraryStats, library_stats
+from autoshelf.fsutil import is_within
 from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import calibrate as calibration
@@ -630,6 +635,76 @@ class AppService:
             return undo_actions.undo_batch(
                 conn, batch_id, force=force, before_rename=self._before_rename()
             )
+
+    # --- compress and convert (always new files next to the originals) ------------------------
+
+    def conversions(self, path: Path) -> list[str]:
+        """The formats ``path`` can be converted to here (e.g. ["docx"] for a PDF)."""
+        return convert_features.targets(path)
+
+    def compress(self, paths: list[Path], *, zip_always: bool = False) -> Created:
+        """Make a smaller copy (one PDF or image) or a ZIP (otherwise) next to the first
+        file. The originals stay as they are; undo sets the copy aside in _Trash."""
+        job = convert_features.plan_compress(self._library_files(paths), zip_always=zip_always)
+        (created,) = self._make([job])
+        return created
+
+    def convert(self, paths: list[Path], to: str) -> list[Created]:
+        """Make a copy of each file in format ``to`` next to it (several images to PDF make
+        one PDF). Several new files form one batch in History."""
+        return self._make(convert_features.plan_convert(self._library_files(paths), to))
+
+    def _library_files(self, paths: list[Path]) -> list[Path]:
+        root = self._require_root()
+        files = []
+        for path in paths:
+            resolved = Path(path).resolve()
+            if not resolved.is_file():
+                raise convert_features.ConvertError(f"{Path(path).name} is no longer there")
+            if not is_within(resolved, root):
+                raise convert_features.ConvertError(
+                    f"{resolved.name} is outside your library ({root}); AutoShelf only "
+                    "compresses and converts files inside it"
+                )
+            files.append(resolved)
+        return files
+
+    def _make(self, jobs: list[convert_features.Job]) -> list[Created]:
+        """Make each job's file in AutoShelf's working folder, then put it in place."""
+        root = self._require_root()
+        settings = self.settings()
+        batch = uuid.uuid4().hex if len(jobs) > 1 else None
+        work = self.paths.cache_dir / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        made = []
+        with self._connect() as conn:
+            for job in jobs:
+                with tempfile.TemporaryDirectory(dir=work) as folder:
+                    output = convert_features.run(job, Path(folder))
+                    made.append(
+                        place_new_file(
+                            conn,
+                            output,
+                            job.sources[0].parent,
+                            job.name,
+                            root=root,
+                            operation=job.operation,
+                            sources=list(job.sources),
+                            extra={"to": job.to} if job.to else None,
+                            batch_id=batch,
+                            sort=settings.sort_created_files,
+                            before_create=self._before_create(settings.sort_created_files),
+                        )
+                    )
+        return made
+
+    def _before_create(self, sort: bool):
+        """Unless new files are to be sorted, the watcher ignores the ones AutoShelf makes."""
+        with self._service_lock:
+            service = self._service
+        if service is None or sort:
+            return None
+        return service.self_moves.expect
 
     # --- how well would AutoShelf sort this library? ----------------------------------------
 

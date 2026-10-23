@@ -15,6 +15,7 @@ from pathlib import Path
 from autoshelf import __version__, wording
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
+from autoshelf.actions.create import CreateError
 from autoshelf.actions.inbox import (
     AssignError,
     assign,
@@ -39,6 +40,7 @@ from autoshelf.db import repository
 from autoshelf.db.connection import open_database
 from autoshelf.db.migrations import MigrationError
 from autoshelf.extract import guard as read_guard
+from autoshelf.features.convert import ConvertError
 from autoshelf.features.duplicates import DuplicateError
 from autoshelf.features.new_folders import FolderNameError
 from autoshelf.features.rename import RenameError
@@ -264,6 +266,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="switch to the recommended confidence level"
     )
 
+    compress = with_root(
+        commands.add_parser(
+            "compress", help="make a smaller copy, or a ZIP, next to the files (they stay)"
+        )
+    )
+    compress.add_argument("files", nargs="+", type=Path, help="files in your library")
+    compress.add_argument(
+        "--zip", action="store_true", help="make a ZIP even of a single PDF or image"
+    )
+    convert = with_root(
+        commands.add_parser("convert", help="make a copy in another format (the original stays)")
+    )
+    convert.add_argument("files", nargs="+", type=Path, help="files in your library")
+    convert.add_argument(
+        "--to",
+        required=True,
+        metavar="FORMAT",
+        help="pdf, docx, png, jpg, webp, bmp or tiff (what each file allows)",
+    )
+
     skipped = commands.add_parser(
         "skipped", help="files only sorted by name because AutoShelf stopped while reading them"
     )
@@ -350,6 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stats": _cmd_stats,
             "calibrate": _cmd_calibrate,
             "skipped": _cmd_skipped,
+            "compress": _cmd_compress,
+            "convert": _cmd_convert,
             "summarize": _cmd_summarize,
             "rename-suggestions": _cmd_rename_suggestions,
             "rename": _cmd_rename,
@@ -381,6 +405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         FolderNameError,
         FileExistsError,
         StartupError,
+        ConvertError,
+        CreateError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1086,6 +1112,26 @@ def _cmd_calibrate(args: argparse.Namespace, paths: AppPaths) -> int:
         f"{level.margin:.2f}); restart a running watcher to apply it."
     )
     return 0
+
+
+def _cmd_compress(args: argparse.Namespace, paths: AppPaths) -> int:
+    created = _service(args, paths).compress(args.files, zip_always=args.zip)
+    _print_created([created])
+    return 0
+
+
+def _cmd_convert(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    created = service.convert(args.files, args.to)
+    _print_created(created)
+    if args.to.casefold().lstrip(".") == "docx":
+        print("Note: a PDF's layout is only approximated in Word; check the result.")
+    return 0
+
+
+def _print_created(created) -> None:
+    for item in created:
+        print(f"Made {item.dst} (undo with: autoshelf undo {item.history_id})")
 
 
 def _cmd_skipped(args: argparse.Namespace, paths: AppPaths) -> int:

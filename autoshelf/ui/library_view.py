@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +33,15 @@ from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import plain_label, plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
+CONVERSION_LABELS = {
+    "pdf": "PDF",
+    "docx": "Word document (.docx; the layout is only approximated)",
+    "png": "PNG image",
+    "jpg": "JPG image",
+    "webp": "WEBP image",
+    "bmp": "BMP image",
+    "tiff": "TIFF image",
+}
 COLUMNS = ("File", "Folder", "Match")
 HINT = (
     'Search your files by meaning ("paper explaining k-means initialization") or by exact '
@@ -130,9 +141,24 @@ class LibraryView(QWidget):
         rename = QPushButton("Rename...")
         rename.clicked.connect(self.rename_file)
         buttons = QHBoxLayout()
+        self.compress_button = QPushButton("Compress")
+        self.compress_button.setToolTip(
+            "Make a smaller copy (a PDF or an image) or a ZIP next to the file; "
+            "the file itself stays as it is"
+        )
+        self.compress_button.clicked.connect(self.compress_file)
+        self.convert_button = QToolButton()
+        self.convert_button.setText("Convert to")
+        self.convert_button.setToolTip("Make a copy in another format next to the file")
+        self.convert_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.convert_menu = QMenu(self.convert_button)
+        self.convert_button.setMenu(self.convert_menu)
+        self.convert_button.setEnabled(False)
         buttons.addWidget(open_button)
         buttons.addWidget(show)
         buttons.addWidget(rename)
+        buttons.addWidget(self.compress_button)
+        buttons.addWidget(self.convert_button)
         buttons.addWidget(self.summarize_button)
         buttons.addStretch(1)
 
@@ -234,6 +260,7 @@ class LibraryView(QWidget):
 
     def _show_rows(self, rows: list[tuple[Path, str, str]]) -> None:
         self._paths = [path for path, _, _ in rows]
+        self.results.clearSelection()  # so selecting row 0 below shows the new first file
         self.results.setRowCount(len(rows))
         for row, (path, folder, match) in enumerate(rows):
             for column, text in enumerate((path.name, folder, match)):
@@ -261,14 +288,19 @@ class LibraryView(QWidget):
             self._show_detail(None)
             return
         self.runner.run(
-            lambda: (self.service.file_info(path), self.service.related(path)),
+            lambda: (
+                self.service.file_info(path),
+                self.service.related(path),
+                self.service.conversions(path),
+            ),
             lambda result: self._show_detail(*result),
             lambda exc: self.summary.setText(f"{path.name}: {exc}"),
         )
 
-    def _show_detail(self, info: FileInfo | None, related=()) -> None:
+    def _show_detail(self, info: FileInfo | None, related=(), conversions=()) -> None:
         self._info = info
         self.detail.setEnabled(info is not None)
+        self._fill_conversions(conversions)
         if info is None:
             self.name.setText("Select a file")
             for widget in (self.facts, self.summary_text):
@@ -297,6 +329,42 @@ class LibraryView(QWidget):
             entry.setToolTip(str(item.path))
             self.related.addItem(entry)
         self.preview.setPlainText(info.excerpt or "")
+
+    def _fill_conversions(self, formats) -> None:
+        self.convert_menu.clear()
+        for to in formats:
+            action = self.convert_menu.addAction(CONVERSION_LABELS.get(to, to.upper()))
+            action.triggered.connect(lambda _=False, to=to: self.convert_file(to))
+        self.convert_button.setEnabled(bool(formats))
+
+    def compress_file(self) -> None:
+        """Make a smaller copy or a ZIP of the selected file, next to it (in the background)."""
+        info = self._info
+        if info is not None:
+            self._make(lambda: [self.service.compress([info.path])])
+
+    def convert_file(self, to: str) -> None:
+        """Make a copy of the selected file in format ``to``, next to it."""
+        info = self._info
+        if info is not None:
+            self._make(lambda: self.service.convert([info.path], to))
+
+    def _make(self, work) -> None:
+        self.summary.setText("Making the new file...")
+
+        def done(created) -> None:
+            names = ", ".join(item.dst.name for item in created)
+            self.summary.setText(f"Made {names} next to the original (undo in History).")
+            self.changed.emit(f"Made {names}")
+            if created:
+                folder = self._info.folder if self._info else ""
+                self._show_rows([(item.dst, folder or "(root)", "") for item in created])
+
+        def failed(exc: Exception) -> None:
+            self.summary.setText(str(exc))
+            QMessageBox.warning(self, "Couldn't make the file", str(exc))
+
+        self.runner.run(work, done, failed)
 
     def set_ai_enabled(self, enabled: bool) -> None:
         """Show the AI buttons only when an AI provider is on."""

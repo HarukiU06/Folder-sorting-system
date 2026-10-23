@@ -814,6 +814,39 @@ def test_library_summarizes_and_renames(
     assert (shelf / "Finance" / "Hosting Invoice 2024.txt").exists()
 
 
+def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) -> None:
+    from PIL import Image
+
+    from autoshelf.ui.library_view import LibraryView
+
+    Image.new("RGB", (30, 20), (10, 120, 200)).save(shelf / "Finance" / "receipt photo.png")
+    service.inbox()
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.query.setText("receipt photo")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert view.name.text() == "receipt photo.png"
+    labels = [action.text() for action in view.convert_menu.actions()]
+    assert view.convert_button.isEnabled() and "JPG image" in labels
+
+    view.convert_menu.actions()[labels.index("JPG image")].trigger()
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "receipt photo.jpg").exists()
+    assert "Made receipt photo.jpg" in view.summary.text()
+    assert (shelf / "Finance" / "receipt photo.png").exists()  # the original stays
+
+    view.query.setText("invoice")
+    view.search()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert not view.convert_button.isEnabled()  # nothing to convert a .txt to
+    view.compress_file()
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "invoice 2024.zip").exists()
+
+
 def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None:
     make(shelf / "_Inbox" / "scan_0034.txt", "Quarterly Report\nrevenue grew")
     view = InboxView(service, runner)

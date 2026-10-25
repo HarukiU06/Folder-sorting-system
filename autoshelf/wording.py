@@ -323,6 +323,60 @@ def history_reason(entry: HistoryEntry) -> str:
     return _REASON_LABELS.get(entry.reason, entry.reason)
 
 
+def place(folder: str) -> str:
+    """A folder as History names it: "Finance", "the Inbox", "your AutoShelf folder"."""
+    if folder == "(root)":
+        return "your AutoShelf folder"
+    if folder == "_Inbox":
+        return "the Inbox"
+    return folder
+
+
+def history_sentence(entry: HistoryEntry, src_folder: str, dst_folder: str) -> str:
+    """What a history row did, in a sentence: "Moved bread.txt to Recipes"."""
+    name = Path(entry.dst or entry.src or "?").name
+    if entry.action == "undo":
+        return f"Put {name} back in {place(dst_folder)}"
+    if entry.action == "create":
+        return f"Made {created(entry.details.get('reason') or {})}"
+    if entry.action == "rename" or entry.reason in ("rename", "renamed (you approved)"):
+        return f"Renamed {Path(entry.src or '?').name} to {name}"
+    if entry.reason in ("tag", "untag"):
+        verb = "Tagged" if entry.reason == "tag" else "Untagged"
+        return f"{verb} {name}: {entry.details.get('tag', '')}"
+    if entry.reason == "duplicate" or entry.reason.startswith("duplicate of "):
+        return f"Set {name} aside in _Duplicates"
+    if dst_folder == "_Inbox":
+        return f"Put {name} in the Inbox"
+    return f"Moved {name} to {place(dst_folder)}"
+
+
+def history_how(entry: HistoryEntry) -> str:
+    """Who or what made a history row happen: "on its own", "you chose it"..."""
+    if entry.action == "undo":
+        return f"undo of #{entry.undo_of}" if entry.undo_of else "undo"
+    if entry.action == "create":
+        return "you asked for it"
+    if entry.reason == "user" and entry.details.get("corrects"):
+        return f"you corrected #{entry.details['corrects']}"
+    if entry.reason.startswith("Rule:"):
+        return f"by your rule “{entry.reason.removeprefix('Rule:').strip()}”"
+    return _HOW.get(entry.reason, history_reason(entry))
+
+
+_HOW = {
+    "auto": "on its own",
+    "ask": "not sure, so it asked you",
+    "user": "you chose it",
+    "organize": "you approved it",
+    "rename": "you approved it",
+    "renamed (you approved)": "you approved it",
+    "duplicate": "you kept another copy",
+    "tag": "you tagged it",
+    "untag": "you removed the tag",
+}
+
+
 def why_here(path: Path, entry: HistoryEntry | None, here: bool) -> str:
     """Why a file is where it is, in a sentence ("Why is this here?" in Explorer's menu).
 

@@ -207,7 +207,7 @@ def test_history_lists_moves_and_undoes_one(qtbot, service, runner, shelf: Path)
 
     assert view.table.rowCount() == 1
     cells = [view.table.item(0, column).text() for column in range(view.table.columnCount())]
-    assert cells[1:5] == ["bread.txt", "_Inbox", "Recipes", "You chose"]
+    assert cells[:2] == ["Moved bread.txt to Recipes", "you chose it"]
     view.table.selectRow(0)
     assert view.undo_button.isEnabled()
 
@@ -216,7 +216,9 @@ def test_history_lists_moves_and_undoes_one(qtbot, service, runner, shelf: Path)
 
     assert src.exists()
     assert view.table.rowCount() == 2
-    assert view.table.item(0, 4).text().startswith("Undo of #")
+    assert view.table.item(0, 0).text() == "Put bread.txt back in the Inbox"
+    assert view.table.item(0, 1).text().startswith("undo of #")
+    assert view.table.item(1, 0).text() == "Moved bread.txt to Recipes (undone)"
 
 
 def test_undo_of_a_changed_file_asks_first(
@@ -617,7 +619,7 @@ def test_history_shows_why_and_corrects_a_move(
     assert moved.args == ["Moved bread.txt to Recipes; AutoShelf will remember"]
     assert (shelf / "Recipes" / "bread.txt").exists()
     settle(qtbot, runner)
-    assert view.table.item(0, 4).text() == "You corrected #1"
+    assert view.table.item(0, 1).text() == "you corrected #1"
     assert service.corrections()[-1]["source"] == "undo"
 
 
@@ -1265,7 +1267,7 @@ def test_history_offers_undo_for_a_file_autoshelf_made(
     view.refresh()
     settle(qtbot, runner)
     row = [entry.id for entry in view._entries].index(created.history_id)
-    assert view.table.item(row, 4).text() == "Made a ZIP of report.txt"
+    assert view.table.item(row, 0).text() == "Made a ZIP of report.txt"
     assert can_undo(view._entries[row])
     view.table.selectRow(row)
     view.undo_selected()

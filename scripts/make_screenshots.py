@@ -188,7 +188,7 @@ def main() -> int:
         def select_auto() -> None:
             history = window.history
             for row in range(history.table.rowCount()):
-                if history.table.item(row, 4).text() == "Sorted automatically":
+                if history.table.item(row, 1).text() == "on its own":
                     history.table.selectRow(row)
                     break
 

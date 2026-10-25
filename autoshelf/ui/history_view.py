@@ -1,23 +1,29 @@
-"""The History screen: every move, why it happened ("Why here?"), Undo and corrections."""
+"""The History screen: what AutoShelf did, in sentences, with Undo, corrections and "Why?"."""
 
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
-    QLabel,
     QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+from qfluentwidgets import (
+    Action,
+    FluentIcon,
+    PushButton,
+    RoundMenu,
+    TableWidget,
+    TitleLabel,
+    TransparentPushButton,
+    TransparentToolButton,
 )
 
 from autoshelf import wording
@@ -27,11 +33,13 @@ from autoshelf.db.repository import UNDOABLE_ACTIONS, HistoryEntry
 from autoshelf.layout import INBOX_DIRNAME, RESERVED_PREFIX
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.why_panel import WhyPanel
-from autoshelf.ui.widgets import plain_tooltip
+from autoshelf.ui.widgets import plain_tooltip, show_menu
 
-COLUMNS = ("When", "File", "From", "To", "Why", "Score", "State")
+COLUMNS = ("What happened", "How", "When")
 FORCE_HINT = "; use --force to undo anyway"  # CLI advice; the app asks instead
-_STATES = {"done": "Done", "undone": "Undone", "failed": "Failed", "pending": "In progress"}
+SHOW_WHY = "Why?"
+HIDE_WHY = "Hide why"
+UNDO_LAST_MAX = 100
 
 
 def describe_reason(entry: HistoryEntry) -> str:
@@ -70,8 +78,20 @@ def can_correct(entry: HistoryEntry) -> bool:
     )
 
 
+def sentence(entry: HistoryEntry) -> str:
+    """The row's "What happened" text ("... (undone)" once it has been undone)."""
+    text = wording.history_sentence(
+        entry, folder_of(entry.src, entry.root), folder_of(entry.dst, entry.root)
+    )
+    if entry.state == "undone":
+        return f"{text} (undone)"
+    if entry.state == "failed":
+        return f"{text} (failed)"
+    return text
+
+
 class HistoryView(QWidget):
-    """A table of recent history with Undo buttons."""
+    """What AutoShelf did, newest first, with Undo and corrections for the selected row."""
 
     undone = Signal(str)  # a message after something was undone
 
@@ -81,56 +101,63 @@ class HistoryView(QWidget):
         self.runner = runner
         self._entries: list[HistoryEntry] = []
 
-        self.table = QTableWidget(0, len(COLUMNS))
+        refresh = TransparentToolButton(FluentIcon.SYNC)
+        refresh.setToolTip("Look again")
+        refresh.clicked.connect(self.refresh)
+        top = QHBoxLayout()
+        top.addWidget(TitleLabel("History"), 1)
+        top.addWidget(refresh)
+
+        self.table = TableWidget()
+        self.table.setColumnCount(len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._update_buttons)
 
-        self.undo_button = QPushButton("Undo selected")
+        self.undo_button = PushButton(FluentIcon.RETURN, "Undo")
         self.undo_button.clicked.connect(self.undo_selected)
-        self.correct_button = QPushButton("Move to another folder...")
+        self.correct_button = PushButton(FluentIcon.FOLDER, "Move to another folder…")
         self.correct_button.setToolTip(
             "Put the file where it belongs; AutoShelf learns from the correction"
         )
         self.correct_button.clicked.connect(self.correct_selected)
-        self.count = QSpinBox()
-        self.count.setRange(1, 100)
-        self.count.setValue(5)
-        self.batch_button = QPushButton("Undo its batch")
-        self.batch_button.setToolTip("Undo every move made together with this one")
-        self.batch_button.clicked.connect(self.undo_selected_batch)
-        undo_last = QPushButton("Undo the last")
-        undo_last.clicked.connect(self.undo_last)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
+        self.why_button = TransparentPushButton(FluentIcon.INFO, SHOW_WHY)
+        self.why_button.clicked.connect(self._toggle_why)
+
+        self.menu = RoundMenu(parent=self)
+        self.batch_action = Action("Undo everything done together with it")
+        self.batch_action.triggered.connect(self.undo_selected_batch)
+        undo_last = Action("Undo the last few moves…")
+        undo_last.triggered.connect(self.ask_undo_last)
+        self.menu.addActions([self.batch_action, undo_last])
+        self.menu_button = TransparentToolButton(FluentIcon.MORE)
+        self.menu_button.setToolTip("More ways to undo")
+        self.menu_button.clicked.connect(lambda: show_menu(self.menu, self.menu_button))
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.undo_button)
         buttons.addWidget(self.correct_button)
-        buttons.addWidget(self.batch_button)
-        buttons.addSpacing(20)
-        buttons.addWidget(undo_last)
-        buttons.addWidget(self.count)
-        buttons.addWidget(QLabel("moves"))
+        buttons.addWidget(self.why_button)
         buttons.addStretch(1)
-        buttons.addWidget(refresh)
+        buttons.addWidget(self.menu_button)
 
         self.why = WhyPanel()
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self.table)
-        splitter.addWidget(self.why)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        self.why.setVisible(False)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter, 1)
+        layout.setContentsMargins(28, 20, 28, 20)
+        layout.setSpacing(12)
+        layout.addLayout(top)
+        layout.addWidget(self.table, 3)
         layout.addLayout(buttons)
+        layout.addWidget(self.why, 2)
         self._update_buttons()
 
     def refresh(self) -> None:
@@ -141,23 +168,18 @@ class HistoryView(QWidget):
         selected = self._selected()
         self._entries = entries
         self.table.setRowCount(len(entries))
+        faded = QBrush(self.palette().color(QPalette.ColorRole.PlaceholderText))
         for row, entry in enumerate(entries):
             when = datetime.fromisoformat(entry.ts).astimezone().strftime("%Y-%m-%d %H:%M")
-            cells = (
-                when,
-                Path(entry.dst or entry.src or "?").name,
-                folder_of(entry.src, entry.root),
-                folder_of(entry.dst, entry.root),
-                describe_reason(entry),
-                f"{entry.confidence:.2f}" if entry.confidence is not None else "",
-                _STATES.get(entry.state, entry.state),
-            )
+            cells = (sentence(entry), wording.history_how(entry), when)
+            tip = wording.explanation(entry.details) or entry.details.get("note") or ""
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, entry.id)
-                tip = wording.explanation(entry.details) or entry.details.get("note") or ""
                 if tip:
                     item.setToolTip(plain_tooltip(f"#{entry.id}: {tip}"))
+                if entry.state != "done" or column:
+                    item.setForeground(faded)
                 self.table.setItem(row, column, item)
         if selected is not None:
             ids = [entry.id for entry in entries]
@@ -175,7 +197,8 @@ class HistoryView(QWidget):
         entry = self._selected()
         self.undo_button.setEnabled(entry is not None and can_undo(entry))
         self.correct_button.setEnabled(entry is not None and can_correct(entry))
-        self.batch_button.setEnabled(entry is not None and bool(entry.batch_id))
+        self.why_button.setEnabled(entry is not None)
+        self.batch_action.setEnabled(entry is not None and bool(entry.batch_id))
         if entry is None:
             self.why.clear_details()
             return
@@ -185,6 +208,11 @@ class HistoryView(QWidget):
         )
         root = Path(entry.root) if entry.root else None
         self.why.show_details(entry.details, root, headline)
+
+    def _toggle_why(self) -> None:
+        shown = not self.why.isVisible()
+        self.why.setVisible(shown)
+        self.why_button.setText(HIDE_WHY if shown else SHOW_WHY)
 
     def correct_selected(self) -> None:
         """Ask for the right folder and move the selected file there (AutoShelf learns)."""
@@ -230,9 +258,16 @@ class HistoryView(QWidget):
         batch = entry.batch_id
         self._run_undo(lambda force: self.service.undo_batch(batch, force=force))
 
-    def undo_last(self) -> None:
-        """Undo the last N moves, newest first."""
-        count = self.count.value()
+    def ask_undo_last(self) -> None:
+        """Ask how many of the latest moves to undo, then undo them."""
+        count, ok = QInputDialog.getInt(
+            self, "Undo the last few moves", "How many moves?", 5, 1, UNDO_LAST_MAX
+        )
+        if ok:
+            self.undo_last(count)
+
+    def undo_last(self, count: int = 5) -> None:
+        """Undo the last ``count`` moves, newest first."""
         self._run_undo(lambda force: self.service.undo_last(count, force=force))
 
     def _run_undo(self, action, force: bool = False) -> None:

@@ -205,12 +205,12 @@ def main() -> int:
             )
             from autoshelf.ui.tidy_view import ROOT_CHOICE
 
-            window.tidy.organize.refresh()
+            window.tools.organize.refresh()
             settle(app, runner)
-            window.tidy.organize.source.setCurrentText(ROOT_CHOICE)
-            window.tidy.organize.preview()
+            window.tools.organize.source.setCurrentText(ROOT_CHOICE)
+            window.tools.organize.preview()
 
-        shoot("tidy", window.tidy, organize)
+        shoot("tidy", window.tools.organize, organize)
         shoot("dashboard", window.dashboard, window.dashboard.refresh)
         shoot("settings", window.settings)
         service.release()

@@ -8,7 +8,6 @@ from qfluentwidgets import FluentIcon, NavigationInterface, NavigationItemPositi
 
 from autoshelf.app_service import AppService
 from autoshelf.ui.ask_view import AskView
-from autoshelf.ui.dashboard_view import DashboardView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
@@ -17,7 +16,7 @@ from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.style import apply_theme
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.tidy_view import TidyView
+from autoshelf.ui.tools_view import ToolsView
 
 MESSAGE_MSECS = 8000
 SIDEBAR_WIDTH = 220
@@ -40,8 +39,8 @@ class MainWindow(QMainWindow):
         self.library = LibraryView(service, runner)
         self.history = HistoryView(service, runner)
         self.rules = RulesView(service, runner)
-        self.tidy = TidyView(service, runner)
-        self.dashboard = DashboardView(service, runner)
+        self.tools = ToolsView(service, runner)
+        self.dashboard = self.tools.dashboard
         self.ask = AskView(service, runner)
         self.settings = SettingsView(service, runner)
 
@@ -66,9 +65,8 @@ class MainWindow(QMainWindow):
         self._add(self.library, "library", FluentIcon.LIBRARY, "Library", top)
         self._add(self.history, "history", FluentIcon.HISTORY, "History", top)
         self._add(self.rules, "rules", FluentIcon.EDIT, "Rules", top)
-        self._add(self.tidy, "tidy", FluentIcon.BROOM, "Tidy up", top)
-        self._add(self.dashboard, "dashboard", FluentIcon.PIE_SINGLE, "Dashboard", top)
         self._add(self.ask, "ask", FluentIcon.CHAT, "Ask", top)
+        self._add(self.tools, "tools", FluentIcon.APPLICATION, "More tools", bottom)
         self._add(self.settings, "settings", FluentIcon.SETTING, "Settings", bottom)
         self.set_page_visible(self.ask, False)  # only with AI on
         self.navigation.setCurrentItem("inbox")
@@ -84,7 +82,7 @@ class MainWindow(QMainWindow):
         self.library.saved.connect(self._after_description)
         self.rules.changed.connect(self._after_rules)
         self.library.changed.connect(self._after_rules)
-        self.tidy.changed.connect(self._after_move)
+        self.tools.changed.connect(self._after_move)
         self.pages.currentChanged.connect(self._page_changed)
 
     def _add(self, page: QWidget, key: str, icon, title: str, position) -> None:
@@ -98,8 +96,11 @@ class MainWindow(QMainWindow):
     # --- pages ------------------------------------------------------------------------
 
     def current_page(self) -> QWidget:
-        """The page on show."""
-        return self.pages.currentWidget()
+        """The page on show (under More tools: the tool, if one is open)."""
+        page = self.pages.currentWidget()
+        if page is self.tools:
+            return self.tools.current_tool() or page
+        return page
 
     def page_title(self, page: QWidget) -> str:
         """The page's name in the sidebar (the Inbox's includes its count)."""
@@ -125,7 +126,7 @@ class MainWindow(QMainWindow):
         """Show the AI features only when an AI provider is chosen in Settings."""
         self.set_page_visible(self.ask, enabled)
         self.library.set_ai_enabled(enabled)
-        self.tidy.set_ai_enabled(enabled)
+        self.tools.set_ai_enabled(enabled)
 
     def show_message(self, text: str) -> None:
         """A transient message in the status bar."""
@@ -136,7 +137,12 @@ class MainWindow(QMainWindow):
         self.state.setText(text)
 
     def show_tab(self, widget) -> None:
-        """Switch to one of the pages."""
+        """Switch to one of the pages, or to one of the tools under More tools."""
+        if widget in self.tools.tools:
+            self.tools.open(widget)
+            widget = self.tools
+        elif widget is self.tools:
+            self.tools.show_cards()
         self.pages.setCurrentWidget(widget)
         self.navigation.setCurrentItem(widget.objectName())
 
@@ -185,10 +191,8 @@ class MainWindow(QMainWindow):
             self.library.refresh()
         elif widget is self.rules:
             self.rules.refresh()
-        elif widget is self.tidy:
-            self.tidy.refresh()
-        elif widget is self.dashboard:
-            self.dashboard.refresh()
+        elif widget is self.tools:
+            self.tools.refresh()
         elif widget is self.settings:
             self.settings.load()
 

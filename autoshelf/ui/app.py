@@ -356,8 +356,8 @@ class AutoShelfApp(QObject):
         files = [Path(item) for item in command.files]
         log.info("Command %s for %d file(s)", command.action, len(files))
         if command.action == commands.SORT:
-            self.show_window(self.window.tidy)
-            self.window.tidy.sort_files(files)
+            self.show_window(self.window.tools)
+            self.window.tools.sort_files(files)
         elif command.action == commands.WHY:
             self.explain(files[0])
         elif command.action == commands.COMPRESS:

@@ -565,9 +565,9 @@ def test_files_right_clicked_together_make_one_zip(qtbot, app, shelf: Path) -> N
 def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: Path) -> None:
     bill = make(tmp_path / "Downloads" / "bill.txt", "invoice tax due to the bank")
     app.run_command(Command(commands.SORT, (str(bill),)))
-    page = app.window.tidy.organize
+    page = app.window.tools.organize
     qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
-    assert app.window.current_page() is app.window.tidy
+    assert app.window.current_page() is app.window.tools.organize
     assert page.source.currentText() == "Files chosen in Explorer"
     assert page.table.item(0, 2).text() == "Downloads"  # the folder, not its whole path
     assert page.table.cellWidget(0, 3).currentText() == "Finance"
@@ -796,11 +796,12 @@ def test_library_searches_and_tags(qtbot, service, runner, shelf: Path) -> None:
 
 
 def test_tidy_organizes_and_undoes_a_batch(qtbot, service, runner, shelf: Path) -> None:
-    from autoshelf.ui.tidy_view import ROOT_CHOICE, TidyView
+    from autoshelf.ui.tidy_view import ROOT_CHOICE
+    from autoshelf.ui.tools_view import ToolsView
 
     service.save_settings(replace(service.settings(), auto_threshold=0.3, auto_margin=0.1))
     make(shelf / "tax invoice.txt", "invoice tax bank receipt")
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
@@ -824,10 +825,10 @@ def test_tidy_organizes_and_undoes_a_batch(qtbot, service, runner, shelf: Path) 
 def test_tidy_sets_duplicates_aside(
     qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from autoshelf.ui.tidy_view import TidyView
+    from autoshelf.ui.tools_view import ToolsView
 
     copy = make(shelf / "Recipes" / "copy.txt", "invoice total tax due bank")
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
     page = view.duplicates
     page.refresh()
@@ -897,11 +898,16 @@ def test_main_window_has_every_screen(qtbot, service, runner) -> None:
         "Library",
         "History",
         "Rules",
-        "Tidy up",
-        "Dashboard",
+        "More tools",
         "Settings",
     ]
     assert not window.is_page_visible(window.ask)  # AI is off
+    window.show_tab(window.dashboard)
+    assert window.current_page() is window.dashboard
+    window.show_tab(window.tools)
+    assert window.current_page() is window.tools  # back to the cards
+    window.tools.cards["duplicates"].clicked.emit()
+    assert window.current_page() is window.tools.duplicates
     window.set_ai_enabled(True)
     assert window.is_page_visible(window.ask)
     for index in range(window.pages.count()):
@@ -1052,13 +1058,13 @@ def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None
 def test_tidy_renames_and_suggests_folders(
     qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from autoshelf.ui.tidy_view import TidyView
+    from autoshelf.ui.tools_view import ToolsView
 
     make(shelf / "_Inbox" / "scan_0001.txt", "Meeting Minutes\nwe met")
     for number in range(3):
         make(shelf / "_Inbox" / f"pods {number}.txt", f"kubernetes pods deployment yaml {number}")
     service.inbox()
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
 
     view.renames.refresh()

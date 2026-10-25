@@ -56,7 +56,7 @@ from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import calibrate as calibration
 from autoshelf.ml.embedder import Embedder, is_downloaded, model_bytes_on_disk
-from autoshelf.ml.library import LibraryIndex, scan_library
+from autoshelf.ml.library import LibraryFile, LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
 from autoshelf.watcher.ignore import ignore_reason
 from autoshelf.watcher.service import Progress, WatchService
@@ -121,6 +121,15 @@ class FolderInfo:
     key: str
     files: int  # files directly in it
     description: str
+
+
+@dataclass(frozen=True)
+class Shelf:
+    """Everything the Library browses, from one scan of the root (reads no file)."""
+
+    root: Path
+    folders: list[FolderInfo]
+    files: list[LibraryFile]
 
 
 @dataclass(frozen=True)
@@ -474,18 +483,22 @@ class AppService:
 
     def folders(self) -> list[FolderInfo]:
         """The category folders with file counts and descriptions."""
+        return self.shelf().folders
+
+    def shelf(self) -> Shelf:
+        """Your folders (with descriptions) and the files in them, from one scan."""
         root = self._require_root()
-        settings = self.settings()
-        scan = scan_library(root, settings.ignore_patterns)
+        scan = scan_library(root, self.settings().ignore_patterns)
         counts = dict.fromkeys(scan.folders, 0)
         for item in scan.files:
             counts[item.folder] += 1
         with self._connect() as conn:
             descriptions = repository.folder_descriptions(conn)
-        return [
+        folders = [
             FolderInfo(key, counts[key], descriptions.get(key.casefold(), ""))
             for key in scan.folders
         ]
+        return Shelf(root, folders, list(scan.files))
 
     def folder_files(self, folder: str) -> list[Path]:
         """The files directly in one of your folders, by name (reads no file)."""

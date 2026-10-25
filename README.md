@@ -97,10 +97,15 @@ AutoShelf then lives in the system tray. Its window has a sidebar:
   file is waiting. One click puts the file away (and teaches AutoShelf for next time); the
   message that follows offers Undo. Rename, open and show in Explorer are in the ⋯ menu;
   "Why is it waiting?" shows the scores and what they are based on.
-- **Library:** search your files by meaning or by exact words, or pick one of your folders
-  or tags on the left. A folder shows its files and a short description you can edit,
-  which helps AutoShelf recognise what belongs there. A file shows its details, tags and
-  related files; its ⋯ menu opens, renames, compresses or converts it.
+- **Library:** your folders the way File Explorer shows them: a folder tree on the left
+  (your tags below it), Back / Forward / Up and the folder's path above, and the open
+  folder's folders and files with their dates and sizes (a cloud marks files that are
+  only in iCloud). Double-click a folder to go into it, a file to open it; right-click
+  either for more. The pane on the right shows the selected file (details, tags, related
+  files, a preview; its ⋯ menu renames, compresses or converts it) or folder (a short
+  description you can edit, which helps AutoShelf recognise what belongs there). Search
+  by meaning or by exact words from the box at the top right: matching folders come
+  first, then files. The Library only browses: it never moves, deletes or makes folders.
 - **History:** what AutoShelf did, in sentences ("Moved bread.txt to Recipes", how and
   when). Undo the selected row, or move a file AutoShelf put in the wrong folder to the
   right one ("Move to another folder", which AutoShelf learns from); "Why?" shows the

@@ -1,16 +1,24 @@
-"""The Library screen: search, your folders and tags on the left, and a file's details
-(tags, related files, compress/convert) (SPEC sections 5.1, 5.3, 5.4).
+"""The Library screen, laid out like File Explorer (SPEC sections 5.1, 5.3, 5.4).
 
-Choosing a folder lists its files and lets you describe what belongs in it, which helps
-AutoShelf recognise such files (this used to be a Folders screen of its own).
+Your folders as a tree on the left (your tags below them), Back / Forward / Up and the
+path above, the open folder's folders and files in the middle, and on the right the
+details of the selected file (tags, related files, compress / convert) or folder (its
+description, which helps AutoShelf recognise what belongs there). A search by meaning or
+by exact words lists the matching folders and files instead.
+
+It browses what one scan found (names, sizes and dates: no file is read, and nothing is
+downloaded from iCloud), so it shows your folders and the files in them, not the files
+still waiting to be sorted, nor hidden or ignored ones. Unlike Explorer it never moves,
+deletes or makes folders.
 """
 
 import html
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QModelIndex, QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -18,13 +26,16 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QListWidgetItem,
     QMessageBox,
+    QSplitter,
     QTableWidgetItem,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from qfluentwidgets import (
     Action,
     BodyLabel,
+    BreadcrumbBar,
     CaptionLabel,
     FluentIcon,
     LineEdit,
@@ -36,26 +47,78 @@ from qfluentwidgets import (
     StrongBodyLabel,
     SubtitleLabel,
     TableWidget,
-    TitleLabel,
+    TransparentToggleToolButton,
     TransparentToolButton,
+    TreeWidget,
 )
 
 from autoshelf import wording
-from autoshelf.app_service import AppService, FileInfo, FolderInfo
+from autoshelf.app_service import AppService, FileInfo, FolderInfo, Shelf
 from autoshelf.features import convert
+from autoshelf.ml.library import LibraryFile, folder_label
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import open_folder, plain, plain_tooltip, show_in_explorer, show_menu
+from autoshelf.ui.widgets import (
+    menu_at,
+    open_folder,
+    plain,
+    plain_tooltip,
+    show_in_explorer,
+    show_menu,
+)
 
-PATH_ROLE = Qt.ItemDataRole.UserRole
-COLUMNS = ("File", "Folder")
+PATH_ROLE = Qt.ItemDataRole.UserRole  # a file's path or a folder's key
+KIND_ROLE = Qt.ItemDataRole.UserRole + 1
+SORT_ROLE = Qt.ItemDataRole.UserRole + 2
+
+FOLDER = "folder"
+FILE = "file"
+TAG = "tag"
+SEARCH = "search"
+type Location = tuple[str, str]  # (FOLDER, key) with "" for your AutoShelf folder, ...
+ROOT: Location = (FOLDER, "")
+
+COLUMNS = ("Name", "", "Date modified", "Size", "Folder")  # "": the status (a cloud icon)
+NAME, STATUS, MODIFIED, SIZE, WHERE = range(len(COLUMNS))
+COLUMN_WIDTHS = {STATUS: 32, MODIFIED: 110, SIZE: 80, WHERE: 150}
 HINT = (
     'Search by meaning ("paper explaining k-means initialization") or by exact words '
-    '("invoice 2025"), or pick a folder or a tag on the left.'
+    '("invoice 2025"). Folders whose names match are listed first.'
 )
 DESCRIBE_HINT = "What belongs in this folder? A few words help AutoShelf sort new files."
-LEFT_WIDTH = 200
-DETAIL_WIDTH = 320
-FOLDER_COLUMN_WIDTH = 130
+ONLINE_ONLY = "Online only: it is in iCloud, and opening it downloads it"
+TREE_WIDTH = 220
+DETAIL_WIDTH = 270
+SEARCH_WIDTH = 280
+
+_KINDS: dict[str, tuple[FluentIcon, str]] = {}
+for _icon, _name, _suffixes in (
+    (FluentIcon.DOCUMENT, "PDF document", "pdf"),
+    (FluentIcon.DOCUMENT, "Word document", "doc docx"),
+    (FluentIcon.DOCUMENT, "Document", "odt rtf pages"),
+    (FluentIcon.DOCUMENT, "Text document", "txt log"),
+    (FluentIcon.DOCUMENT, "Markdown document", "md"),
+    (FluentIcon.DOCUMENT, "Spreadsheet", "xls xlsx xlsm ods numbers"),
+    (FluentIcon.DOCUMENT, "CSV file", "csv tsv"),
+    (FluentIcon.DOCUMENT, "Presentation", "ppt pptx odp key"),
+    (FluentIcon.BOOK_SHELF, "E-book", "epub mobi"),
+    (FluentIcon.GLOBE, "Web page", "html htm"),
+    (FluentIcon.PHOTO, "Image", "jpg jpeg png gif bmp tif tiff webp heic heif svg"),
+    (FluentIcon.MUSIC, "Audio", "mp3 m4a wav flac ogg aac"),
+    (FluentIcon.VIDEO, "Video", "mp4 mov avi mkv webm m4v"),
+    (FluentIcon.ZIP_FOLDER, "Compressed archive", "zip 7z rar tar gz"),
+    (FluentIcon.CODE, "Code", "py js ts json xml yaml yml c cpp h java ipynb sql"),
+):
+    for _suffix in _suffixes.split():
+        _KINDS[_suffix] = (_icon, _name)
+
+
+def file_kind(name: str) -> tuple[FluentIcon, str]:
+    """An icon and an Explorer-like type ("PDF document") from a file's extension only.
+
+    The extension is enough, and asking Windows for a file's own icon could make iCloud
+    download it."""
+    suffix = Path(name).suffix.lower().lstrip(".")
+    return _KINDS.get(suffix, (FluentIcon.DOCUMENT, f"{suffix.upper()} file" if suffix else "File"))
 
 
 def _size(size: int) -> str:
@@ -66,9 +129,54 @@ def _size(size: int) -> str:
     return str(size)
 
 
+def short_size(size: int) -> str:
+    """A size as Explorer's list shows it: "1 KB", "820 KB", "12.5 MB"."""
+    if size < 1024 * 1024:
+        return f"{max(1, round(size / 1024)):,} KB" if size else "0 KB"
+    if size < 1024**3:
+        return f"{size / 1024**2:.1f} MB"
+    return f"{size / 1024**3:.1f} GB"
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number:,} {noun}{'' if number == 1 else 's'}"
+
+
+def _parent(key: str) -> str:
+    return key.rpartition("/")[0]
+
+
+def _leaf(key: str) -> str:
+    return key.rpartition("/")[2]
+
+
+@dataclass(frozen=True)
+class Row:
+    """One line of the middle list: a folder or a file."""
+
+    kind: str  # FOLDER or FILE
+    value: str  # the folder's key or the file's path
+    name: str
+    where: str = ""  # the folder it is in (search and tag results)
+    size: int | None = None  # bytes, or the number of items in a folder
+    modified: float | None = None
+    online_only: bool = False
+    tip: str = ""
+
+
+class _Item(QTableWidgetItem):
+    """A cell that sorts by SORT_ROLE, so sizes and dates sort as numbers and folders
+    stay together."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        mine, theirs = self.data(SORT_ROLE), other.data(SORT_ROLE)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
+
 class LibraryView(QWidget):
-    """Folders and tags on the left, search results or a folder's files in the middle, the
-    selected file's details on the right."""
+    """Your folders like File Explorer shows them, with search, tags and file details."""
 
     changed = Signal(str)  # a message after tags changed or a file was made or renamed
     saved = Signal(str)  # a message after a folder's description was saved
@@ -78,96 +186,181 @@ class LibraryView(QWidget):
         self.service = service
         self.runner = runner
         self.ai_enabled = False
-        self._paths: list[Path] = []
+        self.location: Location = ROOT
+        self._shelf: Shelf | None = None
+        self._folders: dict[str, FolderInfo] = {}
+        self._items: dict[str, int] = {}  # folder key -> folders and files directly in it
+        self._files: dict[str, LibraryFile] = {}  # casefolded path -> file
+        self._tags: list[tuple[str, int]] = []
+        self._tree_items: dict[str, QTreeWidgetItem] = {}
+        self.tags_item: QTreeWidgetItem | None = None
+        self._back: list[Location] = []
+        self._forward: list[Location] = []
+        self._last_folder: Location = ROOT
+        self._filled: Location | None = None  # what the middle list shows
+        self._select_after_load: Path | None = None
+        self._note = ""
         self._info: FileInfo | None = None
-        self._folders: list[FolderInfo] = []
-        self._folder: FolderInfo | None = None
+        self._folder: FolderInfo | None = None  # the folder in the details pane
+        self._folder_key: str | None = None
         self._search_number = 0
+        self._syncing = False
+
+        bar = self._build_bar()
+        self.tree = TreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setColumnCount(1)
+        self.tree.setMinimumWidth(160)
+        self.tree.currentItemChanged.connect(self._tree_changed)
+        self.results = self._build_results()
+        self.detail = self._build_detail()
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(10)
+        for widget in (self.tree, self.results, self.detail):
+            self.splitter.addWidget(widget)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([TREE_WIDTH, 500, DETAIL_WIDTH])
+
+        self.summary = plain(CaptionLabel())  # the status line, as at the foot of Explorer
+        self.summary.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 18, 24, 12)
+        layout.setSpacing(10)
+        layout.addLayout(bar)
+        layout.addWidget(self.splitter, 1)
+        layout.addWidget(self.summary)
+        self._add_shortcuts()
+        self._show_detail(None)
+        self._update_bar()
+
+    # --- building -----------------------------------------------------------------------
+
+    def _build_bar(self) -> QHBoxLayout:
+        self.back_button = TransparentToolButton(FluentIcon.LEFT_ARROW)
+        self.back_button.setToolTip("Back (Alt+Left)")
+        self.back_button.clicked.connect(self.go_back)
+        self.forward_button = TransparentToolButton(FluentIcon.RIGHT_ARROW)
+        self.forward_button.setToolTip("Forward (Alt+Right)")
+        self.forward_button.clicked.connect(self.go_forward)
+        self.up_button = TransparentToolButton(FluentIcon.UP)
+        self.up_button.setToolTip("Up to the folder it is in (Alt+Up)")
+        self.up_button.clicked.connect(self.go_up)
+        self.refresh_button = TransparentToolButton(FluentIcon.SYNC)
+        self.refresh_button.setToolTip("Refresh (F5)")
+        self.refresh_button.clicked.connect(self.refresh)
+
+        self.path_bar = BreadcrumbBar()
+        self.path_bar.currentItemChanged.connect(self._crumb_clicked)
+        address = SimpleCardWidget()  # the address box
+        address_layout = QHBoxLayout(address)
+        address_layout.setContentsMargins(12, 4, 12, 4)
+        address_layout.addWidget(self.path_bar)
 
         self.query = SearchLineEdit()
         self.query.setPlaceholderText("Search your files")
+        self.query.setToolTip(HINT)
+        self.query.setFixedWidth(SEARCH_WIDTH)
         self.query.returnPressed.connect(self.search)
         self.query.searchSignal.connect(lambda _: self.search())
-        self.summary = plain(CaptionLabel(HINT))
-        self.summary.setWordWrap(True)
+        self.query.clearSignal.connect(self._search_cleared)
 
-        self.folder_list = ListWidget()
-        self.folder_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.folder_list.itemClicked.connect(self._folder_clicked)
-        self.tag_list = ListWidget()
-        self.tag_list.itemClicked.connect(self._tag_clicked)
-        left = QWidget()
-        left.setFixedWidth(LEFT_WIDTH)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(StrongBodyLabel("Folders"))
-        left_layout.addWidget(self.folder_list, 2)
-        left_layout.addWidget(StrongBodyLabel("Tags"))
-        left_layout.addWidget(self.tag_list, 1)
+        self.details_button = TransparentToggleToolButton(FluentIcon.INFO)
+        self.details_button.setToolTip("Details pane")
+        self.details_button.setChecked(True)
+        self.details_button.toggled.connect(lambda shown: self.detail.setVisible(shown))
 
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        for button in (self.back_button, self.forward_button, self.up_button):
+            bar.addWidget(button)
+        bar.addWidget(address, 1)
+        bar.addWidget(self.refresh_button)
+        bar.addSpacing(8)
+        bar.addWidget(self.query)
+        bar.addWidget(self.details_button)
+        return bar
+
+    def _build_results(self) -> TableWidget:
+        table = TableWidget()
+        table.setColumnCount(len(COLUMNS))
+        table.setHorizontalHeaderLabels(COLUMNS)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        table.setMinimumWidth(320)
+        table.horizontalHeaderItem(STATUS).setToolTip("Status: a cloud means online only")
+        header = table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.setSectionResizeMode(NAME, QHeaderView.ResizeMode.Stretch)
+        for column, width in COLUMN_WIDTHS.items():
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            table.setColumnWidth(column, width)
+        header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        table.setSortingEnabled(True)
+        table.itemSelectionChanged.connect(self._selection_changed)
+        table.itemDoubleClicked.connect(lambda _: self.open_selected())
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(self._context_menu)
+        return table
+
+    def _build_detail(self) -> QWidget:
+        detail = QWidget()
+        detail.setMinimumWidth(240)
         self.folder_box = self._build_folder_box()
-        self.results = TableWidget()
-        self.results.setColumnCount(len(COLUMNS))
-        self.results.setHorizontalHeaderLabels(COLUMNS)
-        self.results.verticalHeader().setVisible(False)
-        self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.results.setWordWrap(False)
-        header = self.results.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.results.setColumnWidth(1, FOLDER_COLUMN_WIDTH)
-        self.results.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.results.itemSelectionChanged.connect(self._selected)
-        self.results.itemDoubleClicked.connect(lambda _: self.open_file())
-        middle = QVBoxLayout()
-        middle.addWidget(self.folder_box)
-        middle.addWidget(self.results, 1)
-
-        self.detail = self._build_detail()
-        body = QHBoxLayout()
-        body.setSpacing(16)
-        body.addWidget(left)
-        body.addLayout(middle, 1)
-        body.addWidget(self.detail)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 20, 28, 20)
-        layout.setSpacing(12)
-        layout.addWidget(TitleLabel("Library"))
-        layout.addWidget(self.query)
-        layout.addWidget(self.summary)
-        layout.addLayout(body, 1)
-        self._show_detail(None)
+        self.file_box = self._build_file_box()
+        layout = QVBoxLayout(detail)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.folder_box, 1)
+        layout.addWidget(self.file_box, 1)
+        return detail
 
     def _build_folder_box(self) -> QWidget:
         box = SimpleCardWidget()
         self.folder_name = plain(SubtitleLabel())
+        self.folder_name.setWordWrap(True)
+        self.folder_facts = plain(BodyLabel())
+        self.folder_facts.setWordWrap(True)
+        self.describe_label = StrongBodyLabel("What belongs here")
         self.description = LineEdit()
         self.description.setPlaceholderText(DESCRIBE_HINT)
         self.description.setToolTip(DESCRIBE_HINT)
         self.description.editingFinished.connect(self._describe)
+        self.describe_note = CaptionLabel(
+            "A few words about this folder help AutoShelf recognise files that belong in it."
+        )
+        self.describe_note.setWordWrap(True)
         open_button = PushButton(FluentIcon.FOLDER, "Open in Explorer")
         open_button.clicked.connect(self._open_folder)
         self.study_button = PushButton(FluentIcon.BOOK_SHELF, "Study…")
         self.study_button.setToolTip("A reading list and flashcards for this folder (AI)")
         self.study_button.clicked.connect(self.study_folder)
         self.study_button.setVisible(False)
-        heading = QHBoxLayout()
-        heading.addWidget(self.folder_name, 1)
-        heading.addWidget(self.study_button)
-        heading.addWidget(open_button)
+        buttons = QHBoxLayout()
+        buttons.addWidget(open_button)
+        buttons.addWidget(self.study_button)
+        buttons.addStretch(1)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(16, 12, 16, 12)
-        layout.addLayout(heading)
+        layout.addWidget(self.folder_name)
+        layout.addWidget(self.folder_facts)
+        layout.addSpacing(6)
+        layout.addWidget(self.describe_label)
         layout.addWidget(self.description)
+        layout.addWidget(self.describe_note)
+        layout.addSpacing(6)
+        layout.addLayout(buttons)
+        layout.addStretch(1)
         box.setVisible(False)
         return box
 
-    def _build_detail(self) -> QWidget:
+    def _build_file_box(self) -> QWidget:
         box = SimpleCardWidget()
-        box.setFixedWidth(DETAIL_WIDTH)
         self.name = plain(SubtitleLabel())
         self.name.setWordWrap(True)
         self.name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -236,100 +429,575 @@ class LibraryView(QWidget):
         layout.addWidget(self.preview, 1)
         return box
 
+    def _add_shortcuts(self) -> None:
+        for keys, slot in (
+            ("Alt+Left", self.go_back),
+            ("Backspace", self.go_back),
+            ("Alt+Right", self.go_forward),
+            ("Alt+Up", self.go_up),
+            ("F5", self.refresh),
+            ("Ctrl+F", self.query.setFocus),
+            ("F3", self.query.setFocus),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(slot)
+        enter = QShortcut(QKeySequence("Return"), self.results)
+        enter.setContext(Qt.ShortcutContext.WidgetShortcut)
+        enter.activated.connect(self.open_selected)
+
     def menu_actions(self) -> list[Action | None]:
-        """What the ⋯ menu offers for the selected file."""
+        """What the ⋯ menu (and a right-click) offers for the selected file."""
         actions: list[Action | None] = [self.open_action, self.show_action, self.rename_action]
         actions += [None, self.compress_action, *self.convert_actions]
         if self.ai_enabled:
             actions += [None, self.summarize_action]
         return actions
 
-    # --- loading ------------------------------------------------------------------
+    # --- loading ------------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Reload the folders and tags."""
-        self.runner.run(self.service.folders, self._show_folders, lambda exc: None)
+        """Rescan your folders (names, sizes, dates) and reload the tags."""
+        self.runner.run(self.service.shelf, self._loaded, self._failed)
         self.runner.run(self.service.tags, self._show_tags)
 
-    def _show_folders(self, folders: list[FolderInfo]) -> None:
-        self._folders = folders
-        self.folder_list.clear()
-        for folder in folders:
-            item = QListWidgetItem(f"{folder.key.replace('/', ' / ')}  ({folder.files})")
-            item.setData(PATH_ROLE, folder.key)
-            item.setToolTip(plain_tooltip(folder.description) if folder.description else "")
-            self.folder_list.addItem(item)
-        if not folders:
-            self.folder_list.addItem(QListWidgetItem("(no folders yet)"))
-        if self._folder is not None:
-            keys = [folder.key for folder in folders]
-            if self._folder.key in keys:
-                self._folder = folders[keys.index(self._folder.key)]
-            else:
-                self._folder = None
-                self.folder_box.setVisible(False)
+    def _loaded(self, shelf: Shelf) -> None:
+        self._shelf = shelf
+        self._folders = {folder.key: folder for folder in shelf.folders}
+        self._items = {folder.key: folder.files for folder in shelf.folders}
+        self._items[""] = 0
+        for folder in shelf.folders:
+            self._items[_parent(folder.key)] += 1
+        self._files = {str(item.path).casefold(): item for item in shelf.files}
+        self._build_tree()
+        kind, value = self.location
+        if kind == FOLDER:
+            while value and value not in self._folders:  # it was renamed or removed
+                value = _parent(value)
+            self.location = (FOLDER, value)
+            self._show_location()
+        elif kind == TAG:
+            self._show_location()
+        else:
+            self._update_bar()
+        self._select_after_load = None
+        self._note = ""
 
     def _show_tags(self, tags: list[tuple[str, int]]) -> None:
-        self.tag_list.clear()
-        for name, count in tags:
-            item = QListWidgetItem(f"{name}  ({count})")
-            item.setData(PATH_ROLE, name)
-            self.tag_list.addItem(item)
-        if not tags:
-            self.tag_list.addItem(QListWidgetItem("(no tags yet)"))
+        self._tags = tags
+        self._fill_tags()
+
+    def _build_tree(self) -> None:
+        shelf = self._shelf
+        if shelf is None:
+            return
+        self._syncing = True
+        expanded = {key for key, item in self._tree_items.items() if item.isExpanded()}
+        first = not self._tree_items
+        self.tree.clear()
+        folder_icon = FluentIcon.FOLDER.icon()
+        root = QTreeWidgetItem([shelf.root.name])
+        root.setIcon(0, FluentIcon.HOME.icon())
+        root.setData(0, KIND_ROLE, FOLDER)
+        root.setData(0, PATH_ROLE, "")
+        root.setToolTip(0, plain_tooltip(f"Your AutoShelf folder\n{shelf.root}"))
+        self.tree.addTopLevelItem(root)
+        self._tree_items = {"": root}
+        for folder in shelf.folders:  # sorted, so a folder comes before the ones inside it
+            parent = self._tree_items.get(_parent(folder.key), root)
+            item = QTreeWidgetItem(parent, [_leaf(folder.key)])
+            item.setIcon(0, folder_icon)
+            item.setData(0, KIND_ROLE, FOLDER)
+            item.setData(0, PATH_ROLE, folder.key)
+            tip = f"{folder.key.replace('/', ' / ')}: {_count(folder.files, 'file')}"
+            item.setToolTip(0, plain_tooltip(f"{tip}\n{folder.description}".strip()))
+            self._tree_items[folder.key] = item
+        self.tags_item = QTreeWidgetItem(["Tags"])
+        self.tags_item.setIcon(0, FluentIcon.TAG.icon())
+        self.tags_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.tree.addTopLevelItem(self.tags_item)
+        for key, item in self._tree_items.items():
+            item.setExpanded(key in expanded or (first and key == ""))
+        self.tags_item.setExpanded(True)
+        self._fill_tags()
+        self._syncing = False
+        self._sync_tree()
+
+    def _fill_tags(self) -> None:
+        if self.tags_item is None:
+            return
+        self._syncing = True
+        self.tags_item.takeChildren()
+        tag_icon = FluentIcon.TAG.icon()
+        for name, count in self._tags:
+            item = QTreeWidgetItem(self.tags_item, [name])
+            item.setIcon(0, tag_icon)
+            item.setData(0, KIND_ROLE, TAG)
+            item.setData(0, PATH_ROLE, name)
+            item.setToolTip(0, _count(count, "file"))
+        if not self._tags:
+            empty = QTreeWidgetItem(self.tags_item, ["(no tags yet)"])
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+        self._syncing = False
+        self._sync_tree()
+
+    def tag_names(self) -> list[str]:
+        """The tags under Tags in the tree."""
+        if self.tags_item is None:
+            return []
+        items = (self.tags_item.child(i) for i in range(self.tags_item.childCount()))
+        return [item.data(0, PATH_ROLE) for item in items if item.data(0, KIND_ROLE) == TAG]
+
+    def tree_children(self, key: str) -> list[str]:
+        """The folders under ``key`` ("" for your AutoShelf folder) in the tree."""
+        item = self._tree_items.get(key)
+        if item is None:
+            return []
+        return [item.child(i).data(0, PATH_ROLE) for i in range(item.childCount())]
+
+    # --- moving around ------------------------------------------------------------------
+
+    def go_to(self, key: str) -> None:
+        """Open one of your folders ("" for your AutoShelf folder itself)."""
+        self._navigate((FOLDER, key))
+
+    def go_up(self) -> None:
+        """Go to the folder the open folder is in (from search results: back to the folder)."""
+        kind, value = self.location
+        if kind != FOLDER:
+            self._navigate(self._last_folder)
+        elif value:
+            self._navigate((FOLDER, _parent(value)))
+
+    def go_back(self) -> None:
+        """Go back to where you were before."""
+        if self._back:
+            self._forward.append(self.location)
+            self._set_location(self._back.pop())
+
+    def go_forward(self) -> None:
+        """Undo a Back."""
+        if self._forward:
+            self._back.append(self.location)
+            self._set_location(self._forward.pop())
+
+    def show_tag(self, name: str) -> None:
+        """List the files with a tag."""
+        self._navigate((TAG, name))
+
+    def show_file(self, path: Path, note: str = "") -> None:
+        """Open the folder a file is in, with the file selected (after a rescan, so a file
+        just made is there too)."""
+        self._select_after_load = path
+        self._note = note
+        self._navigate((FOLDER, self._key_of(path)))
+        self.refresh()
 
     def search(self) -> None:
         """Search for the typed query in the background."""
         query = self.query.text().strip()
-        if not query:
+        if query:
+            self._navigate((SEARCH, query))
+
+    def _search_cleared(self) -> None:
+        if self.location[0] == SEARCH:
+            self._navigate(self._last_folder)
+
+    def _navigate(self, location: Location) -> None:
+        if location != self.location:
+            self._back.append(self.location)
+            self._forward.clear()
+        self._set_location(location)
+
+    def _set_location(self, location: Location) -> None:
+        self.location = location
+        if location[0] == FOLDER:
+            self._last_folder = location
+        self._show_location()
+
+    def _show_location(self) -> None:
+        self._search_number += 1  # a search or tag list still under way no longer shows
+        kind, value = self.location
+        if kind == FOLDER:
+            self._show_folder_contents(value)
+        elif kind == TAG:
+            self._load_tag(value)
+        else:
+            self._run_search(value)
+        self._update_bar()
+
+    def _crumb_clicked(self, route: str) -> None:
+        if route.startswith(f"{FOLDER}:"):
+            self.go_to(route.partition(":")[2])
+
+    def _tree_changed(self, current: QTreeWidgetItem | None, _previous) -> None:
+        if self._syncing or current is None:
             return
-        self._search_number += 1
+        kind, value = current.data(0, KIND_ROLE), current.data(0, PATH_ROLE)
+        if kind == FOLDER:
+            self.go_to(value)
+        elif kind == TAG:
+            self.show_tag(value)
+
+    def _update_bar(self) -> None:
+        kind, value = self.location
+        self.back_button.setEnabled(bool(self._back))
+        self.forward_button.setEnabled(bool(self._forward))
+        self.up_button.setEnabled(self.location != ROOT)
+        self.path_bar.blockSignals(True)
+        self.path_bar.clear()
+        self.path_bar.addItem(f"{FOLDER}:", self._shelf.root.name if self._shelf else "AutoShelf")
+        if kind == FOLDER and value:
+            parts = value.split("/")
+            for end in range(1, len(parts) + 1):
+                self.path_bar.addItem(f"{FOLDER}:{'/'.join(parts[:end])}", parts[end - 1])
+        elif kind == SEARCH:
+            self.path_bar.addItem(SEARCH, f"Search results for “{value}”")
+        elif kind == TAG:
+            self.path_bar.addItem(TAG, f"Tagged “{value}”")
+        self.path_bar.blockSignals(False)
+        if kind != SEARCH and self.query.text():
+            self.query.blockSignals(True)
+            self.query.clear()
+            self.query.blockSignals(False)
+        self._sync_tree()
+
+    def _sync_tree(self) -> None:
+        """Select the open folder or tag in the tree."""
+        kind, value = self.location
+        item = None
+        if kind == FOLDER:
+            item = self._tree_items.get(value)
+        elif kind == TAG and self.tags_item is not None:
+            children = (self.tags_item.child(i) for i in range(self.tags_item.childCount()))
+            item = next((c for c in children if c.data(0, PATH_ROLE) == value), None)
+        self._syncing = True
+        if item is None:
+            self.tree.clearSelection()
+            self.tree.setCurrentIndex(QModelIndex())
+        else:
+            parent = item.parent()
+            while parent is not None:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            self.tree.setCurrentItem(item)
+            self.tree.scrollToItem(item)
+        self._syncing = False
+
+    # --- what the middle list shows -----------------------------------------------------
+
+    def _show_folder_contents(self, key: str) -> None:
+        if self._shelf is None:
+            self._fill([])
+            self.summary.setText("Looking at your folders...")
+            return
+        folders = [
+            self._folder_row(folder.key)
+            for folder in self._shelf.folders
+            if folder.key != key and _parent(folder.key) == key
+        ]
+        files = sorted(
+            (item for item in self._shelf.files if item.folder == key),
+            key=lambda item: item.path.name.casefold(),
+        )
+        self._fill(
+            folders + [self._file_row(item.path, item.folder) for item in files],
+            by_name=True,
+            select=self._select_after_load,
+        )
+        if folders or files:
+            parts = [_count(len(folders), "folder")] if folders else []
+            parts += [_count(len(files), "file")] if files else []
+            text = ", ".join(parts)
+        elif key:
+            text = "This folder is empty."
+        else:
+            text = (
+                "No folders yet. Make folders in your AutoShelf folder (in Explorer or on your "
+                "iPhone), and AutoShelf sorts new files into them."
+            )
+        self.summary.setText(self._note or text)
+
+    def _load_tag(self, name: str) -> None:
         number = self._search_number
-        self._show_folder(None)
-        self.summary.setText(f"Searching for {query!r}... (the first search loads the model)")
+        self.summary.setText(f"Looking for files tagged “{name}”...")
+
+        def found(paths: list[Path]) -> None:
+            if number != self._search_number:
+                return
+            self._fill([self._file_row(path, self._key_of(path)) for path in paths], by_name=True)
+            self.summary.setText(f"{_count(len(paths), 'file')} tagged “{name}”")
+
+        self.runner.run(lambda: self.service.tagged(name), found, self._failed)
+
+    def _run_search(self, query: str) -> None:
+        number = self._search_number
+        if self.query.text().strip() != query:  # Back or Forward to a search
+            self.query.blockSignals(True)
+            self.query.setText(query)
+            self.query.blockSignals(False)
+        folders = [self._folder_row(key, where=True) for key in self.matching_folders(query)]
+        self._fill(folders)
+        self.summary.setText(f"Searching for “{query}”... (the first search loads the model)")
 
         def found(hits) -> None:
             if number != self._search_number:
                 return  # a newer search is under way
-            rows = [
-                (
+            files = [
+                self._file_row(
                     hit.path,
-                    wording.place(hit.folder or "(root)"),
+                    hit.folder,
                     ("[has the words] " if hit.keyword else "")
                     + (f"Summary: {hit.summary}" if hit.summary else hit.snippet),
                 )
                 for hit in hits
             ]
-            self._show_rows(rows)
+            self._fill(folders + files, select_first_file=True)
+            parts = [_count(len(folders), "folder")] if folders else []
+            parts += [_count(len(files), "file")] if files or not folders else []
             self.summary.setText(
-                f"{len(hits)} file{'' if len(hits) == 1 else 's'} for {query!r}"
-                if hits
-                else f"Nothing found for {query!r}."
+                f"{' and '.join(parts)} for “{query}”"
+                if folders or files
+                else f"Nothing found for “{query}”."
             )
 
         self.runner.run(lambda: self.service.search(query), found, self._failed)
 
-    def _folder_clicked(self, item: QListWidgetItem) -> None:
-        key = item.data(PATH_ROLE)
-        folder = next((folder for folder in self._folders if folder.key == key), None)
-        if folder is None:
+    def matching_folders(self, query: str) -> list[str]:
+        """Your folders whose names contain every word of ``query``."""
+        words = query.casefold().split()
+        return [
+            key
+            for key in self._folders
+            if all(word in f"{key} {folder_label(key)}".casefold() for word in words)
+        ]
+
+    def _folder_row(self, key: str, *, where: bool = False) -> Row:
+        folder = self._folders.get(key)
+        tip = key.replace("/", " / ")
+        if folder is not None and folder.description:
+            tip += f"\n{folder.description}"
+        return Row(
+            FOLDER,
+            key,
+            _leaf(key),
+            where=self._place(_parent(key)) if where else "",
+            size=self._items.get(key, 0),
+            tip=tip,
+        )
+
+    def _file_row(self, path: Path, folder: str, note: str = "") -> Row:
+        item = self._files.get(str(path).casefold())
+        return Row(
+            FILE,
+            str(path),
+            path.name,
+            where=self._place(folder),
+            size=item.size if item else None,
+            modified=item.mtime if item else None,
+            online_only=item.online_only if item else False,
+            tip=f"{path}\n{note}" if note else str(path),
+        )
+
+    def _place(self, key: str) -> str:
+        if not key:
+            return self._shelf.root.name if self._shelf else "your AutoShelf folder"
+        return key.replace("/", " / ")
+
+    def _key_of(self, path: Path) -> str:
+        if self._shelf is not None:
+            try:
+                return "/".join(path.parent.relative_to(self._shelf.root).parts)
+            except ValueError:
+                pass
+        return path.parent.name
+
+    def _fill(
+        self,
+        rows: list[Row],
+        *,
+        by_name: bool = False,
+        select: Path | None = None,
+        select_first_file: bool = False,
+    ) -> None:
+        """Show ``rows``: folders first, sorted by name (``by_name``), or in the order given
+        (search results, best first). Keeps the selection when the list is only refreshed."""
+        kept = self.selected_item() if self._filled == self.location else None
+        self._filled = self.location
+        table = self.results
+        table.setSortingEnabled(False)
+        table.blockSignals(True)
+        table.clearSelection()
+        table.setRowCount(len(rows))
+        for number, row in enumerate(rows):
+            for column, cell in enumerate(self._cells(row)):
+                table.setItem(number, column, cell)
+        table.setColumnHidden(WHERE, self.location[0] == FOLDER)
+        header = table.horizontalHeader()
+        header.setSortIndicator(NAME if by_name else -1, Qt.SortOrder.AscendingOrder)
+        table.setSortingEnabled(True)
+        table.blockSignals(False)
+
+        wanted: tuple[str, str] | None = kept
+        if select is not None:
+            wanted = (FILE, str(select))
+        elif select_first_file:
+            wanted = next(((FILE, row.value) for row in rows if row.kind == FILE), None)
+        if wanted is None or not self.select(*wanted):
+            self._selection_changed()
+
+    def _cells(self, row: Row) -> list[QTableWidgetItem]:
+        group = 0 if row.kind == FOLDER else 1
+        if row.kind == FOLDER:
+            icon, kind = FluentIcon.FOLDER, "File folder"
+            size = _count(row.size or 0, "item")
+        else:
+            icon, kind = file_kind(row.name)
+            size = short_size(row.size) if row.size is not None else ""
+        modified = (
+            datetime.fromtimestamp(row.modified).strftime("%Y-%m-%d")
+            if row.modified is not None
+            else ""
+        )
+        texts = {
+            NAME: (row.name, row.name.casefold()),
+            STATUS: ("", row.online_only),
+            MODIFIED: (modified, row.modified or 0.0),
+            SIZE: (size, row.size or 0),
+            WHERE: (row.where, row.where.casefold()),
+        }
+        cells = []
+        for column in range(len(COLUMNS)):
+            text, key = texts[column]
+            cell = _Item(text)
+            cell.setData(SORT_ROLE, (group, key))
+            cell.setData(PATH_ROLE, row.value)
+            cell.setData(KIND_ROLE, row.kind)
+            cell.setToolTip(plain_tooltip(f"{kind}\n{row.tip}"))
+            cells.append(cell)
+        cells[NAME].setIcon(icon.icon())
+        if row.online_only:
+            cells[STATUS].setIcon(FluentIcon.CLOUD.icon())
+            cells[STATUS].setToolTip(ONLINE_ONLY)
+        cells[SIZE].setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return cells
+
+    def row_names(self) -> list[str]:
+        """The names in the middle list, top to bottom."""
+        return [self.results.item(row, NAME).text() for row in range(self.results.rowCount())]
+
+    def selected_item(self) -> tuple[str, str] | None:
+        """(FOLDER, key) or (FILE, path) of the selected row."""
+        rows = self.results.selectionModel().selectedRows()
+        if not rows:
+            return None
+        cell = self.results.item(rows[0].row(), NAME)
+        return (cell.data(KIND_ROLE), cell.data(PATH_ROLE)) if cell else None
+
+    def select(self, kind: str, value: str) -> bool:
+        """Select the row of a folder (by key) or a file (by path)."""
+        wanted = value.casefold() if kind == FILE else value
+        for row in range(self.results.rowCount()):
+            cell = self.results.item(row, NAME)
+            mine = cell.data(PATH_ROLE)
+            if (
+                cell.data(KIND_ROLE) == kind
+                and (mine.casefold() if kind == FILE else mine) == wanted
+            ):
+                self.results.selectRow(row)
+                self.results.scrollToItem(cell)
+                return True
+        return False
+
+    def open_selected(self) -> None:
+        """Open the selected folder here, or the selected file with its usual program."""
+        selected = self.selected_item()
+        if selected is None:
             return
-        self._search_number += 1  # a search still under way no longer shows
-        self._show_folder(folder)
+        kind, value = selected
+        if kind == FOLDER:
+            self.go_to(value)
+        else:
+            self.open_file()
 
-        def found(paths: list[Path]) -> None:
-            self._show_rows([(path, key, "") for path in paths])
-            count = len(paths)
-            self.summary.setText(f"{count} file{'' if count == 1 else 's'} in {key}")
+    def _context_menu(self, pos: QPoint) -> None:
+        cell = self.results.itemAt(pos)
+        if cell is None:
+            return
+        self.results.selectRow(cell.row())
+        if cell.data(KIND_ROLE) == FOLDER:
+            key = cell.data(PATH_ROLE)
+            open_here = Action(FluentIcon.FOLDER, "Open", self)
+            open_here.triggered.connect(lambda: self.go_to(key))
+            explorer = Action(FluentIcon.LINK, "Open in Explorer", self)
+            explorer.triggered.connect(lambda: self._open_in_explorer(key))
+            actions: list[Action | None] = [open_here, explorer]
+        else:
+            actions = self.menu_actions()
+        menu_at(self.results.viewport(), pos, actions)
 
-        self.runner.run(lambda: self.service.folder_files(key), found, self._failed)
+    def _failed(self, exc: Exception) -> None:
+        self.summary.setText(str(exc))
 
-    def _show_folder(self, folder: FolderInfo | None) -> None:
-        self._folder = folder
-        self.folder_box.setVisible(folder is not None)
-        if folder is not None:
-            self.folder_name.setText(folder.key.replace("/", " / "))
-            self.description.setText(folder.description)
+    # --- the details pane ---------------------------------------------------------------
+
+    def current_path(self) -> Path | None:
+        """The selected file."""
+        selected = self.selected_item()
+        return Path(selected[1]) if selected and selected[0] == FILE else None
+
+    def _selection_changed(self) -> None:
+        selected = self.selected_item()
+        if selected is not None and selected[0] == FOLDER:
+            self._show_folder_details(selected[1])
+            return
+        path = self.current_path()
+        if path is None:
+            kind, value = self.location
+            if kind == FOLDER:
+                self._show_folder_details(value)
+            else:
+                self._show_detail(None)
+            return
+        self.runner.run(
+            lambda: (
+                self.service.file_info(path),
+                self.service.related(path),
+                self.service.conversions(path),
+            ),
+            lambda result: self._show_detail(*result) if self.current_path() == path else None,
+            lambda exc: self.summary.setText(f"{path.name}: {exc}"),
+        )
+
+    def _show_folder_details(self, key: str) -> None:
+        self.file_box.setVisible(False)
+        self.folder_box.setVisible(True)
+        self._info = None
+        self._folder_key = key
+        self._folder = self._folders.get(key) if key else None
+        if not key:
+            name = self._shelf.root.name if self._shelf else "Your AutoShelf folder"
+            facts = (
+                "Your AutoShelf folder. New files arrive here and are sorted into the folders "
+                "inside it."
+            )
+        else:
+            name = _leaf(key)
+            files = self._folder.files if self._folder else 0
+            folders = self._items.get(key, 0) - files
+            where = f"In {self._place(_parent(key))} · "
+            facts = where + (
+                ", ".join(
+                    ([_count(folders, "folder")] if folders else []) + [_count(files, "file")]
+                )
+            )
+        self.folder_name.setText(name)
+        self.folder_facts.setText(facts)
+        has_description = bool(key)
+        for widget in (self.describe_label, self.description, self.describe_note):
+            widget.setVisible(has_description)
+        self.description.setText(self._folder.description if self._folder else "")
+        self.study_button.setVisible(self.ai_enabled and has_description)
 
     def _describe(self) -> None:
         folder = self._folder
@@ -338,6 +1006,7 @@ class LibraryView(QWidget):
             return
         key = folder.key
         self._folder = FolderInfo(key, folder.files, text)
+        self._folders[key] = self._folder
         self.runner.run(
             lambda: self.service.describe(key, text),
             lambda _: (self.saved.emit(f"Saved the description of {key}"), self.refresh()),
@@ -345,80 +1014,25 @@ class LibraryView(QWidget):
         )
 
     def _open_folder(self) -> None:
-        folder = self._folder
-        if folder is None:
-            return
-        self.runner.run(
-            self.service.root,
-            lambda root: root and open_folder(root.joinpath(*folder.key.split("/"))),
-        )
+        if self._folder_key is not None:
+            self._open_in_explorer(self._folder_key)
+
+    def _open_in_explorer(self, key: str) -> None:
+        if self._shelf is not None:
+            open_folder(self._shelf.root.joinpath(*key.split("/")) if key else self._shelf.root)
 
     def study_folder(self) -> None:
-        """Open study mode (reading list, flashcards) for the chosen folder."""
+        """Open study mode (reading list, flashcards) for the folder in the details pane."""
         from autoshelf.ui.study_dialog import StudyDialog
 
-        if self._folder is not None:
-            StudyDialog(self.service, self.runner, self._folder.key, self).exec()
-
-    def _tag_clicked(self, item: QListWidgetItem) -> None:
-        name = item.data(PATH_ROLE)
-        if not name:
-            return
-        self._search_number += 1
-        self._show_folder(None)
-
-        def found(paths: list[Path]) -> None:
-            self._show_rows([(path, path.parent.name, "") for path in paths])
-            self.summary.setText(f"Tagged {name!r}: {len(paths)} file(s)")
-
-        self.runner.run(lambda: self.service.tagged(name), found, self._failed)
-
-    def _failed(self, exc: Exception) -> None:
-        self.summary.setText(str(exc))
-
-    def _show_rows(self, rows: list[tuple[Path, str, str]]) -> None:
-        self._paths = [path for path, _, _ in rows]
-        self.results.clearSelection()  # so selecting row 0 below shows the new first file
-        self.results.setRowCount(len(rows))
-        for row, (path, folder, match) in enumerate(rows):
-            tip = plain_tooltip(f"{path}\n{match}" if match else str(path))
-            for column, text in enumerate((path.name, folder)):
-                item = QTableWidgetItem(text)
-                item.setData(PATH_ROLE, str(path))
-                item.setToolTip(tip)
-                self.results.setItem(row, column, item)
-        if rows:
-            self.results.selectRow(0)
-        else:
-            self._show_detail(None)
-
-    # --- the selected file ------------------------------------------------------------
-
-    def current_path(self) -> Path | None:
-        """The selected file."""
-        rows = self.results.selectionModel().selectedRows()
-        if not rows or rows[0].row() >= len(self._paths):
-            return None
-        return self._paths[rows[0].row()]
-
-    def _selected(self) -> None:
-        path = self.current_path()
-        if path is None:
-            self._show_detail(None)
-            return
-        self.runner.run(
-            lambda: (
-                self.service.file_info(path),
-                self.service.related(path),
-                self.service.conversions(path),
-            ),
-            lambda result: self._show_detail(*result),
-            lambda exc: self.summary.setText(f"{path.name}: {exc}"),
-        )
+        if self._folder_key:
+            StudyDialog(self.service, self.runner, self._folder_key, self).exec()
 
     def _show_detail(self, info: FileInfo | None, related=(), conversions=()) -> None:
+        self.folder_box.setVisible(False)
+        self.file_box.setVisible(True)
         self._info = info
-        self.detail.setEnabled(info is not None)
+        self.file_box.setEnabled(info is not None)
         self._fill_conversions(conversions)
         if info is None:
             self.name.setText("Select a file")
@@ -431,10 +1045,12 @@ class LibraryView(QWidget):
             return
         self.name.setText(info.path.name)
         modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
-        where = wording.place(info.folder or "(root)")
+        where = self._place(info.folder)
         title = f"<br>Title: {html.escape(info.title)}" if info.title else ""
+        kind = file_kind(info.path.name)[1]
         self.facts.setText(
-            f"In {html.escape(where)} &middot; {_size(info.size)} &middot; {modified}{title}"
+            f"{kind} &middot; {_size(info.size)}<br>In {html.escape(where)}"
+            f"<br>Modified {modified}{title}"
         )
         self.summary_text.setText(f"Summary: {info.summary}" if info.summary else "")
         self.summary_text.setVisible(bool(info.summary))
@@ -443,7 +1059,7 @@ class LibraryView(QWidget):
         self._show_suggestions(info.tag_suggestions)
         self.related.clear()
         for item in related:
-            entry = QListWidgetItem(f"{item.path.name}  ({item.folder})")
+            entry = QListWidgetItem(f"{item.path.name}  ({wording.place(item.folder)})")
             entry.setData(PATH_ROLE, str(item.path))
             entry.setToolTip(f"{item.path}\nsimilarity {item.similarity:.2f}")
             self.related.addItem(entry)
@@ -458,28 +1074,26 @@ class LibraryView(QWidget):
 
     def compress_file(self) -> None:
         """Make a smaller copy or a ZIP of the selected file, next to it (in the background)."""
-        info = self._info
-        if info is not None:
-            self._make(lambda: [self.service.compress([info.path])])
+        path = self.current_path()
+        if path is not None:
+            self._make(lambda: [self.service.compress([path])])
 
     def convert_file(self, to: str) -> None:
         """Make a copy of the selected file in format ``to``, next to it."""
-        info = self._info
-        if info is not None:
-            self._make(lambda: self.service.convert([info.path], to))
+        path = self.current_path()
+        if path is not None:
+            self._make(lambda: self.service.convert([path], to))
 
     def _make(self, work) -> None:
         self.summary.setText("Making the new file...")
 
         def done(created) -> None:
             names = ", ".join(item.dst.name for item in created)
-            self.summary.setText(f"Made {names} next to the original (undo in History).")
+            note = f"Made {names} next to the original (undo in History)."
+            self.summary.setText(note)
             self.changed.emit(f"Made {names}")
             if created:
-                folder = self._info.folder if self._info else ""
-                self._show_rows(
-                    [(item.dst, wording.place(folder or "(root)"), "") for item in created]
-                )
+                self.show_file(created[-1].dst, note)
 
         def failed(exc: Exception) -> None:
             self.summary.setText(str(exc))
@@ -490,7 +1104,7 @@ class LibraryView(QWidget):
     def set_ai_enabled(self, enabled: bool) -> None:
         """Offer the AI features (summaries, study mode) only when an AI provider is on."""
         self.ai_enabled = enabled
-        self.study_button.setVisible(enabled)
+        self.study_button.setVisible(enabled and bool(self._folder_key))
 
     def summarize(self) -> None:
         """Ask the AI for a summary of the selected file (cached afterwards)."""
@@ -507,31 +1121,32 @@ class LibraryView(QWidget):
 
     def rename_file(self) -> None:
         """Propose a better name (title, heading, or the AI when on); rename if approved."""
-        info = self._info
-        if info is None:
+        path = self.current_path()
+        if path is None:
             return
         use_ai = self.ai_enabled
 
         def ask(proposal) -> None:
-            current = proposal.new_name if proposal else info.path.name
+            current = proposal.new_name if proposal else path.name
             source = f" (from its {proposal.source})" if proposal else ""
             name, ok = QInputDialog.getText(
-                self, "Rename", f"New name for {info.path.name}{source}:", text=current
+                self, "Rename", f"New name for {path.name}{source}:", text=current
             )
-            if ok and name.strip() and name.strip() != info.path.name:
+            if ok and name.strip() and name.strip() != path.name:
                 self.runner.run(
-                    lambda: self.service.rename(info.path, name.strip()),
-                    lambda result: (
-                        self.changed.emit(f"Renamed to {result.dst.name} (undo in History)"),
-                        self._show_rows([(result.dst, wording.place(info.folder or "(root)"), "")]),
-                    ),
+                    lambda: self.service.rename(path, name.strip()),
+                    renamed,
                     lambda exc: QMessageBox.warning(self, "Couldn't rename", str(exc)),
                 )
 
-        def failed(exc: Exception) -> None:
-            ask(None)
+        def renamed(result) -> None:
+            note = f"Renamed to {result.dst.name} (undo in History)"
+            self.changed.emit(note)
+            self.show_file(result.dst, note)
 
-        self.runner.run(lambda: self.service.propose_name(info.path, use_ai=use_ai), ask, failed)
+        self.runner.run(
+            lambda: self.service.propose_name(path, use_ai=use_ai), ask, lambda exc: ask(None)
+        )
 
     def _show_suggestions(self, names: list[str]) -> None:
         for button in self.suggested_buttons:
@@ -554,7 +1169,7 @@ class LibraryView(QWidget):
         def done(added: list[str]) -> None:
             self.changed.emit(f"Tagged {info.path.name}: {', '.join(added)}" if added else "")
             self.refresh()
-            self._selected()
+            self._selection_changed()
 
         self.runner.run(
             lambda: self.service.tag(info.path, names),
@@ -578,7 +1193,7 @@ class LibraryView(QWidget):
         def done(_) -> None:
             self.changed.emit(f"Removed the tag {name!r} from {info.path.name}")
             self.refresh()
-            self._selected()
+            self._selection_changed()
 
         self.runner.run(lambda: self.service.untag(info.path, name), done)
 
@@ -595,6 +1210,5 @@ class LibraryView(QWidget):
             show_in_explorer(path)
 
     def _open_related(self, item: QListWidgetItem) -> None:
-        path = Path(item.data(PATH_ROLE))
-        self._show_rows([(path, path.parent.name, "")])
-        self.summary.setText(f"Related to {self._info.path.name if self._info else ''}")
+        name = self._info.path.name if self._info else ""
+        self.show_file(Path(item.data(PATH_ROLE)), f"Related to {name}" if name else "")

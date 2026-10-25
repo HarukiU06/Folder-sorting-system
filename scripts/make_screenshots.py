@@ -179,11 +179,12 @@ def main() -> int:
 
         shoot("inbox", window.inbox)
 
-        def search() -> None:
-            window.library.query.setText("how to choose the number of clusters")
-            window.library.search()
+        def browse() -> None:
+            folder = root / "Machine Learning" / "Unsupervised"
+            window.library.go_to("Machine Learning/Unsupervised")
+            window.library.select("file", str(folder / "clustering notes.md"))
 
-        shoot("library", window.library, search)
+        shoot("library", window.library, browse)
 
         def select_auto() -> None:
             history = window.history

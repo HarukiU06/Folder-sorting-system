@@ -254,19 +254,69 @@ def test_library_lists_folders_and_saves_descriptions(qtbot, service, runner) ->
     view.refresh()
     settle(qtbot, runner)
 
-    names = [view.folder_list.item(i).text() for i in range(view.folder_list.count())]
-    assert names[0] == "Finance  (1)" and names[1].startswith("Recipes  (")
-    view._folder_clicked(view.folder_list.item(0))
+    assert view.tree_children("") == ["Finance", "Recipes"]
+    assert view.row_names() == ["Finance", "Recipes"]  # your AutoShelf folder opens first
+    assert view.folder_box.isVisibleTo(view)  # nothing selected: the open folder's details
+    view.go_to("Finance")
     settle(qtbot, runner)
-    assert view.folder_box.isVisibleTo(view)
-    assert view.results.rowCount() == 1
-    assert view.results.item(0, 0).text() == "invoice 2024.txt"
-    view._folder_clicked(view.folder_list.item(1))
+    assert view.row_names() == ["invoice 2024.txt"]
+    assert view.folder_name.text() == "Finance"
+    view.go_to("Recipes")
     settle(qtbot, runner)
     with qtbot.waitSignal(view.saved, timeout=WAIT_MS):
         view.description.setText("cakes and bread")
         view.description.editingFinished.emit()
     assert {f.key: f.description for f in service.folders()}["Recipes"] == "cakes and bread"
+
+
+def test_library_browses_like_explorer(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.library_view import FOLDER, ROOT, SIZE, WHERE, LibraryView
+
+    make(shelf / "Finance" / "Taxes" / "2024" / "return.txt", "tax return")
+    make(shelf / "Finance" / "bank.txt", "bank statement")
+    make(shelf / "loose.txt", "waiting to be sorted")  # not in a folder: not listed
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+
+    assert view.tree_children("Finance") == ["Finance/Taxes"]
+    assert view.tree_children("Finance/Taxes") == ["Finance/Taxes/2024"]
+    assert "loose.txt" not in view.row_names()
+    assert not view.up_button.isEnabled() and not view.back_button.isEnabled()
+
+    view.select(FOLDER, "Finance")
+    view.open_selected()  # double-click or Enter on a folder opens it here
+    assert view.location == (FOLDER, "Finance")
+    assert view.row_names() == ["Taxes", "bank.txt", "invoice 2024.txt"]  # folders first
+    assert view.results.item(0, SIZE).text() == "1 item"
+    assert view.results.isColumnHidden(WHERE)  # no Folder column inside a folder
+    view.go_to("Finance/Taxes/2024")
+    assert view.tree.currentItem().text(0) == "2024"  # the tree follows
+    crumbs = [view.path_bar.itemAt(i).text for i in range(view.path_bar.count())]
+    assert crumbs == [shelf.name, "Finance", "Taxes", "2024"]
+
+    view.path_bar.setCurrentIndex(1)  # click "Finance" in the path
+    assert view.location == (FOLDER, "Finance")
+    view.go_up()
+    assert view.location == ROOT
+    view.go_back()
+    assert view.location == (FOLDER, "Finance")
+    view.go_forward()
+    assert view.location == ROOT
+
+    view.results.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+    view.go_to("Finance")
+    view.results.sortByColumn(SIZE, Qt.SortOrder.AscendingOrder)  # by size: sizes, not text
+    assert view.row_names()[0] == "Taxes"  # folders stay together
+
+    view.query.setText("tax")
+    view.search()
+    settle(qtbot, runner)
+    assert view.row_names()[0] == "Taxes"  # matching folders first
+    assert not view.results.isColumnHidden(WHERE)
+    view._search_cleared()
+    assert view.location == (FOLDER, "Finance")
 
 
 # --- Settings -------------------------------------------------------------------------------
@@ -850,13 +900,13 @@ def test_library_searches_and_tags(qtbot, service, runner, shelf: Path) -> None:
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert [view.file_tags.item(i).text() for i in range(view.file_tags.count())] == ["Taxes 2024"]
-    assert view.tag_list.item(0).text() == "Taxes 2024  (1)"
+    assert view.tag_names() == ["Taxes 2024"]
 
-    view.results.setRowCount(0)
-    view._tag_clicked(view.tag_list.item(0))
+    view.show_tag("Taxes 2024")
     settle(qtbot, runner)
+    assert view.row_names() == ["invoice 2024.txt"]
+    view.results.selectRow(0)
     settle(qtbot, runner)
-    assert view.results.rowCount() == 1
     view.file_tags.setCurrentRow(0)
     view._remove_tag()
     settle(qtbot, runner)

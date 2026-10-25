@@ -897,7 +897,6 @@ def test_main_window_has_every_screen(qtbot, service, runner) -> None:
         "Inbox",
         "Library",
         "History",
-        "Rules",
         "More tools",
         "Settings",
     ]

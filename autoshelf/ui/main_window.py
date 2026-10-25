@@ -12,7 +12,6 @@ from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
 from autoshelf.ui.library_view import LibraryView
-from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.style import apply_theme
 from autoshelf.ui.tasks import TaskRunner
@@ -38,11 +37,11 @@ class MainWindow(QMainWindow):
         self.inbox = InboxView(service, runner)
         self.library = LibraryView(service, runner)
         self.history = HistoryView(service, runner)
-        self.rules = RulesView(service, runner)
         self.tools = ToolsView(service, runner)
         self.dashboard = self.tools.dashboard
         self.ask = AskView(service, runner)
         self.settings = SettingsView(service, runner)
+        self.rules = self.settings.rules  # Rules live in Settings
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -64,7 +63,6 @@ class MainWindow(QMainWindow):
         self._add(self.inbox, "inbox", FluentIcon.MAIL, "Inbox", top)
         self._add(self.library, "library", FluentIcon.LIBRARY, "Library", top)
         self._add(self.history, "history", FluentIcon.HISTORY, "History", top)
-        self._add(self.rules, "rules", FluentIcon.EDIT, "Rules", top)
         self._add(self.ask, "ask", FluentIcon.CHAT, "Ask", top)
         self._add(self.tools, "tools", FluentIcon.APPLICATION, "More tools", bottom)
         self._add(self.settings, "settings", FluentIcon.SETTING, "Settings", bottom)
@@ -138,6 +136,8 @@ class MainWindow(QMainWindow):
 
     def show_tab(self, widget) -> None:
         """Switch to one of the pages, or to one of the tools under More tools."""
+        if widget is self.rules:
+            widget = self.settings
         if widget in self.tools.tools:
             self.tools.open(widget)
             widget = self.tools
@@ -189,12 +189,11 @@ class MainWindow(QMainWindow):
             self.history.refresh()
         elif widget is self.library:
             self.library.refresh()
-        elif widget is self.rules:
-            self.rules.refresh()
         elif widget is self.tools:
             self.tools.refresh()
         elif widget is self.settings:
             self.settings.load()
+            self.rules.refresh()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.keep_running_on_close:

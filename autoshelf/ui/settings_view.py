@@ -5,24 +5,30 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
     QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QScrollArea,
-    QSlider,
     QVBoxLayout,
     QWidget,
+)
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    DoubleSpinBox,
+    LineEdit,
+    ListWidget,
+    PasswordLineEdit,
+    PlainTextEdit,
+    PrimaryPushButton,
+    PushButton,
+    ScrollArea,
+    SimpleCardWidget,
+    Slider,
+    StrongBodyLabel,
+    SwitchButton,
+    TitleLabel,
 )
 
 from autoshelf import llm, wording
@@ -31,19 +37,28 @@ from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
 from autoshelf.llm import claude as claude_provider
 from autoshelf.ml import calibrate as calibration
+from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import open_folder, plain_label, plain_tooltip
+from autoshelf.ui.widgets import open_folder, plain, plain_tooltip
 
 DEFAULT_LEVEL = 2  # "Balanced"
+LEVEL_WORDS = (
+    "almost every file waits in the Inbox for you",
+    "moves a file on its own only when it is very sure",
+    "moves a file on its own when one folder is a clear match",
+    "asks you less often",
+    "asks only when two folders are about equally good",
+)
+SHOW_ADVANCED = "Show advanced settings"
+HIDE_ADVANCED = "Hide advanced settings"
 
 
 def describe_level(index: int) -> str:
     """Text under the slider for a preset."""
     level = CONFIDENCE_LEVELS[index]
     return (
-        f"{level.name}: a file is moved on its own only if its best folder scores at least "
-        f"{level.threshold:.2f} and beats every other folder by {level.margin:.2f}. "
-        "Everything else waits in the Inbox."
+        f"{level.name}: {LEVEL_WORDS[index]}. (It moves a file when its best folder scores "
+        f"at least {level.threshold:.2f} and beats the others by {level.margin:.2f}.)"
     )
 
 
@@ -53,6 +68,52 @@ def nearest_level(threshold: float) -> int:
         range(len(CONFIDENCE_LEVELS)),
         key=lambda i: abs(CONFIDENCE_LEVELS[i].threshold - threshold),
     )
+
+
+def setting_row(title: str, note: str = "", *controls: QWidget) -> QWidget:
+    """One line of a settings card: what it is (and a note) on the left, controls right."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(16, 10, 16, 10)
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    if title:
+        label = BodyLabel(title)
+        label.setWordWrap(True)
+        text.addWidget(label)
+    if note:
+        caption = CaptionLabel(note)
+        caption.setWordWrap(True)
+        text.addWidget(caption)
+    layout.addLayout(text, 1)
+    for control in controls:
+        layout.addWidget(control)
+    return row
+
+
+def setting_group(title: str, *rows: QWidget) -> QWidget:
+    """A titled card of setting rows."""
+    group = QWidget()
+    layout = QVBoxLayout(group)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(StrongBodyLabel(title))
+    card = SimpleCardWidget()
+    card_layout = QVBoxLayout(card)
+    card_layout.setContentsMargins(0, 4, 0, 4)
+    card_layout.setSpacing(0)
+    for row in rows:
+        card_layout.addWidget(row)
+    layout.addWidget(card)
+    return group
+
+
+def switch() -> SwitchButton:
+    """An on/off switch for a settings row."""
+    button = SwitchButton()
+    button.setOnText("On")
+    button.setOffText("Off")
+    return button
 
 
 class SettingsView(QWidget):
@@ -72,201 +133,284 @@ class SettingsView(QWidget):
         self.runner = runner
         self._settings: Settings | None = None
         self._load_number = 0  # results of older loads are ignored
+        self._recommended: int | None = None
 
-        # Library folder
-        self.root = QLineEdit()
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content.setStyleSheet("QWidget#settingsContent{background: transparent}")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 20, 28, 28)
+        layout.setSpacing(20)
+        layout.addWidget(TitleLabel("Settings"))
+        layout.addWidget(self._folder_group())
+        layout.addWidget(self._sorting_group())
+        layout.addWidget(self._skipped_group())
+        layout.addWidget(self._notifications_group())
+        layout.addWidget(self._windows_group())
+        self.rules = RulesView(service, runner)
+        self.rules.setMinimumHeight(420)
+        rules_group = QWidget()
+        rules_layout = QVBoxLayout(rules_group)
+        rules_layout.setContentsMargins(0, 0, 0, 0)
+        rules_layout.addWidget(StrongBodyLabel("Rules"))
+        rules_layout.addWidget(self.rules)
+        layout.addWidget(rules_group)
+        self.advanced_button = PushButton(SHOW_ADVANCED)
+        self.advanced_button.clicked.connect(self._toggle_advanced)
+        layout.addWidget(self.advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced = self._advanced_settings()
+        self.advanced.setVisible(False)
+        layout.addWidget(self.advanced)
+        layout.addStretch(1)
+
+        scroll = ScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{background: transparent; border: none}")
+        scroll.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    # --- the groups -------------------------------------------------------------------
+
+    def _folder_group(self) -> QWidget:
+        self.root = LineEdit()
         self.root.setReadOnly(True)
         self.root.setPlaceholderText("Not chosen yet")
-        change = QPushButton("Change...")
+        self.root.setMinimumWidth(320)
+        change = PushButton("Change…")
         change.clicked.connect(self.change_root_requested)
-        open_root = QPushButton("Open")
+        open_root = PushButton("Open")
         open_root.clicked.connect(self._open_root)
-        root_row = QHBoxLayout()
-        root_row.addWidget(self.root, 1)
-        root_row.addWidget(change)
-        root_row.addWidget(open_root)
-        root_box = QGroupBox("Folder to sort")
-        root_layout = QVBoxLayout(root_box)
-        root_layout.addLayout(root_row)
-        note = QLabel(
-            "Pick the folder you keep your sorted files in, for example one inside iCloud "
-            "Drive. New files dropped into it (or into its _Inbox) are sorted into your own "
-            f"subfolders. AutoShelf's own data stays in {service.paths.home}."
+        return setting_group(
+            "Your AutoShelf folder",
+            setting_row(
+                "The folder AutoShelf sorts",
+                "New files dropped into it, or into its _Inbox, are sorted into your own "
+                f"folders. AutoShelf's own data stays in {self.service.paths.home}.",
+                self.root,
+                change,
+                open_root,
+            ),
         )
-        note.setWordWrap(True)
-        root_layout.addWidget(note)
 
-        # Sorting
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+    def _sorting_group(self) -> QWidget:
+        self.slider = Slider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, len(CONFIDENCE_LEVELS) - 1)
-        self.slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.slider.setPageStep(1)
+        self.slider.setMinimumWidth(260)
         self.slider.valueChanged.connect(self._level_changed)
-        self.level_text = QLabel()
+        self.level_text = CaptionLabel()
         self.level_text.setWordWrap(True)
-        slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel("Cautious"))
-        slider_row.addWidget(self.slider, 1)
-        slider_row.addWidget(QLabel("Automatic"))
-        self.paused = QCheckBox("Pause automatic sorting (new files wait until you resume)")
-        self.paused.toggled.connect(self._paused_changed)
-        self.notifications = QCheckBox("Notify me when a file needs my decision")
-        self.notifications.toggled.connect(self._notifications_changed)
-        self.weekly = QCheckBox(
-            "Once a week, tell me what AutoShelf did (sorted, waiting, learned)"
-        )
-        self.weekly.toggled.connect(lambda on: self._update(None, False, weekly_digest=on))
-        self.startup = QCheckBox("Start AutoShelf when I sign in to Windows (in the tray)")
-        self.startup.toggled.connect(self._startup_changed)
-        self.explorer_menu = QCheckBox(
-            "Add AutoShelf to Explorer's right-click menu (on Windows 11: under "
-            "\u201cShow more options\u201d)"
-        )
-        self.explorer_menu.setToolTip(
-            "Sort with AutoShelf, Why is this here?, Compress, and Convert for the file "
-            "types AutoShelf can convert"
-        )
-        self.explorer_menu.toggled.connect(self._explorer_menu_changed)
-        self.buttons = QCheckBox(
-            "Buttons in notifications: put a file away without opening AutoShelf"
-        )
-        self.buttons.setToolTip(
-            "Registers AutoShelf with Windows for its notifications (the installer does this "
-            "too). Without it, a notification opens the Inbox when you click it."
-        )
-        self.buttons.toggled.connect(self._buttons_changed)
-        self.calibrate_button = QPushButton("How well would AutoShelf sort my library?")
+        slider_row = QWidget()
+        slider_layout = QVBoxLayout(slider_row)
+        slider_layout.setContentsMargins(16, 10, 16, 10)
+        line = QHBoxLayout()
+        line.addWidget(BodyLabel("How automatic"), 1)
+        line.addWidget(CaptionLabel("Cautious"))
+        line.addWidget(self.slider, 2)
+        line.addWidget(CaptionLabel("Automatic"))
+        slider_layout.addLayout(line)
+        slider_layout.addWidget(self.level_text)
+
+        self.calibrate_button = PushButton("Test it")
         self.calibrate_button.setToolTip(
             "Sorts every file in your folders as if it had just arrived and compares the "
             "result with where it is. Nothing is moved."
         )
         self.calibrate_button.clicked.connect(self.calibrate)
-        self.use_recommended = QPushButton("Use the recommended setting")
+        self.use_recommended = PrimaryPushButton("Use the recommended setting")
         self.use_recommended.clicked.connect(self._use_recommended)
         self.use_recommended.setVisible(False)
-        self.calibration_text = plain_label()
+        self.calibration_text = plain(CaptionLabel())
         self.calibration_text.setWordWrap(True)
         self.calibration_text.setVisible(False)
         self.calibration_progress.connect(self._show_calibration_progress)
-        self._recommended: int | None = None
-        calibrate_row = QHBoxLayout()
-        calibrate_row.addWidget(self.calibrate_button)
-        calibrate_row.addWidget(self.use_recommended)
-        calibrate_row.addStretch(1)
-        sorting_box = QGroupBox("Sorting")
-        sorting = QVBoxLayout(sorting_box)
-        sorting.addLayout(slider_row)
-        sorting.addWidget(self.level_text)
-        sorting.addLayout(calibrate_row)
-        sorting.addWidget(self.calibration_text)
-        sorting.addWidget(self.paused)
-        sorting.addWidget(self.notifications)
-        sorting.addWidget(self.weekly)
-        sorting.addWidget(self.startup)
-        sorting.addWidget(self.explorer_menu)
-        sorting.addWidget(self.buttons)
+        calibrate_row = setting_row(
+            "How well would AutoShelf sort my library?",
+            "Sorts your files as if they were new and compares; nothing moves",
+            self.use_recommended,
+            self.calibrate_button,
+        )
+        calibration_box = QWidget()
+        calibration_layout = QVBoxLayout(calibration_box)
+        calibration_layout.setContentsMargins(16, 0, 16, 10)
+        calibration_layout.addWidget(self.calibration_text)
 
-        # Files
-        self.stable = QDoubleSpinBox()
+        self.paused = switch()
+        self.paused.checkedChanged.connect(self._paused_changed)
+        return setting_group(
+            "Sorting",
+            slider_row,
+            calibrate_row,
+            calibration_box,
+            setting_row("Pause sorting", "New files wait until you turn this off", self.paused),
+        )
+
+    def _skipped_group(self) -> QWidget:
+        self.skipped = ListWidget()
+        self.skipped.setMaximumHeight(90)
+        self.skipped.setSelectionMode(ListWidget.SelectionMode.ExtendedSelection)
+        read_selected = PushButton("Read selected again")
+        read_selected.clicked.connect(self.clear_selected_skipped)
+        read_all = PushButton("Read all again")
+        read_all.clicked.connect(self.clear_all_skipped)
+        buttons = QVBoxLayout()
+        buttons.addWidget(read_selected)
+        buttons.addWidget(read_all)
+        buttons.addStretch(1)
+        list_row = QWidget()
+        list_layout = QHBoxLayout(list_row)
+        list_layout.setContentsMargins(16, 0, 16, 10)
+        list_layout.addWidget(self.skipped, 1)
+        list_layout.addLayout(buttons)
+        self.skipped_box = setting_group(
+            "Files sorted by name only",
+            setting_row(
+                "AutoShelf stopped while reading these files",
+                "So it sorts them by their names only, to avoid stopping again. A power cut "
+                "or a forced restart looks the same as a crash: if that is what happened, "
+                "read them again.",
+            ),
+            list_row,
+        )
+        self.skipped_box.setVisible(False)  # shown when there are any
+        return self.skipped_box
+
+    def _notifications_group(self) -> QWidget:
+        self.notifications = switch()
+        self.notifications.checkedChanged.connect(self._notifications_changed)
+        self.buttons = switch()
+        self.buttons.setToolTip(
+            "Registers AutoShelf with Windows for its notifications (the installer does this "
+            "too). Without it, a notification opens the Inbox when you click it."
+        )
+        self.buttons.checkedChanged.connect(self._buttons_changed)
+        self.weekly = switch()
+        self.weekly.checkedChanged.connect(lambda on: self._update(None, False, weekly_digest=on))
+        return setting_group(
+            "Notifications",
+            setting_row("Ask me when a file needs a decision", "", self.notifications),
+            setting_row(
+                "Folder buttons in the notification",
+                "Put a file away without opening AutoShelf",
+                self.buttons,
+            ),
+            setting_row(
+                "A short summary once a week",
+                "How many files were sorted, are waiting, and what AutoShelf learned",
+                self.weekly,
+            ),
+        )
+
+    def _windows_group(self) -> QWidget:
+        self.startup = switch()
+        self.startup.checkedChanged.connect(self._startup_changed)
+        self.explorer_menu = switch()
+        self.explorer_menu.setToolTip(
+            "Sort with AutoShelf, Why is this here?, Compress, and Convert for the file "
+            "types AutoShelf can convert"
+        )
+        self.explorer_menu.checkedChanged.connect(self._explorer_menu_changed)
+        return setting_group(
+            "Windows",
+            setting_row("Start AutoShelf when I sign in", "It starts in the tray", self.startup),
+            setting_row(
+                "AutoShelf in Explorer's right-click menu",
+                "Sort, Why is this here?, Compress and Convert (on Windows 11: under "
+                "\u201cShow more options\u201d)",
+                self.explorer_menu,
+            ),
+        )
+
+    def _advanced_settings(self) -> QWidget:
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(20)
+        layout.addWidget(self._files_group())
+        layout.addWidget(self._watched_group())
+        layout.addWidget(self._ai_group())
+        self.model = CaptionLabel()
+        self.model.setWordWrap(True)
+        self.model.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.model)
+        return box
+
+    def _files_group(self) -> QWidget:
+        self.stable = DoubleSpinBox()
         self.stable.setRange(1.0, 120.0)
         self.stable.setDecimals(0)
         self.stable.setSuffix(" s")
-        self.stable.setMaximumWidth(110)
-        self.sweep = QDoubleSpinBox()
+        self.sweep = DoubleSpinBox()
         self.sweep.setRange(0.0, 120.0)
         self.sweep.setDecimals(0)
         self.sweep.setSuffix(" min")
         self.sweep.setSpecialValueText("never")
-        self.sweep.setMaximumWidth(110)
         self.sweep.setToolTip(
             "Windows can miss new files in busy iCloud folders. AutoShelf looks at the "
             "folder again this often, so no file stays unsorted until the next start."
         )
-        self.patterns = QPlainTextEdit()
+        self.patterns = PlainTextEdit()
         self.patterns.setPlaceholderText("One pattern per line, e.g. *.tmp")
-        self.patterns.setMaximumHeight(110)
-        apply = QPushButton("Apply")
+        self.patterns.setFixedHeight(110)
+        self.patterns.setMinimumWidth(260)
+        apply = PushButton("Apply")
         apply.clicked.connect(self._apply_files)
-        files_box = QGroupBox("New files")
-        files = QFormLayout(files_box)
-        files.addRow("Wait until a file is unchanged for", self.stable)
-        files.addRow("Look for missed files every", self.sweep)
-        self.sort_created = QCheckBox(
-            "Sort compressed and converted copies like new files (when they land in the "
-            "root or the Inbox)"
-        )
-        self.sort_created.toggled.connect(
+        self.sort_created = switch()
+        self.sort_created.checkedChanged.connect(
             lambda checked: self._update(None, False, sort_created_files=checked)
         )
-        files.addRow("", self.sort_created)
-        files.addRow("Ignore files named like", self.patterns)
-        apply_row = QHBoxLayout()
-        apply_row.addStretch(1)
-        apply_row.addWidget(apply)
-        files.addRow("", apply_row)
-
-        # Files that stopped AutoShelf while it read them
-        self.skipped = QListWidget()
-        self.skipped.setMaximumHeight(80)
-        self.skipped.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        read_selected = QPushButton("Read selected again")
-        read_selected.clicked.connect(self.clear_selected_skipped)
-        read_all = QPushButton("Read all again")
-        read_all.clicked.connect(self.clear_all_skipped)
-        skipped_buttons = QVBoxLayout()
-        skipped_buttons.addWidget(read_selected)
-        skipped_buttons.addWidget(read_all)
-        skipped_buttons.addStretch(1)
-        skipped_row = QHBoxLayout()
-        skipped_row.addWidget(self.skipped, 1)
-        skipped_row.addLayout(skipped_buttons)
-        skipped_note = QLabel(
-            "AutoShelf stopped while reading these files, so it sorts them by their names "
-            "only, to avoid stopping again. A power cut or a forced restart looks the same "
-            "as a crash: if that is what happened, read them again."
+        return setting_group(
+            "New files",
+            setting_row("Wait until a new file stops changing", "", self.stable),
+            setting_row("Look for files Windows missed, every", "0: never", self.sweep),
+            setting_row(
+                "Ignore files named like",
+                "One pattern per line. Temporary and partial files are always ignored.",
+                self.patterns,
+            ),
+            setting_row("", "Saves the three settings above", apply),
+            setting_row(
+                "Sort compressed and converted copies like new files",
+                "When they land in your AutoShelf folder or its Inbox",
+                self.sort_created,
+            ),
         )
-        skipped_note.setWordWrap(True)
-        self.skipped_box = QGroupBox("Files sorted by name only")
-        skipped_layout = QVBoxLayout(self.skipped_box)
-        skipped_layout.addWidget(skipped_note)
-        skipped_layout.addLayout(skipped_row)
-        self.skipped_box.setVisible(False)  # shown when there are any
 
-        # Watched folders
-        self.watched = QListWidget()
-        self.watched.setMaximumHeight(70)
-        add_watched = QPushButton("Add folder...")
+    def _watched_group(self) -> QWidget:
+        self.watched = ListWidget()
+        self.watched.setFixedHeight(80)
+        self.watched.setMinimumWidth(260)
+        add_watched = PushButton("Add folder…")
         add_watched.clicked.connect(self.add_watched)
-        remove_watched = QPushButton("Remove")
+        remove_watched = PushButton("Remove")
         remove_watched.clicked.connect(self.remove_watched)
-        self.extensions = QLineEdit()
+        self.extensions = LineEdit()
         self.extensions.setPlaceholderText(".pdf, .docx")
-        save_extensions = QPushButton("Apply")
+        self.extensions.setMinimumWidth(260)
+        save_extensions = PushButton("Apply")
         save_extensions.clicked.connect(self._apply_extensions)
-        watched_buttons = QVBoxLayout()
-        watched_buttons.addWidget(add_watched)
-        watched_buttons.addWidget(remove_watched)
-        watched_buttons.addStretch(1)
-        watched_row = QHBoxLayout()
-        watched_row.addWidget(self.watched, 1)
-        watched_row.addLayout(watched_buttons)
-        extensions_row = QHBoxLayout()
-        extensions_row.addWidget(QLabel("Take files ending in"))
-        extensions_row.addWidget(self.extensions, 1)
-        extensions_row.addWidget(save_extensions)
-        watched_note = QLabel(
-            "Optional. New files that arrive in these folders (e.g. Downloads) with these "
-            "extensions are moved into your library and sorted; undo puts them back. Files "
-            "already there, and subfolders, are left alone."
+        buttons = QWidget()
+        buttons_layout = QVBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addWidget(add_watched)
+        buttons_layout.addWidget(remove_watched)
+        return setting_group(
+            "Take new files from other folders",
+            setting_row(
+                "Folders to watch",
+                "For example Downloads. New files with these extensions are moved into your "
+                "library and sorted; undo puts them back. Files already there, and "
+                "subfolders, are left alone.",
+                self.watched,
+                buttons,
+            ),
+            setting_row("Take files ending in", "", self.extensions, save_extensions),
         )
-        watched_note.setWordWrap(True)
-        watched_box = QGroupBox("Watch other folders")
-        watched_layout = QVBoxLayout(watched_box)
-        watched_layout.addWidget(watched_note)
-        watched_layout.addLayout(watched_row)
-        watched_layout.addLayout(extensions_row)
 
-        # Optional AI
+    def _ai_group(self) -> QWidget:
         self.ai_provider = QComboBox()
         for key, name in llm.PROVIDER_NAMES.items():
             self.ai_provider.addItem(name, key)
@@ -281,65 +425,48 @@ class SettingsView(QWidget):
             "Many small requests: the cheapest model is the default. Choose a bigger one "
             "for better summaries, names and flashcards."
         )
-        self.api_key = QLineEdit()
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key = PasswordLineEdit()
         self.api_key.setPlaceholderText("Paste your Claude API key")
-        self.key_status = QLabel()
-        save_key = QPushButton("Save key")
+        self.api_key.setMinimumWidth(260)
+        self.key_status = CaptionLabel()
+        save_key = PushButton("Save key")
         save_key.clicked.connect(self._save_key)
-        forget_key = QPushButton("Forget key")
+        forget_key = PushButton("Forget key")
         forget_key.clicked.connect(self._forget_key)
-        key_row = QHBoxLayout()
-        key_row.addWidget(self.api_key, 1)
-        key_row.addWidget(save_key)
-        key_row.addWidget(forget_key)
-        self.ollama_url = QLineEdit()
-        apply_ai = QPushButton("Apply")
+        self.ollama_url = LineEdit()
+        self.ollama_url.setMinimumWidth(260)
+        apply_ai = PrimaryPushButton("Apply")
         apply_ai.clicked.connect(self._apply_ai)
-        test_ai = QPushButton("Test")
+        test_ai = PushButton("Test")
         test_ai.clicked.connect(self.test_ai)
-        ai_buttons = QHBoxLayout()
-        self.ai_result = plain_label()
+        self.ai_result = plain(CaptionLabel())
         self.ai_result.setWordWrap(True)
-        ai_buttons.addWidget(self.ai_result, 1)
-        ai_buttons.addWidget(test_ai)
-        ai_buttons.addWidget(apply_ai)
-        privacy = QLabel(llm.PRIVACY_NOTE)
-        privacy.setWordWrap(True)
-        privacy.setStyleSheet("color: palette(placeholder-text);")
-        ai_box = QGroupBox("AI (optional)")
-        ai_form = QFormLayout(ai_box)
-        ai_form.addRow("Provider", self.ai_provider)
-        ai_form.addRow("Model for questions", self.ai_model)
-        ai_form.addRow(f"Model for {llm.BULK_TASKS}", self.ai_bulk_model)
-        ai_form.addRow("Claude API key", key_row)
-        ai_form.addRow("", self.key_status)
-        ai_form.addRow("Ollama address", self.ollama_url)
-        ai_form.addRow(privacy)
-        ai_form.addRow(ai_buttons)
+        result_row = QWidget()
+        result_layout = QHBoxLayout(result_row)
+        result_layout.setContentsMargins(16, 10, 16, 10)
+        result_layout.addWidget(self.ai_result, 1)
+        result_layout.addWidget(test_ai)
+        result_layout.addWidget(apply_ai)
+        return setting_group(
+            "AI (optional)",
+            setting_row(
+                "Provider",
+                "Summaries, answers from your files, study tools. Sorting never uses it. "
+                + llm.PRIVACY_NOTE,
+                self.ai_provider,
+            ),
+            setting_row("Model for questions", "", self.ai_model),
+            setting_row(f"Model for {llm.BULK_TASKS}", "", self.ai_bulk_model),
+            setting_row("Claude API key", "", self.api_key, save_key, forget_key),
+            setting_row("", "", self.key_status),
+            setting_row("Ollama address", "", self.ollama_url),
+            result_row,
+        )
 
-        self.model = QLabel()
-        self.model.setWordWrap(True)
-        self.model.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.addWidget(root_box)
-        layout.addWidget(sorting_box)
-        layout.addWidget(files_box)
-        layout.addWidget(self.skipped_box)
-        layout.addWidget(watched_box)
-        layout.addWidget(ai_box)
-        layout.addWidget(self.model)
-        layout.addStretch(1)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+    def _toggle_advanced(self) -> None:
+        shown = not self.advanced.isVisible()
+        self.advanced.setVisible(shown)
+        self.advanced_button.setText(HIDE_ADVANCED if shown else SHOW_ADVANCED)
 
     # --- loading ------------------------------------------------------------------
 

@@ -193,7 +193,6 @@ def main() -> int:
                     break
 
         shoot("history", window.history, select_auto)
-        shoot("rules", window.rules)
 
         def organize() -> None:
             (root / "old notes.md").write_text(

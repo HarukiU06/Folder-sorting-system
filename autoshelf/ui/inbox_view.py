@@ -1,23 +1,29 @@
-"""The Inbox screen: files waiting for a decision, with suggestions and a preview."""
+"""The Inbox screen: files waiting for a decision, with the best folders as big buttons."""
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont
-from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QSplitter,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QHBoxLayout, QListWidgetItem, QMessageBox, QVBoxLayout, QWidget
+from qfluentwidgets import (
+    Action,
+    BodyLabel,
+    CaptionLabel,
+    CheckBox,
+    ComboBox,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    ListWidget,
+    PlainTextEdit,
+    PrimaryPushButton,
+    PushButton,
+    SimpleCardWidget,
+    StrongBodyLabel,
+    SubtitleLabel,
+    TitleLabel,
+    TransparentPushButton,
+    TransparentToolButton,
 )
 
 from autoshelf import wording
@@ -25,13 +31,13 @@ from autoshelf.actions.inbox import InboxItem
 from autoshelf.app_service import AppService
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.why_panel import WhyPanel
-from autoshelf.ui.widgets import plain_label, show_in_explorer
+from autoshelf.ui.widgets import plain, show_in_explorer, show_menu
 
 MAX_SUGGESTIONS = 3
-EMPTY_TEXT = (
-    "Nothing is waiting.\n\nFiles that AutoShelf isn't sure about will appear here, "
-    "with its best guesses."
-)
+EMPTY_TEXT = "Nothing is waiting. Files AutoShelf isn't sure about will show up here."
+SHOW_WHY = "Why is it waiting?"
+HIDE_WHY = "Hide why it's waiting"
+UNDO_MSECS = 10_000
 
 
 class InboxView(QWidget):
@@ -49,103 +55,98 @@ class InboxView(QWidget):
         self._reload = False
         self._wanted: Path | None = None
 
-        self.summary = plain_label()
-        refresh = QPushButton("Refresh")
+        self.summary = plain(TitleLabel())
+        refresh = TransparentToolButton(FluentIcon.SYNC)
+        refresh.setToolTip("Look again")
         refresh.clicked.connect(self.refresh)
         top = QHBoxLayout()
         top.addWidget(self.summary, 1)
         top.addWidget(refresh)
 
-        self.list = QListWidget()
+        self.list = ListWidget()
         self.list.currentRowChanged.connect(self._show_current)
+        self.list.setMaximumWidth(320)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
 
-        self.detail = QWidget()
-        self.name = plain_label()
-        font = QFont(self.name.font())
-        font.setBold(True)
-        font.setPointSizeF(font.pointSizeF() * 1.2)
-        self.name.setFont(font)
+        self.detail = SimpleCardWidget()
+        self.name = plain(SubtitleLabel())
         self.name.setWordWrap(True)
         self.name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.title = plain_label()
+        self.title = plain(CaptionLabel())
         self.title.setWordWrap(True)
-        self.why = plain_label()
+        self.why = plain(BodyLabel())
         self.why.setWordWrap(True)
-        self.why.setStyleSheet("color: palette(placeholder-text);")
+
+        self.menu_button = TransparentToolButton(FluentIcon.MORE)
+        self.menu_button.setToolTip("More actions")
+        self.rename_action = Action(FluentIcon.EDIT, "Rename", self)
+        self.rename_action.triggered.connect(self._rename)
+        self.open_action = Action(FluentIcon.DOCUMENT, "Open the file", self)
+        self.open_action.triggered.connect(self._open_file)
+        self.show_action = Action(FluentIcon.FOLDER, "Show in Explorer", self)
+        self.show_action.triggered.connect(self._show_in_explorer)
+        self.menu_button.clicked.connect(lambda: show_menu(self.menu_button, self.menu_actions()))
+        heading = QHBoxLayout()
+        names = QVBoxLayout()
+        names.setSpacing(2)
+        names.addWidget(self.name)
+        names.addWidget(self.title)
+        names.addWidget(self.why)
+        heading.addLayout(names, 1)
+        heading.addWidget(self.menu_button, 0, Qt.AlignmentFlag.AlignTop)
 
         self.suggestions = QHBoxLayout()
-        self.suggestion_buttons: list[QPushButton] = []
-        self.other = QComboBox()
-        self.other.setMinimumContentsLength(18)
-        self.move_other = QPushButton("Move")
+        self.suggestion_buttons: list[PushButton] = []
+        self.other = ComboBox()
+        self.other.setMinimumWidth(220)
+        self.move_other = PushButton("Move there")
         self.move_other.clicked.connect(self._move_to_other)
         other_row = QHBoxLayout()
-        other_row.addWidget(QLabel("Other folder:"))
+        other_row.addWidget(BodyLabel("Another folder:"))
         other_row.addWidget(self.other, 1)
         other_row.addWidget(self.move_other)
         self.tag_row = QHBoxLayout()
-        self.tag_label = QLabel("Also tag it:")
+        self.tag_label = BodyLabel("Also tag it:")
         self.tag_row.addWidget(self.tag_label)
-        self.tag_boxes: list[QCheckBox] = []
+        self.tag_boxes: list[CheckBox] = []
         self.tag_row.addStretch(1)
 
-        self.rename_label = plain_label()
-        self.rename_button = QPushButton("Rename")
-        self.rename_button.clicked.connect(self._rename)
-        self.rename_row = QWidget()
-        rename_layout = QHBoxLayout(self.rename_row)
-        rename_layout.setContentsMargins(0, 0, 0, 0)
-        rename_layout.addWidget(self.rename_label, 1)
-        rename_layout.addWidget(self.rename_button)
-
-        open_file = QPushButton("Open file")
-        open_file.clicked.connect(self._open_file)
-        show = QPushButton("Show in Explorer")
-        show.clicked.connect(self._show_in_explorer)
-        file_row = QHBoxLayout()
-        file_row.addWidget(open_file)
-        file_row.addWidget(show)
-        file_row.addStretch(1)
-
-        self.preview = QPlainTextEdit()
+        self.preview = PlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("No text preview for this file.")
+        self.why_button = TransparentPushButton(FluentIcon.INFO, SHOW_WHY)
+        self.why_button.clicked.connect(self._toggle_why)
         self.why_panel = WhyPanel()
-        self.pages = QTabWidget()
-        self.pages.addTab(self.preview, "Preview")
-        self.pages.addTab(self.why_panel, "Why?")
+        self.why_panel.setVisible(False)
 
         detail = QVBoxLayout(self.detail)
-        detail.addWidget(self.name)
-        detail.addWidget(self.title)
-        detail.addWidget(self.why)
-        detail.addWidget(self.rename_row)
-        detail.addSpacing(6)
-        detail.addWidget(QLabel("Move it to:"))
+        detail.setContentsMargins(20, 16, 20, 16)
+        detail.setSpacing(10)
+        detail.addLayout(heading)
+        detail.addSpacing(4)
+        detail.addWidget(StrongBodyLabel("Where should it go?"))
         detail.addLayout(self.suggestions)
         detail.addLayout(other_row)
         detail.addLayout(self.tag_row)
-        detail.addLayout(file_row)
-        detail.addWidget(self.pages, 1)
+        detail.addWidget(self.preview, 1)
+        detail.addWidget(self.why_button, 0, Qt.AlignmentFlag.AlignLeft)
+        detail.addWidget(self.why_panel, 1)
 
-        self.empty = QLabel(EMPTY_TEXT)
+        self.empty = BodyLabel(EMPTY_TEXT)
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
 
-        splitter = QSplitter()
-        splitter.addWidget(self.list)
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.detail)
-        right_layout.addWidget(self.empty)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([260, 560])
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        body.addWidget(self.list, 1)
+        body.addWidget(self.detail, 3)
+        body.addWidget(self.empty, 3)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 20, 28, 20)
+        layout.setSpacing(16)
         layout.addLayout(top)
-        layout.addWidget(splitter, 1)
+        layout.addLayout(body, 1)
         self._show_items([], [])
 
     # --- loading ------------------------------------------------------------------
@@ -157,7 +158,7 @@ class InboxView(QWidget):
             return
         self._loading = True
         if not self._items:
-            self.summary.setText("Looking at your Inbox... (the first time loads the model)")
+            self.summary.setText("Looking at your Inbox...")
         self.runner.run(self._load, self._loaded, self._load_failed)
 
     def select(self, path: Path | None) -> None:
@@ -200,8 +201,9 @@ class InboxView(QWidget):
         self.list.blockSignals(False)
         count = len(items)
         self.summary.setText(
-            f"{count} file{'' if count == 1 else 's'} waiting for you" if count else ""
+            f"{count} file{'' if count == 1 else 's'} waiting for you" if count else "Inbox"
         )
+        self.list.setVisible(bool(items))
         self.detail.setVisible(bool(items))
         self.empty.setVisible(not items)
         self.count_changed.emit(count)
@@ -233,7 +235,7 @@ class InboxView(QWidget):
         self.name.setText(item.path.name)
         self.title.setText(f"Title: {item.title}" if item.title else "")
         self.title.setVisible(bool(item.title))
-        self.why.setText(f"Why it's here: {wording.reason_text(item.reason)}")
+        self.why.setText(wording.waiting_text(item.reason))
         self.preview.setPlainText(item.excerpt or "")
         root = item.path.parent.parent  # the file is in <root>/_Inbox
         self.why_panel.show_details(item.details, root)
@@ -242,11 +244,14 @@ class InboxView(QWidget):
             button.deleteLater()
         self.suggestion_buttons = []
         top = item.classification.top(MAX_SUGGESTIONS) if item.classification else ()
-        for score in top:
-            button = QPushButton(f"{score.folder}   {score.score:.2f}")
-            button.setToolTip(f"Move {item.path.name} to {score.folder}")
+        for index, score in enumerate(top):
+            button = (PrimaryPushButton if index == 0 else PushButton)(score.folder)
+            button.setMinimumHeight(48)
+            button.setToolTip(
+                ("Best guess: " if index == 0 else "") + f"move {item.path.name} to {score.folder}"
+            )
             button.clicked.connect(lambda _=False, folder=score.folder: self.move_to(folder))
-            self.suggestions.addWidget(button)
+            self.suggestions.addWidget(button, 1)
             self.suggestion_buttons.append(button)
         if top:
             self.other.setCurrentText(top[0].folder)
@@ -255,16 +260,25 @@ class InboxView(QWidget):
             box.deleteLater()
         self.tag_boxes = []
         for name in item.tag_suggestions:
-            box = QCheckBox(name)
+            box = CheckBox(name)
             box.setToolTip("It fits this folder too: tag it, so it shows up under the tag")
             self.tag_row.insertWidget(self.tag_row.count() - 1, box)
             self.tag_boxes.append(box)
         self.tag_label.setVisible(bool(self.tag_boxes))
-        self.rename_row.setVisible(item.rename is not None)
         if item.rename is not None:
-            self.rename_label.setText(
-                f"Better name (from its {item.rename.source}): {item.rename.new_name}"
-            )
+            self.rename_action.setText(f"Rename to “{item.rename.new_name}”")
+
+    def menu_actions(self) -> list[Action]:
+        """What the ⋯ menu offers for the selected file."""
+        item = self._current_item()
+        rename = [self.rename_action] if item is not None and item.rename is not None else []
+        return [*rename, self.open_action, self.show_action]
+
+    def _toggle_why(self) -> None:
+        shown = not self.why_panel.isVisible()
+        self.why_panel.setVisible(shown)
+        self.preview.setVisible(not shown)
+        self.why_button.setText(HIDE_WHY if shown else SHOW_WHY)
 
     def _move_to_other(self) -> None:
         if self.other.currentText():
@@ -283,6 +297,7 @@ class InboxView(QWidget):
         def done(result) -> None:
             self.detail.setEnabled(True)
             self.moved.emit(f"Moved {path.name} to {folder}")
+            self._offer_undo(f"Moved {path.name} to {folder}. AutoShelf will remember.", result)
             self.refresh()
             self.runner.run(
                 lambda: self.service.rule_suggestion_for(folder), self.offer_rule, lambda exc: None
@@ -295,6 +310,28 @@ class InboxView(QWidget):
 
         self.runner.run(lambda: self.service.assign(path, folder, tags), done, failed)
 
+    def _offer_undo(self, text: str, result) -> None:
+        history_id = result.history_id
+        bar = InfoBar.success(
+            "", text, duration=UNDO_MSECS, position=InfoBarPosition.TOP, parent=self
+        )
+        undo = PushButton("Undo")
+
+        def undone(_) -> None:
+            self.moved.emit(f"Put {result.dst.name} back in the Inbox")
+            self.refresh()
+
+        def undo_move() -> None:
+            bar.close()
+            self.runner.run(
+                lambda: self.service.undo(history_id),
+                undone,
+                lambda exc: QMessageBox.warning(self, "Couldn't undo", str(exc)),
+            )
+
+        undo.clicked.connect(undo_move)
+        bar.addWidget(undo)
+
     def offer_rule(self, suggestion) -> None:
         """After an answer: offer the rule the user's choices point to, if there is one."""
         if suggestion is None:
@@ -304,7 +341,7 @@ class InboxView(QWidget):
             "Make this a rule?",
             wording.rule_suggestion(suggestion)
             + "\n\nA rule would send such files there by itself; you can change or remove it "
-            "on the Rules tab. (No: don't suggest it again.)",
+            "in Settings, under Rules. (No: don't suggest it again.)",
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.runner.run(

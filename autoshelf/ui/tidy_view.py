@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -32,7 +31,7 @@ from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
-ROOT_CHOICE = "The root (files not sorted yet)"
+ROOT_CHOICE = "Your AutoShelf folder (files not sorted yet)"
 OTHER_CHOICE = "Another folder..."
 LEAVE = "(leave it)"
 
@@ -362,7 +361,8 @@ class OrganizePage(QWidget):
             self.table.setItem(row, 1, name)
             # A folder outside the root is shown by its name (the whole path as a tooltip).
             current = Path(proposal.current)
-            now_in = QTableWidgetItem(current.name if current.is_absolute() else proposal.current)
+            shown = current.name if current.is_absolute() else wording.place(proposal.current)
+            now_in = QTableWidgetItem(shown)
             now_in.setToolTip(proposal.current)
             self.table.setItem(row, 2, now_in)
             target = QComboBox()
@@ -629,41 +629,3 @@ class NewFoldersPage(QWidget):
             ),
             lambda exc: QMessageBox.warning(self, "Couldn't create the folder", str(exc)),
         )
-
-
-class TidyView(QWidget):
-    """Organizing, duplicates, versions, better names and new folders, one page each."""
-
-    changed = Signal(str)
-
-    def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
-        super().__init__(parent)
-        self.duplicates = DuplicatesPage(service, runner)
-        self.versions = VersionsPage(service, runner)
-        self.organize = OrganizePage(service, runner)
-        self.renames = RenamePage(service, runner)
-        self.new_folders = NewFoldersPage(service, runner)
-        self.pages = QTabWidget()
-        self.pages.addTab(self.organize, "Organize a folder")
-        self.pages.addTab(self.duplicates, "Duplicates")
-        self.pages.addTab(self.versions, "Possible versions")
-        self.pages.addTab(self.renames, "Better names")
-        self.pages.addTab(self.new_folders, "New folders")
-        for page in (self.duplicates, self.organize, self.renames, self.new_folders):
-            page.changed.connect(self.changed)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.pages)
-
-    def refresh(self) -> None:
-        """Reload what is cheap to reload (scans run when asked)."""
-        self.organize.refresh()
-
-    def sort_files(self, paths: list[Path]) -> None:
-        """Show the preview for files chosen in Explorer."""
-        self.pages.setCurrentWidget(self.organize)
-        self.organize.preview_files(paths)
-
-    def set_ai_enabled(self, enabled: bool) -> None:
-        """Offer AI-made names only when an AI provider is on."""
-        self.renames.ai_button.setVisible(enabled)

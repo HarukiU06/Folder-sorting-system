@@ -60,6 +60,33 @@ def reason_text(reason: Mapping | None) -> str:
     return str(code or "")
 
 
+def waiting_text(reason: Mapping | None) -> str:
+    """Why a file waits in the Inbox, as a plain sentence without scores."""
+    code = (reason or {}).get("code")
+    if code == reasons.LOW_SCORE:
+        return f"None of your folders is a clear match. The closest is {reason['folder']}."
+    if code == reasons.TOO_CLOSE:
+        if reason.get("rival") is None:
+            return f"AutoShelf isn't sure about {reason['folder']}."
+        return (
+            f"It fits {reason['folder']} and {reason['rival']} about equally well, "
+            "so AutoShelf is asking you."
+        )
+    if code == reasons.NO_FOLDERS:
+        return "There are no folders to sort into yet."
+    if code == reasons.NO_CLASSIFIER:
+        return "AutoShelf can't read files to sort them right now."
+    if code == reasons.RULE_FOLDER_MISSING:
+        return (
+            f"Your rule {reason['rule']!r} sends it to {reason['folder']}, "
+            "but that folder no longer exists."
+        )
+    if code == reasons.FOLDER_GONE:
+        return f"Its folder {reason['folder']} no longer exists."
+    text = reason_text(reason)
+    return text[:1].upper() + text[1:] if text else ""
+
+
 def explanation(details: Mapping | None) -> str:
     """Why a history row happened, from its stored details (older rows stored the words)."""
     if not details:
@@ -95,6 +122,45 @@ def digest(sorted_files: int, waiting: int, learned: int) -> str:
         f"This week: {sorted_files} sorted, {waiting} waiting in Inbox, "
         f"{learned} {corrections} learned"
     )
+
+
+def duration(seconds: float) -> str:
+    """ "less than a minute", "about 3 minutes", "about 2 hours"."""
+    if seconds < 60:
+        return "less than a minute"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return "about 1 minute" if minutes == 1 else f"about {minutes} minutes"
+    hours = round(seconds / 3600)
+    return "about 1 hour" if hours == 1 else f"about {hours} hours"
+
+
+def duration_range(low: float, high: float) -> str:
+    """ "About 3 to 5 minutes", "Less than a minute", "About 1 to 2 hours"."""
+    if high < 60:
+        return "Less than a minute"
+    if high < 3600:
+        first, last = max(1, round(low / 60)), max(1, round(high / 60))
+        unit = "minute" if last == 1 else "minutes"
+    else:
+        first, last = max(1, round(low / 3600)), max(1, round(high / 3600))
+        unit = "hour" if last == 1 else "hours"
+    return f"About {last} {unit}" if first >= last else f"About {first} to {last} {unit}"
+
+
+def estimate_lines(estimate) -> list[str]:
+    """What AutoShelf will do before everything is sorted (features.estimate.Estimate)."""
+    files = f"{estimate.library_files:,} file{'' if estimate.library_files == 1 else 's'}"
+    lines = [f"{files} in your folders"]
+    if estimate.name_only:
+        lines[0] += f" ({estimate.name_only:,} online-only: names only, nothing downloaded)"
+    if estimate.library_files and not estimate.to_read:
+        lines[0] += ", already known"
+    lines.append(f"{estimate.to_sort:,} new file{'' if estimate.to_sort == 1 else 's'} to sort now")
+    if estimate.download_bytes:
+        size = round(estimate.download_bytes / 1_000_000)
+        lines.append(f"A one-time download of the language model ({size} MB)")
+    return lines
 
 
 def size_text(size: int) -> str:
@@ -294,6 +360,60 @@ def history_reason(entry: HistoryEntry) -> str:
         verb = "Tagged" if entry.reason == "tag" else "Untagged"
         return f"{verb} '{entry.details.get('tag', '')}'"
     return _REASON_LABELS.get(entry.reason, entry.reason)
+
+
+def place(folder: str) -> str:
+    """A folder as History names it: "Finance", "the Inbox", "your AutoShelf folder"."""
+    if folder == "(root)":
+        return "your AutoShelf folder"
+    if folder == "_Inbox":
+        return "the Inbox"
+    return folder
+
+
+def history_sentence(entry: HistoryEntry, src_folder: str, dst_folder: str) -> str:
+    """What a history row did, in a sentence: "Moved bread.txt to Recipes"."""
+    name = Path(entry.dst or entry.src or "?").name
+    if entry.action == "undo":
+        return f"Put {name} back in {place(dst_folder)}"
+    if entry.action == "create":
+        return f"Made {created(entry.details.get('reason') or {})}"
+    if entry.action == "rename" or entry.reason in ("rename", "renamed (you approved)"):
+        return f"Renamed {Path(entry.src or '?').name} to {name}"
+    if entry.reason in ("tag", "untag"):
+        verb = "Tagged" if entry.reason == "tag" else "Untagged"
+        return f"{verb} {name}: {entry.details.get('tag', '')}"
+    if entry.reason == "duplicate" or entry.reason.startswith("duplicate of "):
+        return f"Set {name} aside in _Duplicates"
+    if dst_folder == "_Inbox":
+        return f"Put {name} in the Inbox"
+    return f"Moved {name} to {place(dst_folder)}"
+
+
+def history_how(entry: HistoryEntry) -> str:
+    """Who or what made a history row happen: "on its own", "you chose it"..."""
+    if entry.action == "undo":
+        return f"undo of #{entry.undo_of}" if entry.undo_of else "undo"
+    if entry.action == "create":
+        return "you asked for it"
+    if entry.reason == "user" and entry.details.get("corrects"):
+        return f"you corrected #{entry.details['corrects']}"
+    if entry.reason.startswith("Rule:"):
+        return f"by your rule “{entry.reason.removeprefix('Rule:').strip()}”"
+    return _HOW.get(entry.reason, history_reason(entry))
+
+
+_HOW = {
+    "auto": "on its own",
+    "ask": "not sure, so it asked you",
+    "user": "you chose it",
+    "organize": "you approved it",
+    "rename": "you approved it",
+    "renamed (you approved)": "you approved it",
+    "duplicate": "you kept another copy",
+    "tag": "you tagged it",
+    "untag": "you removed the tag",
+}
 
 
 def why_here(path: Path, entry: HistoryEntry | None, here: bool) -> str:

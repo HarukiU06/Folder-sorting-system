@@ -22,6 +22,9 @@ dependencies = [
     "watchdog>=6.0",
     # desktop app (Phase 4); LGPL
     "PySide6-Essentials>=6.12",
+    # Windows 11 style widgets; GPLv3, brings PySide6, PySideSix-Frameless-Window (LGPLv3),
+    # pywin32 (PSF) and darkdetect (BSD)
+    "PySide6-Fluent-Widgets>=1.11.3",
     # classification (Phase 3)
     "numpy>=2.5",
     "sentence-transformers>=6.1",

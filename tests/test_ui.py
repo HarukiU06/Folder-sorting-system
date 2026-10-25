@@ -12,7 +12,8 @@ import pytest
 from fakes import FakeEmbedder
 from helpers import make
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox, QWidget
+from qfluentwidgets import InfoBar, PushButton
 
 from autoshelf import commands
 from autoshelf.app_service import AppService
@@ -21,7 +22,6 @@ from autoshelf.config import CONFIDENCE_LEVELS, AppPaths
 from autoshelf.pipeline import Outcome, OutcomeKind
 from autoshelf.ui import app as app_module
 from autoshelf.ui.app import AutoShelfApp, notification_text
-from autoshelf.ui.folders_view import DESCRIPTION_COLUMN, FoldersView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
@@ -110,7 +110,7 @@ def test_inbox_shows_files_and_suggestions(qtbot, service, runner, shelf: Path) 
     view.select(shelf / "_Inbox" / "tax invoice.txt")
     assert view.name.text() == "tax invoice.txt"
     assert view.suggestion_buttons[0].text().startswith("Finance")
-    assert "Why it's here" in view.why.text()
+    assert "Finance" in view.why.text()
     assert view.preview.toPlainText() == "invoice tax"
     assert [view.other.itemText(i) for i in range(view.other.count())] == ["Finance", "Recipes"]
 
@@ -124,7 +124,7 @@ def test_inbox_shows_text_from_files_literally(qtbot, service, runner, shelf: Pa
     view.refresh()
     settle(qtbot, runner)
     assert view.title.text() == f"Title: {title}"
-    for label in (view.name, view.title, view.why, view.rename_label):
+    for label in (view.name, view.title, view.why):
         assert label.textFormat() == Qt.TextFormat.PlainText
 
 
@@ -151,6 +151,24 @@ def test_choosing_a_suggestion_moves_the_file(qtbot, service, runner, shelf: Pat
     assert not src.exists()
     assert view.list.count() == 0
     assert view.empty.isVisibleTo(view)
+
+
+def test_an_inbox_answer_can_be_undone_right_away(qtbot, service, runner, shelf: Path) -> None:
+    src = make(shelf / "_Inbox" / "tax invoice.txt", "invoice tax")
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    view.suggestion_buttons[0].click()
+    settle(qtbot, runner)
+    (bar,) = view.findChildren(InfoBar)
+    assert "Moved tax invoice.txt to Finance. AutoShelf will remember." in bar.content
+    (undo,) = [button for button in bar.findChildren(PushButton) if button.text() == "Undo"]
+    undo.click()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert src.exists()
+    assert view.list.count() == 1
 
 
 def test_other_folder_moves_the_file(qtbot, service, runner, shelf: Path) -> None:
@@ -188,7 +206,7 @@ def test_history_lists_moves_and_undoes_one(qtbot, service, runner, shelf: Path)
 
     assert view.table.rowCount() == 1
     cells = [view.table.item(0, column).text() for column in range(view.table.columnCount())]
-    assert cells[1:5] == ["bread.txt", "_Inbox", "Recipes", "You chose"]
+    assert cells[:2] == ["Moved bread.txt to Recipes", "you chose it"]
     view.table.selectRow(0)
     assert view.undo_button.isEnabled()
 
@@ -197,7 +215,9 @@ def test_history_lists_moves_and_undoes_one(qtbot, service, runner, shelf: Path)
 
     assert src.exists()
     assert view.table.rowCount() == 2
-    assert view.table.item(0, 4).text().startswith("Undo of #")
+    assert view.table.item(0, 0).text() == "Put bread.txt back in the Inbox"
+    assert view.table.item(0, 1).text().startswith("undo of #")
+    assert view.table.item(1, 0).text() == "Moved bread.txt to Recipes (undone)"
 
 
 def test_undo_of_a_changed_file_asks_first(
@@ -226,18 +246,77 @@ def test_undo_of_a_changed_file_asks_first(
 # --- Folders --------------------------------------------------------------------------------
 
 
-def test_folders_show_counts_and_save_descriptions(qtbot, service, runner) -> None:
-    view = FoldersView(service, runner)
+def test_library_lists_folders_and_saves_descriptions(qtbot, service, runner) -> None:
+    from autoshelf.ui.library_view import LibraryView
+
+    view = LibraryView(service, runner)
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
 
-    assert view.table.rowCount() == 2
-    assert view.table.item(0, 0).text() == "Finance"
-    assert view.table.item(0, 1).text() == "1"
+    assert view.tree_children("") == ["Finance", "Recipes"]
+    assert view.row_names() == ["Finance", "Recipes"]  # your AutoShelf folder opens first
+    assert view.folder_box.isVisibleTo(view)  # nothing selected: the open folder's details
+    view.go_to("Finance")
+    settle(qtbot, runner)
+    assert view.row_names() == ["invoice 2024.txt"]
+    assert view.folder_name.text() == "Finance"
+    view.go_to("Recipes")
+    settle(qtbot, runner)
     with qtbot.waitSignal(view.saved, timeout=WAIT_MS):
-        view.table.item(1, DESCRIPTION_COLUMN).setText("cakes and bread")
+        view.description.setText("cakes and bread")
+        view.description.editingFinished.emit()
     assert {f.key: f.description for f in service.folders()}["Recipes"] == "cakes and bread"
+
+
+def test_library_browses_like_explorer(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.library_view import FOLDER, ROOT, SIZE, WHERE, LibraryView
+
+    make(shelf / "Finance" / "Taxes" / "2024" / "return.txt", "tax return")
+    make(shelf / "Finance" / "bank.txt", "bank statement")
+    make(shelf / "loose.txt", "waiting to be sorted")  # not in a folder: not listed
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+
+    assert view.tree_children("Finance") == ["Finance/Taxes"]
+    assert view.tree_children("Finance/Taxes") == ["Finance/Taxes/2024"]
+    assert "loose.txt" not in view.row_names()
+    assert not view.up_button.isEnabled() and not view.back_button.isEnabled()
+
+    view.select(FOLDER, "Finance")
+    view.open_selected()  # double-click or Enter on a folder opens it here
+    assert view.location == (FOLDER, "Finance")
+    assert view.row_names() == ["Taxes", "bank.txt", "invoice 2024.txt"]  # folders first
+    assert view.results.item(0, SIZE).text() == "1 item"
+    assert view.results.isColumnHidden(WHERE)  # no Folder column inside a folder
+    view.go_to("Finance/Taxes/2024")
+    assert view.tree.currentItem().text(0) == "2024"  # the tree follows
+    crumbs = [view.path_bar.itemAt(i).text for i in range(view.path_bar.count())]
+    assert crumbs == [shelf.name, "Finance", "Taxes", "2024"]
+
+    view.path_bar.setCurrentIndex(1)  # click "Finance" in the path
+    assert view.location == (FOLDER, "Finance")
+    view.go_up()
+    assert view.location == ROOT
+    view.go_back()
+    assert view.location == (FOLDER, "Finance")
+    view.go_forward()
+    assert view.location == ROOT
+
+    view.results.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+    view.go_to("Finance")
+    view.results.sortByColumn(SIZE, Qt.SortOrder.AscendingOrder)  # by size: sizes, not text
+    assert view.row_names()[0] == "Taxes"  # folders stay together
+
+    view.query.setText("tax")
+    view.search()
+    settle(qtbot, runner)
+    assert view.row_names()[0] == "Taxes"  # matching folders first
+    assert not view.results.isColumnHidden(WHERE)
+    view._search_cleared()
+    assert view.location == (FOLDER, "Finance")
 
 
 # --- Settings -------------------------------------------------------------------------------
@@ -306,7 +385,7 @@ def test_app_sorts_and_reports_files_needing_a_decision(qtbot, app, shelf: Path)
         lambda: "Where should notes.txt go?" in status.currentMessage(), timeout=WAIT_MS
     )
     qtbot.waitUntil(lambda: app.window.inbox.list.count() == 1, timeout=WAIT_MS)
-    assert app.window.tabs.tabText(0) == "Inbox (1)"
+    assert app.window.page_title(app.window.inbox) == "Inbox (1)"
 
 
 def test_pausing_from_the_tray_updates_settings(qtbot, app) -> None:
@@ -322,8 +401,13 @@ def test_first_run_asks_for_a_folder(
     qtbot, paths: AppPaths, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make(shelf / "loose.pdf")
-    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(shelf))
-    monkeypatch.setattr(AutoShelfApp, "ask_about_loose_files", lambda self, root, n: "paused")
+    asked = []
+
+    def ask(self, current):
+        asked.append(current)
+        return shelf, "paused", None
+
+    monkeypatch.setattr(AutoShelfApp, "ask_for_folder", ask)
     service = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
     assert service.acquire()
     shelf_app = AutoShelfApp(service)
@@ -333,18 +417,82 @@ def test_first_run_asks_for_a_folder(
     qtbot.waitUntil(lambda: service.watching, timeout=WAIT_MS)
     settle(qtbot, shelf_app.runner)
 
+    assert asked == [None]
     assert service.root() == shelf
     assert service.settings().paused  # the user chose to look first
     assert (shelf / "loose.pdf").exists()
     shelf_app.shutdown()
 
 
-def test_unusable_folder_is_refused(
-    qtbot, app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_dialogs
+def test_setup_says_how_long_starting_takes(
+    qtbot, service, runner, shelf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(Path.home()))
-    app.choose_root()
-    assert "home folder" in no_dialogs[0][2]
+    from autoshelf.ui import setup_dialog
+
+    make(shelf / "loose.pdf", "invoice")
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(setup_dialog, "icloud_drive", lambda: None)
+    dialog = setup_dialog.SetupDialog(service, runner, parent, first=True)
+    assert not dialog.yesButton.isEnabled()  # no folder yet
+    dialog.set_folder(shelf)
+    settle(qtbot, runner)
+    assert dialog.folder == shelf
+    assert dialog.time.text().startswith(("About", "Less than"))
+    assert "1 new file to sort now" in dialog.lines.text()
+    assert "one-time download" in dialog.lines.text()  # the fake model isn't on disk
+    assert dialog.yesButton.isEnabled() and dialog.paused_button.isEnabled()
+    dialog.paused_button.click()
+    assert dialog.choice == "paused"
+
+    home = setup_dialog.SetupDialog(service, runner, parent)
+    home.set_folder(Path.home())
+    assert "home folder" in home.problem.text()
+    assert not home.yesButton.isEnabled()
+
+
+def test_setup_warns_about_the_top_of_icloud_drive(
+    qtbot, service, runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui import setup_dialog
+
+    drive = tmp_path / "iCloudDrive"
+    (drive / "Documents").mkdir(parents=True)
+    monkeypatch.setattr(setup_dialog, "icloud_drive", lambda: drive)
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    dialog = setup_dialog.SetupDialog(service, runner, parent, first=True)
+    assert dialog.path.text() == str(drive / "AutoShelf")  # suggested, not there yet
+    assert dialog.make_button.isVisibleTo(dialog)
+    dialog.set_folder(drive)
+    assert dialog.warning.isVisibleTo(dialog)
+    dialog.use_subfolder.click()
+    assert (drive / "AutoShelf").is_dir()
+    assert dialog.path.text() == str(drive / "AutoShelf")
+    assert not dialog.warning.isVisibleTo(dialog)
+
+
+def test_progress_shows_the_time_left(qtbot, service, runner) -> None:
+    from autoshelf.features.estimate import Estimate
+    from autoshelf.ui.progress_panel import ProgressPanel
+    from autoshelf.watcher import service as watch
+
+    panel = ProgressPanel(service, runner)
+    qtbot.addWidget(panel)
+    panel.set_estimate(Estimate(100, 0, 100, 4, 0, 10, 20, reading_seconds=100, sorting_seconds=4))
+    panel.show_progress(watch.Progress(watch.READING, 10, 100))
+    assert panel.isVisibleTo(panel.parentWidget() or panel)
+    assert panel.title.text() == "Reading your folders"
+    assert panel.detail.text() == "10 of 100 files (once only)"
+    assert panel.left.text() == "about 2 minutes left"  # 90% of 100 s, plus 4 s of sorting
+    assert panel.bar.value() == 10
+    panel.show_progress(watch.Progress(watch.SORTING, 1, 4))
+    assert panel.title.text() == "Sorting new files"
+    assert panel.left.text() == "less than a minute left"
+    panel.show_progress(watch.Progress(watch.READY))
+    assert panel.title.text() == "Done"
+    panel.show_progress(watch.Progress(watch.PAUSED, 0, 3))
+    assert panel.detail.text() == "3 new files will be sorted when you resume"
 
 
 def test_notification_text() -> None:
@@ -536,9 +684,9 @@ def test_files_right_clicked_together_make_one_zip(qtbot, app, shelf: Path) -> N
 def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: Path) -> None:
     bill = make(tmp_path / "Downloads" / "bill.txt", "invoice tax due to the bank")
     app.run_command(Command(commands.SORT, (str(bill),)))
-    page = app.window.tidy.organize
+    page = app.window.tools.organize
     qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
-    assert app.window.tabs.currentWidget() is app.window.tidy
+    assert app.window.current_page() is app.window.tools.organize
     assert page.source.currentText() == "Files chosen in Explorer"
     assert page.table.item(0, 2).text() == "Downloads"  # the folder, not its whole path
     assert page.table.cellWidget(0, 3).currentText() == "Finance"
@@ -598,7 +746,7 @@ def test_history_shows_why_and_corrects_a_move(
     assert moved.args == ["Moved bread.txt to Recipes; AutoShelf will remember"]
     assert (shelf / "Recipes" / "bread.txt").exists()
     settle(qtbot, runner)
-    assert view.table.item(0, 4).text() == "You corrected #1"
+    assert view.table.item(0, 1).text() == "you corrected #1"
     assert service.corrections()[-1]["source"] == "undo"
 
 
@@ -752,13 +900,13 @@ def test_library_searches_and_tags(qtbot, service, runner, shelf: Path) -> None:
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert [view.file_tags.item(i).text() for i in range(view.file_tags.count())] == ["Taxes 2024"]
-    assert view.tag_list.item(0).text() == "Taxes 2024  (1)"
+    assert view.tag_names() == ["Taxes 2024"]
 
-    view.results.setRowCount(0)
-    view._tag_clicked(view.tag_list.item(0))
+    view.show_tag("Taxes 2024")
     settle(qtbot, runner)
+    assert view.row_names() == ["invoice 2024.txt"]
+    view.results.selectRow(0)
     settle(qtbot, runner)
-    assert view.results.rowCount() == 1
     view.file_tags.setCurrentRow(0)
     view._remove_tag()
     settle(qtbot, runner)
@@ -767,11 +915,12 @@ def test_library_searches_and_tags(qtbot, service, runner, shelf: Path) -> None:
 
 
 def test_tidy_organizes_and_undoes_a_batch(qtbot, service, runner, shelf: Path) -> None:
-    from autoshelf.ui.tidy_view import ROOT_CHOICE, TidyView
+    from autoshelf.ui.tidy_view import ROOT_CHOICE
+    from autoshelf.ui.tools_view import ToolsView
 
     service.save_settings(replace(service.settings(), auto_threshold=0.3, auto_margin=0.1))
     make(shelf / "tax invoice.txt", "invoice tax bank receipt")
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
@@ -795,10 +944,10 @@ def test_tidy_organizes_and_undoes_a_batch(qtbot, service, runner, shelf: Path) 
 def test_tidy_sets_duplicates_aside(
     qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from autoshelf.ui.tidy_view import TidyView
+    from autoshelf.ui.tools_view import ToolsView
 
     copy = make(shelf / "Recipes" / "copy.txt", "invoice total tax due bank")
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
     page = view.duplicates
     page.refresh()
@@ -862,23 +1011,25 @@ def test_settings_add_and_remove_a_watched_folder(
 def test_main_window_has_every_screen(qtbot, service, runner) -> None:
     window = MainWindow(service, runner, keep_running_on_close=False)
     qtbot.addWidget(window)
-    names = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    names = window.page_titles()
     assert names == [
         "Inbox",
         "Library",
         "History",
-        "Folders",
-        "Rules",
-        "Tidy up",
-        "Dashboard",
-        "Ask",
+        "More tools",
         "Settings",
     ]
-    assert not window.tabs.isTabVisible(window.tabs.indexOf(window.ask))  # AI is off
+    assert not window.is_page_visible(window.ask)  # AI is off
+    window.show_tab(window.dashboard)
+    assert window.current_page() is window.dashboard
+    window.show_tab(window.tools)
+    assert window.current_page() is window.tools  # back to the cards
+    window.tools.cards["duplicates"].clicked.emit()
+    assert window.current_page() is window.tools.duplicates
     window.set_ai_enabled(True)
-    assert window.tabs.isTabVisible(window.tabs.indexOf(window.ask))
-    for index in range(window.tabs.count()):
-        window.tabs.setCurrentIndex(index)
+    assert window.is_page_visible(window.ask)
+    for index in range(window.pages.count()):
+        window.show_tab(window.pages.widget(index))
         settle(qtbot, runner)
 
 
@@ -958,7 +1109,7 @@ def test_library_summarizes_and_renames(
     view.search()
     settle(qtbot, runner)
     settle(qtbot, runner)
-    assert view.summarize_button.isVisibleTo(view)
+    assert view.summarize_action in view.menu_actions()
     view.summarize()
     settle(qtbot, runner)
     assert view.summary_text.text() == "Summary: A short summary."
@@ -988,10 +1139,11 @@ def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) ->
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert view.name.text() == "receipt photo.png"
-    labels = [action.text() for action in view.convert_menu.actions()]
-    assert view.convert_button.isEnabled() and "JPG image" in labels
+    labels = [action.text() for action in view.convert_actions]
+    assert "Convert to JPG image" in labels
+    assert view.convert_actions[0] in view.menu_actions()
 
-    view.convert_menu.actions()[labels.index("JPG image")].trigger()
+    view.convert_actions[labels.index("Convert to JPG image")].trigger()
     settle(qtbot, runner)
     assert (shelf / "Finance" / "receipt photo.jpg").exists()
     assert "Made receipt photo.jpg" in view.summary.text()
@@ -1001,7 +1153,7 @@ def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) ->
     view.search()
     settle(qtbot, runner)
     settle(qtbot, runner)
-    assert not view.convert_button.isEnabled()  # nothing to convert a .txt to
+    assert view.convert_actions == []  # nothing to convert a .txt to
     view.compress_file()
     settle(qtbot, runner)
     assert (shelf / "Finance" / "invoice 2024.zip").exists()
@@ -1013,9 +1165,9 @@ def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
-    assert view.rename_row.isVisibleTo(view)
-    assert view.rename_label.text().endswith("Quarterly Report.txt")
-    view.rename_button.click()
+    assert view.rename_action in view.menu_actions()
+    assert view.rename_action.text() == "Rename to “Quarterly Report.txt”"
+    view.rename_action.trigger()
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert (shelf / "_Inbox" / "Quarterly Report.txt").exists()
@@ -1024,13 +1176,13 @@ def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None
 def test_tidy_renames_and_suggests_folders(
     qtbot, service, runner, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from autoshelf.ui.tidy_view import TidyView
+    from autoshelf.ui.tools_view import ToolsView
 
     make(shelf / "_Inbox" / "scan_0001.txt", "Meeting Minutes\nwe met")
     for number in range(3):
         make(shelf / "_Inbox" / f"pods {number}.txt", f"kubernetes pods deployment yaml {number}")
     service.inbox()
-    view = TidyView(service, runner)
+    view = ToolsView(service, runner)
     qtbot.addWidget(view)
 
     view.renames.refresh()
@@ -1247,7 +1399,7 @@ def test_history_offers_undo_for_a_file_autoshelf_made(
     view.refresh()
     settle(qtbot, runner)
     row = [entry.id for entry in view._entries].index(created.history_id)
-    assert view.table.item(row, 4).text() == "Made a ZIP of report.txt"
+    assert view.table.item(row, 0).text() == "Made a ZIP of report.txt"
     assert can_undo(view._entries[row])
     view.table.selectRow(row)
     view.undo_selected()
@@ -1348,7 +1500,7 @@ def test_a_click_on_the_notification_opens_the_inbox(qtbot, app, shelf: Path) ->
     token = app.service.offer(waiting, ["Finance"])
     app.run_command(Command(commands.URL, url=f"autoshelf:inbox?offer={token}"))
     qtbot.waitUntil(lambda: app.window.isVisible(), timeout=WAIT_MS)
-    assert app.window.tabs.currentWidget() is app.window.inbox
+    assert app.window.current_page() is app.window.inbox
     app.run_command(Command(commands.URL, url="autoshelf:nonsense"))  # ignored, no error
 
 
@@ -1387,7 +1539,7 @@ def test_the_weekly_digest_opens_the_dashboard(qtbot, service: AppService, shelf
         assert note.message == "This week: 23 sorted, 3 waiting in Inbox, 1 correction learned"
         assert note.launch == "autoshelf:dashboard" and note.buttons == ()
         app.run_command(Command(commands.URL, url=note.launch))
-        assert app.window.tabs.currentWidget() is app.window.dashboard
+        assert app.window.current_page() is app.window.dashboard
     finally:
         app.shutdown()
 
@@ -1400,10 +1552,10 @@ def test_a_plain_digest_notification_also_opens_the_dashboard(qtbot, app) -> Non
     status = app.window.statusBar()
     qtbot.waitUntil(lambda: "This week: 1 sorted" in status.currentMessage(), timeout=WAIT_MS)
     app.tray.message_clicked.emit()
-    assert app.window.tabs.currentWidget() is app.window.dashboard
+    assert app.window.current_page() is app.window.dashboard
     app._clicked_opens = "inbox"
     app.tray.message_clicked.emit()
-    assert app.window.tabs.currentWidget() is app.window.inbox
+    assert app.window.current_page() is app.window.inbox
 
 
 def test_the_weekly_digest_can_be_turned_off(qtbot, service, runner) -> None:

@@ -179,21 +179,21 @@ def main() -> int:
 
         shoot("inbox", window.inbox)
 
-        def search() -> None:
-            window.library.query.setText("how to choose the number of clusters")
-            window.library.search()
+        def browse() -> None:
+            folder = root / "Machine Learning" / "Unsupervised"
+            window.library.go_to("Machine Learning/Unsupervised")
+            window.library.select("file", str(folder / "clustering notes.md"))
 
-        shoot("library", window.library, search)
+        shoot("library", window.library, browse)
 
         def select_auto() -> None:
             history = window.history
             for row in range(history.table.rowCount()):
-                if history.table.item(row, 4).text() == "Sorted automatically":
+                if history.table.item(row, 1).text() == "on its own":
                     history.table.selectRow(row)
                     break
 
         shoot("history", window.history, select_auto)
-        shoot("rules", window.rules)
 
         def organize() -> None:
             (root / "old notes.md").write_text(
@@ -205,12 +205,12 @@ def main() -> int:
             )
             from autoshelf.ui.tidy_view import ROOT_CHOICE
 
-            window.tidy.organize.refresh()
+            window.tools.organize.refresh()
             settle(app, runner)
-            window.tidy.organize.source.setCurrentText(ROOT_CHOICE)
-            window.tidy.organize.preview()
+            window.tools.organize.source.setCurrentText(ROOT_CHOICE)
+            window.tools.organize.preview()
 
-        shoot("tidy", window.tidy, organize)
+        shoot("tidy", window.tools.organize, organize)
         shoot("dashboard", window.dashboard, window.dashboard.refresh)
         shoot("settings", window.settings)
         service.release()

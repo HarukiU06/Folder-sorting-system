@@ -75,7 +75,22 @@ def test_is_downloaded_looks_for_a_snapshot(tmp_path: Path) -> None:
     assert not is_downloaded(model, tmp_path)
     snapshot = tmp_path / "models--org--some-model" / "snapshots" / "abc123"
     snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    assert not is_downloaded(model, tmp_path)  # stopped before the weights arrived
+    (snapshot / "model.safetensors").write_bytes(b"weights")
     assert is_downloaded(model, tmp_path)
+
+
+def test_a_download_is_followed_by_its_size(tmp_path: Path) -> None:
+    from autoshelf.ml.embedder import model_bytes_on_disk
+
+    model = "org/some-model"
+    assert model_bytes_on_disk(model, tmp_path) == 0
+    blobs = tmp_path / "models--org--some-model" / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / "abc.incomplete").write_bytes(b"x" * 1000)
+    (blobs / "def").write_bytes(b"y" * 24)
+    assert model_bytes_on_disk(model, tmp_path) == 1024
 
 
 def test_short_last_window_overlaps_the_one_before() -> None:

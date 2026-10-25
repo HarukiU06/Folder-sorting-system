@@ -12,7 +12,7 @@ import pytest
 from fakes import FakeEmbedder
 from helpers import make
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox, QWidget
 from qfluentwidgets import InfoBar, PushButton
 
 from autoshelf import commands
@@ -351,8 +351,13 @@ def test_first_run_asks_for_a_folder(
     qtbot, paths: AppPaths, shelf: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make(shelf / "loose.pdf")
-    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(shelf))
-    monkeypatch.setattr(AutoShelfApp, "ask_about_loose_files", lambda self, root, n: "paused")
+    asked = []
+
+    def ask(self, current):
+        asked.append(current)
+        return shelf, "paused", None
+
+    monkeypatch.setattr(AutoShelfApp, "ask_for_folder", ask)
     service = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
     assert service.acquire()
     shelf_app = AutoShelfApp(service)
@@ -362,18 +367,82 @@ def test_first_run_asks_for_a_folder(
     qtbot.waitUntil(lambda: service.watching, timeout=WAIT_MS)
     settle(qtbot, shelf_app.runner)
 
+    assert asked == [None]
     assert service.root() == shelf
     assert service.settings().paused  # the user chose to look first
     assert (shelf / "loose.pdf").exists()
     shelf_app.shutdown()
 
 
-def test_unusable_folder_is_refused(
-    qtbot, app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_dialogs
+def test_setup_says_how_long_starting_takes(
+    qtbot, service, runner, shelf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(Path.home()))
-    app.choose_root()
-    assert "home folder" in no_dialogs[0][2]
+    from autoshelf.ui import setup_dialog
+
+    make(shelf / "loose.pdf", "invoice")
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(setup_dialog, "icloud_drive", lambda: None)
+    dialog = setup_dialog.SetupDialog(service, runner, parent, first=True)
+    assert not dialog.yesButton.isEnabled()  # no folder yet
+    dialog.set_folder(shelf)
+    settle(qtbot, runner)
+    assert dialog.folder == shelf
+    assert dialog.time.text().startswith(("About", "Less than"))
+    assert "1 new file to sort now" in dialog.lines.text()
+    assert "one-time download" in dialog.lines.text()  # the fake model isn't on disk
+    assert dialog.yesButton.isEnabled() and dialog.paused_button.isEnabled()
+    dialog.paused_button.click()
+    assert dialog.choice == "paused"
+
+    home = setup_dialog.SetupDialog(service, runner, parent)
+    home.set_folder(Path.home())
+    assert "home folder" in home.problem.text()
+    assert not home.yesButton.isEnabled()
+
+
+def test_setup_warns_about_the_top_of_icloud_drive(
+    qtbot, service, runner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui import setup_dialog
+
+    drive = tmp_path / "iCloudDrive"
+    (drive / "Documents").mkdir(parents=True)
+    monkeypatch.setattr(setup_dialog, "icloud_drive", lambda: drive)
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    dialog = setup_dialog.SetupDialog(service, runner, parent, first=True)
+    assert dialog.path.text() == str(drive / "AutoShelf")  # suggested, not there yet
+    assert dialog.make_button.isVisibleTo(dialog)
+    dialog.set_folder(drive)
+    assert dialog.warning.isVisibleTo(dialog)
+    dialog.use_subfolder.click()
+    assert (drive / "AutoShelf").is_dir()
+    assert dialog.path.text() == str(drive / "AutoShelf")
+    assert not dialog.warning.isVisibleTo(dialog)
+
+
+def test_progress_shows_the_time_left(qtbot, service, runner) -> None:
+    from autoshelf.features.estimate import Estimate
+    from autoshelf.ui.progress_panel import ProgressPanel
+    from autoshelf.watcher import service as watch
+
+    panel = ProgressPanel(service, runner)
+    qtbot.addWidget(panel)
+    panel.set_estimate(Estimate(100, 0, 100, 4, 0, 10, 20, reading_seconds=100, sorting_seconds=4))
+    panel.show_progress(watch.Progress(watch.READING, 10, 100))
+    assert panel.isVisibleTo(panel.parentWidget() or panel)
+    assert panel.title.text() == "Reading your folders"
+    assert panel.detail.text() == "10 of 100 files (once only)"
+    assert panel.left.text() == "about 2 minutes left"  # 90% of 100 s, plus 4 s of sorting
+    assert panel.bar.value() == 10
+    panel.show_progress(watch.Progress(watch.SORTING, 1, 4))
+    assert panel.title.text() == "Sorting new files"
+    assert panel.left.text() == "less than a minute left"
+    panel.show_progress(watch.Progress(watch.READY))
+    assert panel.title.text() == "Done"
+    panel.show_progress(watch.Progress(watch.PAUSED, 0, 3))
+    assert panel.detail.text() == "3 new files will be sorted when you resume"
 
 
 def test_notification_text() -> None:

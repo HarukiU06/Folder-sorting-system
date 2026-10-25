@@ -124,6 +124,45 @@ def digest(sorted_files: int, waiting: int, learned: int) -> str:
     )
 
 
+def duration(seconds: float) -> str:
+    """ "less than a minute", "about 3 minutes", "about 2 hours"."""
+    if seconds < 60:
+        return "less than a minute"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return "about 1 minute" if minutes == 1 else f"about {minutes} minutes"
+    hours = round(seconds / 3600)
+    return "about 1 hour" if hours == 1 else f"about {hours} hours"
+
+
+def duration_range(low: float, high: float) -> str:
+    """ "About 3 to 5 minutes", "Less than a minute", "About 1 to 2 hours"."""
+    if high < 60:
+        return "Less than a minute"
+    if high < 3600:
+        first, last = max(1, round(low / 60)), max(1, round(high / 60))
+        unit = "minute" if last == 1 else "minutes"
+    else:
+        first, last = max(1, round(low / 3600)), max(1, round(high / 3600))
+        unit = "hour" if last == 1 else "hours"
+    return f"About {last} {unit}" if first >= last else f"About {first} to {last} {unit}"
+
+
+def estimate_lines(estimate) -> list[str]:
+    """What AutoShelf will do before everything is sorted (features.estimate.Estimate)."""
+    files = f"{estimate.library_files:,} file{'' if estimate.library_files == 1 else 's'}"
+    lines = [f"{files} in your folders"]
+    if estimate.name_only:
+        lines[0] += f" ({estimate.name_only:,} online-only: names only, nothing downloaded)"
+    if estimate.library_files and not estimate.to_read:
+        lines[0] += ", already known"
+    lines.append(f"{estimate.to_sort:,} new file{'' if estimate.to_sort == 1 else 's'} to sort now")
+    if estimate.download_bytes:
+        size = round(estimate.download_bytes / 1_000_000)
+        lines.append(f"A one-time download of the language model ({size} MB)")
+    return lines
+
+
 def size_text(size: int) -> str:
     """1536 -> "1.5 KB"."""
     value = float(size)

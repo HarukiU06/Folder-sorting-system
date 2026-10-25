@@ -40,6 +40,7 @@ from autoshelf.features import ask as ask_features
 from autoshelf.features import convert as convert_features
 from autoshelf.features import digest as digest_features
 from autoshelf.features import duplicates as duplicate_features
+from autoshelf.features import estimate as estimate_features
 from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
 from autoshelf.features import rename as rename_features
@@ -54,11 +55,11 @@ from autoshelf.fsutil import is_within
 from autoshelf.instance import LOCK_FILENAME, WatchLock
 from autoshelf.layout import PROCESSED_ZONES, Zone, inbox_dir, zone_of
 from autoshelf.ml import calibrate as calibration
-from autoshelf.ml.embedder import Embedder, is_downloaded
+from autoshelf.ml.embedder import Embedder, is_downloaded, model_bytes_on_disk
 from autoshelf.ml.library import LibraryIndex, scan_library
 from autoshelf.pipeline import Outcome
 from autoshelf.watcher.ignore import ignore_reason
-from autoshelf.watcher.service import WatchService
+from autoshelf.watcher.service import Progress, WatchService
 
 log = logging.getLogger(__name__)
 
@@ -191,6 +192,7 @@ class AppService:
         self.on_outcome: Callable[[Outcome], None] | None = None
         self.on_status: Callable[[str], None] | None = None
         self.on_learned: Callable[[list[learning.Relocation]], None] | None = None
+        self.on_progress: Callable[[Progress], None] | None = None
         self._search_index = SearchIndex()
 
     # --- settings -----------------------------------------------------------------
@@ -342,6 +344,7 @@ class AppService:
                 on_outcome=self._outcome,
                 on_status=self._status,
                 on_learned=self._learned,
+                on_progress=self._progress,
                 watched=watched,
                 watched_extensions=settings.watched_extensions,
                 sweep_interval=settings.sweep_minutes * 60,
@@ -382,6 +385,10 @@ class AppService:
     def _status(self, message: str) -> None:
         if self.on_status is not None:
             self.on_status(message)
+
+    def _progress(self, progress: Progress) -> None:
+        if self.on_progress is not None:
+            self.on_progress(progress)
 
     def _learned(self, relocations: list[learning.Relocation]) -> None:
         if self.on_learned is not None:
@@ -815,6 +822,31 @@ class AppService:
         return service.self_moves.expect
 
     # --- how well would AutoShelf sort this library? ----------------------------------------
+
+    def estimate(self, root: Path | None = None) -> estimate_features.Estimate:
+        """How long getting ready in ``root`` (the configured root by default) and sorting
+        the new files waiting there will take (looks at names and sizes only)."""
+        root = self.check_root(root) if root is not None else self._require_root()
+        settings = self.settings()
+        loose = self.loose_files(root)
+        with self._connect() as conn:
+            return estimate_features.estimate(
+                root,
+                settings.embedding_model,
+                self.paths.model_dir,
+                loose_files=loose,
+                conn=conn,
+                ignore_patterns=settings.ignore_patterns,
+            )
+
+    def model_download(self) -> tuple[int, int] | None:
+        """(bytes so far, bytes in all) while the language model is still to be downloaded;
+        None once it is on this PC."""
+        model = self.settings().embedding_model
+        if is_downloaded(model, self.paths.model_dir):
+            return None
+        done = model_bytes_on_disk(model, self.paths.model_dir)
+        return done, max(done, estimate_features.MODEL_BYTES)
 
     def library_file_count(self) -> int:
         """How many files your folders hold (reads no file)."""

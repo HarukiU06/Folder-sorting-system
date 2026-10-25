@@ -146,10 +146,33 @@ def _load_model(model_name: str, cache_dir: Path):
         raise EmbedderError(f"couldn't load the language model {model_name!r}: {exc}") from exc
 
 
+WEIGHT_FILES = ("*.safetensors", "pytorch_model.bin")
+
+
 def is_downloaded(model_name: str, cache_dir: Path) -> bool:
-    """True if the model is already in the cache (so loading it needs no download)."""
+    """True if the model is already in the cache (so loading it needs no download).
+
+    A download that stopped halfway leaves the small files of a snapshot but not its
+    weights, so the weights are what is looked for.
+    """
     snapshots = cache_dir / ("models--" + model_name.replace("/", "--")) / "snapshots"
-    return snapshots.is_dir() and any(snapshots.iterdir())
+    if not snapshots.is_dir():
+        return False
+    return any(
+        weights.is_file()
+        for snapshot in snapshots.iterdir()
+        for pattern in WEIGHT_FILES
+        for weights in snapshot.glob(pattern)
+    )
+
+
+def model_bytes_on_disk(model_name: str, cache_dir: Path) -> int:
+    """How much of the model is in the cache so far (to follow a download)."""
+    folder = cache_dir / ("models--" + model_name.replace("/", "--")) / "blobs"
+    try:
+        return sum(entry.stat().st_size for entry in folder.iterdir() if entry.is_file())
+    except OSError:
+        return 0
 
 
 _loaded: dict[tuple[str, Path], SentenceTransformerEmbedder] = {}

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from autoshelf import commands, explorer, links, wording
 from autoshelf.app_service import AppService, WhyHere
@@ -27,6 +27,7 @@ from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import calibrate as calibration
 from autoshelf.pipeline import Outcome
 from autoshelf.toasts import Note, Toaster, default_toaster
+from autoshelf.ui import setup_dialog as setup
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.main_window import MainWindow
 from autoshelf.ui.tasks import TaskRunner
@@ -48,12 +49,6 @@ FORWARD_SECONDS = 20.0
 QUIT_SECONDS = 20.0
 SHOW_COMMAND = Command(commands.SHOW)
 QUIT_COMMAND = Command(commands.QUIT)
-
-
-def icloud_drive() -> Path | None:
-    """The iCloud Drive folder of iCloud for Windows, if there is one."""
-    folder = Path.home() / "iCloudDrive"
-    return folder if folder.is_dir() else None
 
 
 def notification_text(outcomes: list[Outcome]) -> tuple[str, str]:
@@ -100,6 +95,7 @@ class AutoShelfApp(QObject):
     outcome_arrived = Signal(object)  # emitted from the watcher's thread
     status_arrived = Signal(str)
     learned_arrived = Signal(object)
+    progress_arrived = Signal(object)  # watcher Progress, from the watcher's thread
 
     def __init__(
         self,
@@ -132,6 +128,8 @@ class AutoShelfApp(QObject):
         service.on_outcome = self.outcome_arrived.emit
         service.on_status = self.status_arrived.emit
         service.on_learned = self.learned_arrived.emit
+        service.on_progress = self.progress_arrived.emit
+        self.progress_arrived.connect(self.window.progress.show_progress)
         self.outcome_arrived.connect(self._on_outcome)
         self.status_arrived.connect(self._on_status)
         self.learned_arrived.connect(lambda relocations: self.window.after_learning())
@@ -163,6 +161,7 @@ class AutoShelfApp(QObject):
             self.show_window(self.window.settings)
             QTimer.singleShot(0, self.choose_root)
             return
+        self.runner.run(self.service.estimate, self.window.progress.set_estimate, lambda exc: None)
         self.service.start()
         self.runner.run(self.service.repair_integration, None, lambda exc: None)
         self.check_digest()
@@ -273,28 +272,17 @@ class AutoShelfApp(QObject):
         self.runner.run(self.service.restart, restarted)
 
     def choose_root(self) -> None:
-        """Let the user pick the folder to sort, then (re)start watching it."""
+        """Let the user pick the folder to sort (with what starting there involves), then
+        (re)start watching it."""
         current = self.service.root()
-        start = current or icloud_drive() or Path.home()
-        folder = QFileDialog.getExistingDirectory(
-            self.window, "Choose the folder AutoShelf should sort", str(start)
-        )
-        if not folder:
+        answer = self.ask_for_folder(current)
+        if answer is None:
             return
-        try:
-            root = self.service.check_root(Path(folder))
-        except ConfigError as exc:
-            QMessageBox.warning(self.window, "This folder can't be used", str(exc))
+        root, choice, estimate = answer
+        paused = choice == setup.PAUSED
+        if current is not None and root == current and paused == self.service.paused():
             return
-        if current is not None and root == current:
-            return
-        paused = self.service.settings().paused
-        loose = self.service.loose_files(root)
-        if loose:
-            choice = self.ask_about_loose_files(root, loose)
-            if choice is None:
-                return
-            paused = choice == "paused"
+        self.window.progress.set_estimate(estimate)
 
         def switch() -> bool:
             self.service.set_root(root)
@@ -309,29 +297,15 @@ class AutoShelfApp(QObject):
 
         self.runner.run(switch, switched)
 
-    def ask_about_loose_files(self, root: Path, count: int) -> str | None:
-        """Ask whether to sort files already in a new root: "now", "paused" or None."""
-        box = QMessageBox(self.window)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Files are waiting in this folder")
-        box.setText(
-            f"{count} file{'' if count == 1 else 's'} in {root} (or its _Inbox) would be "
-            "sorted straight away."
+    def ask_for_folder(self, current: Path | None):
+        """The setup dialog: (folder, "now" or "paused", its estimate), or None."""
+        self.show_window(self.window.settings)
+        dialog = setup.SetupDialog(
+            self.service, self.runner, self.window, current=current, first=current is None
         )
-        box.setInformativeText(
-            "Sort them now, or start paused so you can look first? You can resume any time "
-            "from the tray menu or Settings."
-        )
-        now = box.addButton("Sort them now", QMessageBox.ButtonRole.AcceptRole)
-        paused = box.addButton("Start paused", QMessageBox.ButtonRole.ActionRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is now:
-            return "now"
-        if clicked is paused:
-            return "paused"
-        return None
+        if not dialog.exec() or dialog.folder is None:
+            return None
+        return dialog.folder, dialog.choice, dialog.estimate
 
     # --- commands from Explorer's menu, notifications and later launches ------------
 

@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
@@ -40,6 +41,22 @@ _PROGRESS_EVERY = 25
 _MTIME_TOLERANCE = 1e-3
 
 LibraryFactory = Callable[[sqlite3.Connection], LibraryIndex]
+
+# What the watcher is busy with, for the app's progress bar (Progress.stage).
+LOADING = "loading"  # starting (or downloading) the language model
+READING = "reading"  # reading the files already in your folders, once
+SORTING = "sorting"  # sorting the new files that were waiting
+PAUSED = "paused"  # new files are waiting, but sorting is paused
+READY = "ready"  # nothing left to do: watching for new files
+
+
+@dataclass(frozen=True)
+class Progress:
+    """How far the watcher has got: ``done`` of ``total`` steps of ``stage``."""
+
+    stage: str
+    done: int = 0
+    total: int = 0
 
 
 class _EventHandler(FileSystemEventHandler):
@@ -106,6 +123,7 @@ class WatchService:
         paused: bool = False,
         on_status: Callable[[str], None] | None = None,
         on_learned: Callable[[Sequence], None] | None = None,
+        on_progress: Callable[[Progress], None] | None = None,
         learn_delay: float = LEARN_DELAY_SECONDS,
         watched: Sequence[Path] = (),
         watched_extensions: Iterable[str] = (),
@@ -124,6 +142,8 @@ class WatchService:
         self.margin = margin
         self._on_status = on_status
         self._on_learned = on_learned
+        self._on_progress = on_progress
+        self._sorting: list[int] | None = None  # [done, total] while new files are sorted
         self._learn_delay = learn_delay
         self.watched = tuple(watched)
         self.watched_extensions = {ext.casefold() for ext in watched_extensions}
@@ -198,6 +218,8 @@ class WatchService:
         log.info("Sorting resumed%s", f"; {len(held)} waiting file(s) next" if held else "")
         for path in held:
             self.offer(path)
+        if held:
+            self._begin_sorting(len(held))
 
     def offer(self, path: Path) -> None:
         """Consider a path from a file event; track it if it should be processed."""
@@ -333,6 +355,7 @@ class WatchService:
         if self._make_library is None:
             return None
         self._status("Loading the language model...")
+        self._progress(Progress(LOADING))
         try:
             library = self._make_library(conn)
             stats = library.refresh(progress=self._index_progress)
@@ -395,9 +418,46 @@ class WatchService:
                 log.exception("Learned callback failed")
 
     def _index_progress(self, done: int, total: int) -> None:
+        self._progress(Progress(READING, done, total))
         if done == total or done % _PROGRESS_EVERY == 0:
             log.info("Reading files already in your folders: %d/%d", done, total)
             self._status(f"Reading files already in your folders: {done}/{total}")
+
+    def _progress(self, progress: Progress) -> None:
+        if self._on_progress is not None:
+            try:
+                self._on_progress(progress)
+            except Exception:
+                log.exception("Progress callback failed")
+
+    def _begin_sorting(self, count: int) -> None:
+        """``count`` new files are about to be sorted (or held, while paused)."""
+        if count == 0:
+            self._sorting = None
+            self._progress(Progress(READY))
+        elif self._paused.is_set():
+            self._sorting = None
+            self._progress(Progress(PAUSED, 0, count))
+        else:
+            self._sorting = [0, count]
+            self._progress(Progress(SORTING, 0, count))
+
+    def _sorted_one(self) -> None:
+        sorting = self._sorting
+        if sorting is None:
+            return
+        sorting[0] += 1
+        if sorting[0] >= sorting[1]:
+            self._sorting = None
+            self._progress(Progress(READY))
+        else:
+            self._progress(Progress(SORTING, sorting[0], sorting[1]))
+
+    def _check_sorting_done(self) -> None:
+        """Files that vanished or turned out to be ignored never arrive: stop waiting."""
+        if self._sorting is not None and len(self.tracker) == 0:
+            self._sorting = None
+            self._progress(Progress(READY))
 
     def _status(self, message: str) -> None:
         if self._on_status is not None:
@@ -421,7 +481,8 @@ class WatchService:
             watched_extensions=self.watched_extensions,
         )
         try:
-            self.offer_loose_files(conn)  # files that arrived while AutoShelf wasn't running
+            # files that arrived while AutoShelf wasn't running
+            self._begin_sorting(self.offer_loose_files(conn))
             next_sweep = self._next_sweep()
             while not self._stop.wait(self.poll_interval):
                 ready = self.tracker.poll()
@@ -437,6 +498,9 @@ class WatchService:
                         self._report(pipeline.process(path))
                     except Exception:
                         log.exception("Error while reporting on %s; still watching", path)
+                    self._sorted_one()
+                if not ready:
+                    self._check_sorting_done()
                 if self._library_refresh_due():
                     self._relearn(pipeline.library)
                 if next_sweep is not None and time.monotonic() >= next_sweep:

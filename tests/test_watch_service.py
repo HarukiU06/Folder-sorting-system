@@ -291,3 +291,50 @@ def test_sorting_dropped_files_doesnt_rescan_the_library(
 
     assert len(list((root / "Recipes").iterdir())) == 4
     assert len(scans) == 1  # only when the watcher started
+
+
+def test_progress_from_loading_to_ready(root: Path, run_service) -> None:
+    from autoshelf.watcher import service as watch
+
+    make(root / "Finance" / "invoice 2024.txt", "invoice tax")
+    make(root / "Recipes" / "cake.txt", "baking")
+    make(root / "bill.txt", "invoice")
+    make(root / "notes.txt", "notes")
+    seen: list = []
+    ready = threading.Event()
+
+    def progress(item) -> None:
+        seen.append(item)
+        if item.stage == watch.READY:
+            ready.set()
+
+    run_service(
+        make_library=lambda c: LibraryIndex(c, root, FakeEmbedder()),
+        threshold=0.3,
+        margin=0.1,
+        on_progress=progress,
+    )
+    assert ready.wait(TIMEOUT), seen
+    stages = [item.stage for item in seen]
+    assert stages[0] == watch.LOADING
+    assert watch.Progress(watch.READING, 2, 2) in seen  # the two files in your folders
+    assert watch.Progress(watch.SORTING, 0, 2) in seen  # the two new files
+    assert watch.Progress(watch.SORTING, 1, 2) in seen
+    assert stages[-1] == watch.READY
+
+
+def test_progress_while_paused(root: Path, run_service) -> None:
+    from autoshelf.watcher import service as watch
+
+    make(root / "bill.txt", "invoice")
+    seen: list = []
+    done = threading.Event()
+
+    def progress(item) -> None:
+        seen.append(item)
+        if item.stage in (watch.PAUSED, watch.READY):
+            done.set()
+
+    run_service(paused=True, on_progress=progress)
+    assert done.wait(TIMEOUT), seen
+    assert seen[-1] == watch.Progress(watch.PAUSED, 0, 1)

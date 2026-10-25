@@ -3,7 +3,14 @@
 from pathlib import Path
 
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QStackedWidget, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import FluentIcon, NavigationInterface, NavigationItemPosition
 
 from autoshelf.app_service import AppService
@@ -12,6 +19,7 @@ from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
 from autoshelf.ui.library_view import LibraryView
+from autoshelf.ui.progress_panel import ProgressPanel
 from autoshelf.ui.settings_view import SettingsView
 from autoshelf.ui.style import apply_theme
 from autoshelf.ui.tasks import TaskRunner
@@ -54,8 +62,16 @@ class MainWindow(QMainWindow):
         self.navigation.setMinimumExpandWidth(SIDEBAR_WIDTH)
         self.navigation.expand(useAni=False)  # it opened at its default width
         self.pages = QStackedWidget()
+        self.progress = ProgressPanel(service, runner)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(28, 12, 28, 0)
+        progress_row.addWidget(self.progress)
+        right.addLayout(progress_row)
+        right.addWidget(self.pages, 1)
         layout.addWidget(self.navigation)
-        layout.addWidget(self.pages, 1)
+        layout.addLayout(right, 1)
         self.setCentralWidget(central)
 
         top, bottom = NavigationItemPosition.TOP, NavigationItemPosition.BOTTOM

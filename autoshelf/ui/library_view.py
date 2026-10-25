@@ -40,6 +40,7 @@ from qfluentwidgets import (
     TransparentToolButton,
 )
 
+from autoshelf import wording
 from autoshelf.app_service import AppService, FileInfo, FolderInfo
 from autoshelf.features import convert
 from autoshelf.ui.tasks import TaskRunner
@@ -293,7 +294,7 @@ class LibraryView(QWidget):
             rows = [
                 (
                     hit.path,
-                    hit.folder or "(root)",
+                    wording.place(hit.folder or "(root)"),
                     ("[has the words] " if hit.keyword else "")
                     + (f"Summary: {hit.summary}" if hit.summary else hit.snippet),
                 )
@@ -430,7 +431,7 @@ class LibraryView(QWidget):
             return
         self.name.setText(info.path.name)
         modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
-        where = info.folder or "(root)"
+        where = wording.place(info.folder or "(root)")
         title = f"<br>Title: {html.escape(info.title)}" if info.title else ""
         self.facts.setText(
             f"In {html.escape(where)} &middot; {_size(info.size)} &middot; {modified}{title}"
@@ -476,7 +477,9 @@ class LibraryView(QWidget):
             self.changed.emit(f"Made {names}")
             if created:
                 folder = self._info.folder if self._info else ""
-                self._show_rows([(item.dst, folder or "(root)", "") for item in created])
+                self._show_rows(
+                    [(item.dst, wording.place(folder or "(root)"), "") for item in created]
+                )
 
         def failed(exc: Exception) -> None:
             self.summary.setText(str(exc))
@@ -520,7 +523,7 @@ class LibraryView(QWidget):
                     lambda: self.service.rename(info.path, name.strip()),
                     lambda result: (
                         self.changed.emit(f"Renamed to {result.dst.name} (undo in History)"),
-                        self._show_rows([(result.dst, info.folder or "(root)", "")]),
+                        self._show_rows([(result.dst, wording.place(info.folder or "(root)"), "")]),
                     ),
                     lambda exc: QMessageBox.warning(self, "Couldn't rename", str(exc)),
                 )

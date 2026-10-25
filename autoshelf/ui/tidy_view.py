@@ -31,7 +31,7 @@ from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import plain_tooltip, show_in_explorer
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
-ROOT_CHOICE = "The root (files not sorted yet)"
+ROOT_CHOICE = "Your AutoShelf folder (files not sorted yet)"
 OTHER_CHOICE = "Another folder..."
 LEAVE = "(leave it)"
 
@@ -361,7 +361,8 @@ class OrganizePage(QWidget):
             self.table.setItem(row, 1, name)
             # A folder outside the root is shown by its name (the whole path as a tooltip).
             current = Path(proposal.current)
-            now_in = QTableWidgetItem(current.name if current.is_absolute() else proposal.current)
+            shown = current.name if current.is_absolute() else wording.place(proposal.current)
+            now_in = QTableWidgetItem(shown)
             now_in.setToolTip(proposal.current)
             self.table.setItem(row, 2, now_in)
             target = QComboBox()

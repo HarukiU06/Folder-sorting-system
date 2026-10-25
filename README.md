@@ -550,9 +550,10 @@ compression need PyMuPDF too). One license for the source and the app keeps that
 The source of each release is the commit its tag points to; GitHub attaches it to the
 Release as a ZIP.
 
-AutoShelf also uses, among others: PySide6 / Qt (LGPL-3.0), mutagen (GPL-2.0-or-later),
+AutoShelf also uses, among others: PySide6 / Qt (LGPL-3.0), PySide6-Fluent-Widgets
+(GPL-3.0) and PySideSix-Frameless-Window (LGPL-3.0), mutagen (GPL-2.0-or-later),
 PyTorch, sentence-transformers, transformers, numpy, watchdog, python-docx, python-pptx,
-openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools, fire,
+openpyxl, Pillow, beautifulsoup4, striprtf, keyring, pdf2docx, fonttools, fire, darkdetect, pywin32,
 windows-toasts and the winrt packages (BSD, MIT, Apache-2.0 or similar), and
 opencv-python-headless (Apache-2.0, needed by pdf2docx; it includes an FFmpeg library under
 LGPL-2.1). All of them may be combined with an AGPL-3.0 program. The installer is made with

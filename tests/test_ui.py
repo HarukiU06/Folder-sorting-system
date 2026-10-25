@@ -306,7 +306,7 @@ def test_app_sorts_and_reports_files_needing_a_decision(qtbot, app, shelf: Path)
         lambda: "Where should notes.txt go?" in status.currentMessage(), timeout=WAIT_MS
     )
     qtbot.waitUntil(lambda: app.window.inbox.list.count() == 1, timeout=WAIT_MS)
-    assert app.window.tabs.tabText(0) == "Inbox (1)"
+    assert app.window.page_title(app.window.inbox) == "Inbox (1)"
 
 
 def test_pausing_from_the_tray_updates_settings(qtbot, app) -> None:
@@ -538,7 +538,7 @@ def test_sort_with_autoshelf_shows_a_preview(qtbot, app, shelf: Path, tmp_path: 
     app.run_command(Command(commands.SORT, (str(bill),)))
     page = app.window.tidy.organize
     qtbot.waitUntil(lambda: page.table.rowCount() == 1, timeout=WAIT_MS)
-    assert app.window.tabs.currentWidget() is app.window.tidy
+    assert app.window.current_page() is app.window.tidy
     assert page.source.currentText() == "Files chosen in Explorer"
     assert page.table.item(0, 2).text() == "Downloads"  # the folder, not its whole path
     assert page.table.cellWidget(0, 3).currentText() == "Finance"
@@ -862,7 +862,7 @@ def test_settings_add_and_remove_a_watched_folder(
 def test_main_window_has_every_screen(qtbot, service, runner) -> None:
     window = MainWindow(service, runner, keep_running_on_close=False)
     qtbot.addWidget(window)
-    names = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    names = window.page_titles()
     assert names == [
         "Inbox",
         "Library",
@@ -871,14 +871,13 @@ def test_main_window_has_every_screen(qtbot, service, runner) -> None:
         "Rules",
         "Tidy up",
         "Dashboard",
-        "Ask",
         "Settings",
     ]
-    assert not window.tabs.isTabVisible(window.tabs.indexOf(window.ask))  # AI is off
+    assert not window.is_page_visible(window.ask)  # AI is off
     window.set_ai_enabled(True)
-    assert window.tabs.isTabVisible(window.tabs.indexOf(window.ask))
-    for index in range(window.tabs.count()):
-        window.tabs.setCurrentIndex(index)
+    assert window.is_page_visible(window.ask)
+    for index in range(window.pages.count()):
+        window.show_tab(window.pages.widget(index))
         settle(qtbot, runner)
 
 
@@ -1348,7 +1347,7 @@ def test_a_click_on_the_notification_opens_the_inbox(qtbot, app, shelf: Path) ->
     token = app.service.offer(waiting, ["Finance"])
     app.run_command(Command(commands.URL, url=f"autoshelf:inbox?offer={token}"))
     qtbot.waitUntil(lambda: app.window.isVisible(), timeout=WAIT_MS)
-    assert app.window.tabs.currentWidget() is app.window.inbox
+    assert app.window.current_page() is app.window.inbox
     app.run_command(Command(commands.URL, url="autoshelf:nonsense"))  # ignored, no error
 
 
@@ -1387,7 +1386,7 @@ def test_the_weekly_digest_opens_the_dashboard(qtbot, service: AppService, shelf
         assert note.message == "This week: 23 sorted, 3 waiting in Inbox, 1 correction learned"
         assert note.launch == "autoshelf:dashboard" and note.buttons == ()
         app.run_command(Command(commands.URL, url=note.launch))
-        assert app.window.tabs.currentWidget() is app.window.dashboard
+        assert app.window.current_page() is app.window.dashboard
     finally:
         app.shutdown()
 
@@ -1400,10 +1399,10 @@ def test_a_plain_digest_notification_also_opens_the_dashboard(qtbot, app) -> Non
     status = app.window.statusBar()
     qtbot.waitUntil(lambda: "This week: 1 sorted" in status.currentMessage(), timeout=WAIT_MS)
     app.tray.message_clicked.emit()
-    assert app.window.tabs.currentWidget() is app.window.dashboard
+    assert app.window.current_page() is app.window.dashboard
     app._clicked_opens = "inbox"
     app.tray.message_clicked.emit()
-    assert app.window.tabs.currentWidget() is app.window.inbox
+    assert app.window.current_page() is app.window.inbox
 
 
 def test_the_weekly_digest_can_be_turned_off(qtbot, service, runner) -> None:

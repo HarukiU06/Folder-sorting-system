@@ -1,9 +1,10 @@
-"""The main window: one tab per screen."""
+"""The main window: a sidebar on the left, one page per screen."""
 
 from pathlib import Path
 
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QStackedWidget, QWidget
+from qfluentwidgets import FluentIcon, NavigationInterface, NavigationItemPosition
 
 from autoshelf.app_service import AppService
 from autoshelf.ui.ask_view import AskView
@@ -15,10 +16,12 @@ from autoshelf.ui.inbox_view import InboxView
 from autoshelf.ui.library_view import LibraryView
 from autoshelf.ui.rules_view import RulesView
 from autoshelf.ui.settings_view import SettingsView
+from autoshelf.ui.style import apply_theme
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.tidy_view import TidyView
 
 MESSAGE_MSECS = 8000
+SIDEBAR_WIDTH = 220
 
 
 class MainWindow(QMainWindow):
@@ -28,10 +31,11 @@ class MainWindow(QMainWindow):
         self, service: AppService, runner: TaskRunner, *, keep_running_on_close: bool = True
     ) -> None:
         super().__init__()
+        apply_theme()
         self.keep_running_on_close = keep_running_on_close
         self.setWindowTitle("AutoShelf")
         self.setWindowIcon(app_icon())
-        self.resize(1000, 660)
+        self.resize(1100, 720)
 
         self.inbox = InboxView(service, runner)
         self.library = LibraryView(service, runner)
@@ -42,20 +46,38 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardView(service, runner)
         self.ask = AskView(service, runner)
         self.settings = SettingsView(service, runner)
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.inbox, "Inbox")
-        self.tabs.addTab(self.library, "Library")
-        self.tabs.addTab(self.history, "History")
-        self.tabs.addTab(self.folders, "Folders")
-        self.tabs.addTab(self.rules, "Rules")
-        self.tabs.addTab(self.tidy, "Tidy up")
-        self.tabs.addTab(self.dashboard, "Dashboard")
-        self.tabs.addTab(self.ask, "Ask")
-        self.tabs.addTab(self.settings, "Settings")
-        self.tabs.setTabVisible(self.tabs.indexOf(self.ask), False)  # only with AI on
+
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.navigation = NavigationInterface(
+            central, showMenuButton=False, showReturnButton=False, collapsible=False
+        )
+        self.navigation.setExpandWidth(SIDEBAR_WIDTH)
+        self.navigation.setMinimumExpandWidth(SIDEBAR_WIDTH)
+        self.navigation.expand(useAni=False)  # it opened at its default width
+        self.pages = QStackedWidget()
+        layout.addWidget(self.navigation)
+        layout.addWidget(self.pages, 1)
+        self.setCentralWidget(central)
+
+        top, bottom = NavigationItemPosition.TOP, NavigationItemPosition.BOTTOM
+        self._titles: dict[QWidget, str] = {}
+        self._add(self.inbox, "inbox", FluentIcon.MAIL, "Inbox", top)
+        self._add(self.library, "library", FluentIcon.LIBRARY, "Library", top)
+        self._add(self.history, "history", FluentIcon.HISTORY, "History", top)
+        self._add(self.folders, "folders", FluentIcon.FOLDER, "Folders", top)
+        self._add(self.rules, "rules", FluentIcon.EDIT, "Rules", top)
+        self._add(self.tidy, "tidy", FluentIcon.BROOM, "Tidy up", top)
+        self._add(self.dashboard, "dashboard", FluentIcon.PIE_SINGLE, "Dashboard", top)
+        self._add(self.ask, "ask", FluentIcon.CHAT, "Ask", top)
+        self._add(self.settings, "settings", FluentIcon.SETTING, "Settings", bottom)
+        self.set_page_visible(self.ask, False)  # only with AI on
+        self.navigation.setCurrentItem("inbox")
+
         self.settings.ai_state.connect(self.set_ai_enabled)
         self.settings.message.connect(self.show_message)
-        self.setCentralWidget(self.tabs)
         self.state = QLabel()
         self.statusBar().addPermanentWidget(self.state)
 
@@ -66,11 +88,45 @@ class MainWindow(QMainWindow):
         self.rules.changed.connect(self._after_rules)
         self.library.changed.connect(self._after_rules)
         self.tidy.changed.connect(self._after_move)
-        self.tabs.currentChanged.connect(self._tab_changed)
+        self.pages.currentChanged.connect(self._page_changed)
+
+    def _add(self, page: QWidget, key: str, icon, title: str, position) -> None:
+        page.setObjectName(key)
+        self.pages.addWidget(page)
+        self._titles[page] = title
+        self.navigation.addItem(
+            key, icon, title, lambda *_, page=page: self.show_tab(page), position=position
+        )
+
+    # --- pages ------------------------------------------------------------------------
+
+    def current_page(self) -> QWidget:
+        """The page on show."""
+        return self.pages.currentWidget()
+
+    def page_title(self, page: QWidget) -> str:
+        """The page's name in the sidebar (the Inbox's includes its count)."""
+        return self.navigation.widget(page.objectName()).text()
+
+    def page_titles(self) -> list[str]:
+        """The names of the pages the sidebar shows, top to bottom."""
+        return [
+            self.page_title(page)
+            for page in self._titles
+            if self.navigation.widget(page.objectName()).isVisibleTo(self.navigation)
+        ]
+
+    def set_page_visible(self, page: QWidget, visible: bool) -> None:
+        """Show or hide a page's sidebar entry."""
+        self.navigation.widget(page.objectName()).setVisible(visible)
+
+    def is_page_visible(self, page: QWidget) -> bool:
+        """True if the sidebar offers the page."""
+        return self.navigation.widget(page.objectName()).isVisibleTo(self.navigation)
 
     def set_ai_enabled(self, enabled: bool) -> None:
         """Show the AI features only when an AI provider is chosen in Settings."""
-        self.tabs.setTabVisible(self.tabs.indexOf(self.ask), enabled)
+        self.set_page_visible(self.ask, enabled)
         self.library.set_ai_enabled(enabled)
         self.folders.set_ai_enabled(enabled)
         self.tidy.set_ai_enabled(enabled)
@@ -84,12 +140,13 @@ class MainWindow(QMainWindow):
         self.state.setText(text)
 
     def show_tab(self, widget) -> None:
-        """Switch to one of the tabs."""
-        self.tabs.setCurrentWidget(widget)
+        """Switch to one of the pages."""
+        self.pages.setCurrentWidget(widget)
+        self.navigation.setCurrentItem(widget.objectName())
 
     def show_inbox(self, path: Path | None = None) -> None:
         """Switch to the Inbox, optionally selecting one file."""
-        self.tabs.setCurrentWidget(self.inbox)
+        self.show_tab(self.inbox)
         self.inbox.select(path)
         self.inbox.refresh()
 
@@ -122,12 +179,10 @@ class MainWindow(QMainWindow):
             self.show_message(message)
 
     def _show_count(self, count: int) -> None:
-        self.tabs.setTabText(
-            self.tabs.indexOf(self.inbox), f"Inbox ({count})" if count else "Inbox"
-        )
+        self.navigation.widget("inbox").setText(f"Inbox ({count})" if count else "Inbox")
 
-    def _tab_changed(self, index: int) -> None:
-        widget = self.tabs.widget(index)
+    def _page_changed(self, index: int) -> None:
+        widget = self.pages.widget(index)
         if widget is self.history:
             self.history.refresh()
         elif widget is self.folders:

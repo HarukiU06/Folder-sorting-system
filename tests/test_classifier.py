@@ -15,7 +15,7 @@ from autoshelf.ml.classifier import (
     is_related,
     score_folders,
 )
-from autoshelf.wording import reason_text
+from autoshelf.wording import reason_text, waiting_text
 
 THRESHOLD = 0.4
 MARGIN = 0.1
@@ -60,6 +60,17 @@ def test_two_close_folders_ask() -> None:
 def test_low_score_explanation_names_the_threshold() -> None:
     classification = choose(scores(Finance=0.2), THRESHOLD, MARGIN)
     assert "below the 0.40" in reason_text(classification.reason)
+
+
+def test_the_inbox_says_why_without_numbers() -> None:
+    close = waiting_text(choose(scores(Finance=0.60, Taxes=0.55), THRESHOLD, MARGIN).reason)
+    assert close == "It fits Finance and Taxes about equally well, so AutoShelf is asking you."
+    low = waiting_text(choose(scores(Finance=0.2), THRESHOLD, MARGIN).reason)
+    assert low == "None of your folders is a clear match. The closest is Finance."
+    assert waiting_text(choose([], THRESHOLD, MARGIN).reason) == (
+        "There are no folders to sort into yet."
+    )
+    assert waiting_text(None) == ""
 
 
 def test_single_folder_needs_only_the_threshold() -> None:

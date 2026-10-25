@@ -13,6 +13,7 @@ from fakes import FakeEmbedder
 from helpers import make
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFileDialog, QMessageBox
+from qfluentwidgets import InfoBar, PushButton
 
 from autoshelf import commands
 from autoshelf.app_service import AppService
@@ -110,7 +111,7 @@ def test_inbox_shows_files_and_suggestions(qtbot, service, runner, shelf: Path) 
     view.select(shelf / "_Inbox" / "tax invoice.txt")
     assert view.name.text() == "tax invoice.txt"
     assert view.suggestion_buttons[0].text().startswith("Finance")
-    assert "Why it's here" in view.why.text()
+    assert "Finance" in view.why.text()
     assert view.preview.toPlainText() == "invoice tax"
     assert [view.other.itemText(i) for i in range(view.other.count())] == ["Finance", "Recipes"]
 
@@ -124,7 +125,7 @@ def test_inbox_shows_text_from_files_literally(qtbot, service, runner, shelf: Pa
     view.refresh()
     settle(qtbot, runner)
     assert view.title.text() == f"Title: {title}"
-    for label in (view.name, view.title, view.why, view.rename_label):
+    for label in (view.name, view.title, view.why):
         assert label.textFormat() == Qt.TextFormat.PlainText
 
 
@@ -151,6 +152,24 @@ def test_choosing_a_suggestion_moves_the_file(qtbot, service, runner, shelf: Pat
     assert not src.exists()
     assert view.list.count() == 0
     assert view.empty.isVisibleTo(view)
+
+
+def test_an_inbox_answer_can_be_undone_right_away(qtbot, service, runner, shelf: Path) -> None:
+    src = make(shelf / "_Inbox" / "tax invoice.txt", "invoice tax")
+    view = InboxView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    view.suggestion_buttons[0].click()
+    settle(qtbot, runner)
+    (bar,) = view.findChildren(InfoBar)
+    assert "Moved tax invoice.txt to Finance. AutoShelf will remember." in bar.content
+    (undo,) = [button for button in bar.findChildren(PushButton) if button.text() == "Undo"]
+    undo.click()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert src.exists()
+    assert view.list.count() == 1
 
 
 def test_other_folder_moves_the_file(qtbot, service, runner, shelf: Path) -> None:
@@ -1012,9 +1031,9 @@ def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
-    assert view.rename_row.isVisibleTo(view)
-    assert view.rename_label.text().endswith("Quarterly Report.txt")
-    view.rename_button.click()
+    assert view.rename_action.isVisible()
+    assert view.rename_action.text() == "Rename to “Quarterly Report.txt”"
+    view.rename_action.trigger()
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert (shelf / "_Inbox" / "Quarterly Report.txt").exists()

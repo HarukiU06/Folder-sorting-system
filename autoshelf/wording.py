@@ -60,6 +60,33 @@ def reason_text(reason: Mapping | None) -> str:
     return str(code or "")
 
 
+def waiting_text(reason: Mapping | None) -> str:
+    """Why a file waits in the Inbox, as a plain sentence without scores."""
+    code = (reason or {}).get("code")
+    if code == reasons.LOW_SCORE:
+        return f"None of your folders is a clear match. The closest is {reason['folder']}."
+    if code == reasons.TOO_CLOSE:
+        if reason.get("rival") is None:
+            return f"AutoShelf isn't sure about {reason['folder']}."
+        return (
+            f"It fits {reason['folder']} and {reason['rival']} about equally well, "
+            "so AutoShelf is asking you."
+        )
+    if code == reasons.NO_FOLDERS:
+        return "There are no folders to sort into yet."
+    if code == reasons.NO_CLASSIFIER:
+        return "AutoShelf can't read files to sort them right now."
+    if code == reasons.RULE_FOLDER_MISSING:
+        return (
+            f"Your rule {reason['rule']!r} sends it to {reason['folder']}, "
+            "but that folder no longer exists."
+        )
+    if code == reasons.FOLDER_GONE:
+        return f"Its folder {reason['folder']} no longer exists."
+    text = reason_text(reason)
+    return text[:1].upper() + text[1:] if text else ""
+
+
 def explanation(details: Mapping | None) -> str:
     """Why a history row happened, from its stored details (older rows stored the words)."""
     if not details:

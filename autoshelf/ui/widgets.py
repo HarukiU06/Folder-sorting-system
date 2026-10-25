@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices, Qt  # QtGui's Qt also has the rich-text helpers
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QMenu, QWidget
 
 
 def plain_label(text: str = "") -> QLabel:
@@ -20,9 +20,20 @@ def plain_label(text: str = "") -> QLabel:
     return label
 
 
+def plain[L: QLabel](label: L) -> L:
+    """Make any label (a Fluent one too) show its text literally; see ``plain_label``."""
+    label.setTextFormat(Qt.TextFormat.PlainText)
+    return label
+
+
 def plain_tooltip(text: str) -> str:
     """``text`` as a tooltip that is shown literally (tooltips are rendered like labels)."""
     return Qt.convertFromPlainText(text) if Qt.mightBeRichText(text) else text
+
+
+def show_menu(menu: QMenu, button: QWidget) -> None:
+    """Open a "⋯" button's menu just below the button."""
+    menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
 
 
 def open_folder(folder: Path) -> None:

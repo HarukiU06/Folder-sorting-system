@@ -2,11 +2,13 @@
 
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QDesktopServices, Qt  # QtGui's Qt also has the rich-text helpers
-from PySide6.QtWidgets import QLabel, QMenu, QWidget
+from PySide6.QtGui import QAction, QDesktopServices, Qt  # QtGui's Qt also has the rich-text helpers
+from PySide6.QtWidgets import QLabel, QWidget
+from qfluentwidgets import RoundMenu
 
 
 def plain_label(text: str = "") -> QLabel:
@@ -31,9 +33,20 @@ def plain_tooltip(text: str) -> str:
     return Qt.convertFromPlainText(text) if Qt.mightBeRichText(text) else text
 
 
-def show_menu(menu: QMenu, button: QWidget) -> None:
-    """Open a "⋯" button's menu just below the button."""
+def show_menu(button: QWidget, actions: Iterable[QAction | None]) -> RoundMenu:
+    """Open a menu of ``actions`` (None: a separator) just below a "⋯" button.
+
+    The menu is made afresh each time, so it lists exactly the actions that apply now
+    (Fluent menus show hidden actions too).
+    """
+    menu = RoundMenu(parent=button)
+    for action in actions:
+        if action is None:
+            menu.addSeparator()
+        else:
+            menu.addAction(action)
     menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+    return menu
 
 
 def open_folder(folder: Path) -> None:

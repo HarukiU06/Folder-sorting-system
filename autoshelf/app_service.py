@@ -480,6 +480,12 @@ class AppService:
             for key in scan.folders
         ]
 
+    def folder_files(self, folder: str) -> list[Path]:
+        """The files directly in one of your folders, by name (reads no file)."""
+        root = self._require_root()
+        scan = scan_library(root, self.settings().ignore_patterns)
+        return [item.path for item in scan.files if item.folder == folder]
+
     def describe(self, folder: str, description: str) -> str:
         """Set a folder's description and return the folder's key."""
         root = self._require_root()

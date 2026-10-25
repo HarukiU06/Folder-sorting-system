@@ -9,7 +9,6 @@ from qfluentwidgets import FluentIcon, NavigationInterface, NavigationItemPositi
 from autoshelf.app_service import AppService
 from autoshelf.ui.ask_view import AskView
 from autoshelf.ui.dashboard_view import DashboardView
-from autoshelf.ui.folders_view import FoldersView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
@@ -40,7 +39,6 @@ class MainWindow(QMainWindow):
         self.inbox = InboxView(service, runner)
         self.library = LibraryView(service, runner)
         self.history = HistoryView(service, runner)
-        self.folders = FoldersView(service, runner)
         self.rules = RulesView(service, runner)
         self.tidy = TidyView(service, runner)
         self.dashboard = DashboardView(service, runner)
@@ -67,7 +65,6 @@ class MainWindow(QMainWindow):
         self._add(self.inbox, "inbox", FluentIcon.MAIL, "Inbox", top)
         self._add(self.library, "library", FluentIcon.LIBRARY, "Library", top)
         self._add(self.history, "history", FluentIcon.HISTORY, "History", top)
-        self._add(self.folders, "folders", FluentIcon.FOLDER, "Folders", top)
         self._add(self.rules, "rules", FluentIcon.EDIT, "Rules", top)
         self._add(self.tidy, "tidy", FluentIcon.BROOM, "Tidy up", top)
         self._add(self.dashboard, "dashboard", FluentIcon.PIE_SINGLE, "Dashboard", top)
@@ -84,7 +81,7 @@ class MainWindow(QMainWindow):
         self.inbox.moved.connect(self._after_move)
         self.inbox.count_changed.connect(self._show_count)
         self.history.undone.connect(self._after_move)
-        self.folders.saved.connect(self._after_description)
+        self.library.saved.connect(self._after_description)
         self.rules.changed.connect(self._after_rules)
         self.library.changed.connect(self._after_rules)
         self.tidy.changed.connect(self._after_move)
@@ -128,7 +125,6 @@ class MainWindow(QMainWindow):
         """Show the AI features only when an AI provider is chosen in Settings."""
         self.set_page_visible(self.ask, enabled)
         self.library.set_ai_enabled(enabled)
-        self.folders.set_ai_enabled(enabled)
         self.tidy.set_ai_enabled(enabled)
 
     def show_message(self, text: str) -> None:
@@ -154,7 +150,7 @@ class MainWindow(QMainWindow):
         """Reload every screen."""
         self.inbox.refresh()
         self.history.refresh()
-        self.folders.refresh()
+        self.library.refresh()
         self.rules.refresh()
         self.settings.load()
 
@@ -162,13 +158,13 @@ class MainWindow(QMainWindow):
         """The user moved files in their folders (e.g. answered the Inbox on the iPhone)."""
         self.inbox.refresh()
         self.history.refresh()
-        self.folders.refresh()
+        self.library.refresh()
 
     def _after_move(self, message: str) -> None:
         self.show_message(message)
         self.inbox.refresh()
         self.history.refresh()
-        self.folders.refresh()
+        self.library.refresh()
 
     def _after_description(self, message: str) -> None:
         self.show_message(message)
@@ -185,12 +181,10 @@ class MainWindow(QMainWindow):
         widget = self.pages.widget(index)
         if widget is self.history:
             self.history.refresh()
-        elif widget is self.folders:
-            self.folders.refresh()
-        elif widget is self.rules:
-            self.rules.refresh()
         elif widget is self.library:
             self.library.refresh()
+        elif widget is self.rules:
+            self.rules.refresh()
         elif widget is self.tidy:
             self.tidy.refresh()
         elif widget is self.dashboard:

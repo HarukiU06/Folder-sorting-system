@@ -19,7 +19,6 @@ from qfluentwidgets import (
     Action,
     FluentIcon,
     PushButton,
-    RoundMenu,
     TableWidget,
     TitleLabel,
     TransparentPushButton,
@@ -131,15 +130,15 @@ class HistoryView(QWidget):
         self.why_button = TransparentPushButton(FluentIcon.INFO, SHOW_WHY)
         self.why_button.clicked.connect(self._toggle_why)
 
-        self.menu = RoundMenu(parent=self)
-        self.batch_action = Action("Undo everything done together with it")
+        self.batch_action = Action("Undo everything done together with it", self)
         self.batch_action.triggered.connect(self.undo_selected_batch)
-        undo_last = Action("Undo the last few moves…")
-        undo_last.triggered.connect(self.ask_undo_last)
-        self.menu.addActions([self.batch_action, undo_last])
+        self.undo_last_action = Action("Undo the last few moves…", self)
+        self.undo_last_action.triggered.connect(self.ask_undo_last)
         self.menu_button = TransparentToolButton(FluentIcon.MORE)
         self.menu_button.setToolTip("More ways to undo")
-        self.menu_button.clicked.connect(lambda: show_menu(self.menu, self.menu_button))
+        self.menu_button.clicked.connect(
+            lambda: show_menu(self.menu_button, [self.batch_action, self.undo_last_action])
+        )
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.undo_button)

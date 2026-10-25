@@ -22,7 +22,6 @@ from autoshelf.config import CONFIDENCE_LEVELS, AppPaths
 from autoshelf.pipeline import Outcome, OutcomeKind
 from autoshelf.ui import app as app_module
 from autoshelf.ui.app import AutoShelfApp, notification_text
-from autoshelf.ui.folders_view import DESCRIPTION_COLUMN, FoldersView
 from autoshelf.ui.history_view import HistoryView
 from autoshelf.ui.icons import app_icon
 from autoshelf.ui.inbox_view import InboxView
@@ -247,17 +246,26 @@ def test_undo_of_a_changed_file_asks_first(
 # --- Folders --------------------------------------------------------------------------------
 
 
-def test_folders_show_counts_and_save_descriptions(qtbot, service, runner) -> None:
-    view = FoldersView(service, runner)
+def test_library_lists_folders_and_saves_descriptions(qtbot, service, runner) -> None:
+    from autoshelf.ui.library_view import LibraryView
+
+    view = LibraryView(service, runner)
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
 
-    assert view.table.rowCount() == 2
-    assert view.table.item(0, 0).text() == "Finance"
-    assert view.table.item(0, 1).text() == "1"
+    names = [view.folder_list.item(i).text() for i in range(view.folder_list.count())]
+    assert names[0] == "Finance  (1)" and names[1].startswith("Recipes  (")
+    view._folder_clicked(view.folder_list.item(0))
+    settle(qtbot, runner)
+    assert view.folder_box.isVisibleTo(view)
+    assert view.results.rowCount() == 1
+    assert view.results.item(0, 0).text() == "invoice 2024.txt"
+    view._folder_clicked(view.folder_list.item(1))
+    settle(qtbot, runner)
     with qtbot.waitSignal(view.saved, timeout=WAIT_MS):
-        view.table.item(1, DESCRIPTION_COLUMN).setText("cakes and bread")
+        view.description.setText("cakes and bread")
+        view.description.editingFinished.emit()
     assert {f.key: f.description for f in service.folders()}["Recipes"] == "cakes and bread"
 
 
@@ -888,7 +896,6 @@ def test_main_window_has_every_screen(qtbot, service, runner) -> None:
         "Inbox",
         "Library",
         "History",
-        "Folders",
         "Rules",
         "Tidy up",
         "Dashboard",
@@ -978,7 +985,7 @@ def test_library_summarizes_and_renames(
     view.search()
     settle(qtbot, runner)
     settle(qtbot, runner)
-    assert view.summarize_button.isVisibleTo(view)
+    assert view.summarize_action in view.menu_actions()
     view.summarize()
     settle(qtbot, runner)
     assert view.summary_text.text() == "Summary: A short summary."
@@ -1008,10 +1015,11 @@ def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) ->
     settle(qtbot, runner)
     settle(qtbot, runner)
     assert view.name.text() == "receipt photo.png"
-    labels = [action.text() for action in view.convert_menu.actions()]
-    assert view.convert_button.isEnabled() and "JPG image" in labels
+    labels = [action.text() for action in view.convert_actions]
+    assert "Convert to JPG image" in labels
+    assert view.convert_actions[0] in view.menu_actions()
 
-    view.convert_menu.actions()[labels.index("JPG image")].trigger()
+    view.convert_actions[labels.index("Convert to JPG image")].trigger()
     settle(qtbot, runner)
     assert (shelf / "Finance" / "receipt photo.jpg").exists()
     assert "Made receipt photo.jpg" in view.summary.text()
@@ -1021,7 +1029,7 @@ def test_library_compresses_and_converts(qtbot, service, runner, shelf: Path) ->
     view.search()
     settle(qtbot, runner)
     settle(qtbot, runner)
-    assert not view.convert_button.isEnabled()  # nothing to convert a .txt to
+    assert view.convert_actions == []  # nothing to convert a .txt to
     view.compress_file()
     settle(qtbot, runner)
     assert (shelf / "Finance" / "invoice 2024.zip").exists()
@@ -1033,7 +1041,7 @@ def test_inbox_offers_a_better_name(qtbot, service, runner, shelf: Path) -> None
     qtbot.addWidget(view)
     view.refresh()
     settle(qtbot, runner)
-    assert view.rename_action.isVisible()
+    assert view.rename_action in view.menu_actions()
     assert view.rename_action.text() == "Rename to “Quarterly Report.txt”"
     view.rename_action.trigger()
     settle(qtbot, runner)

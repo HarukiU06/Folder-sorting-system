@@ -1,5 +1,9 @@
-"""The Library screen: search by meaning or words, tag views, and a file's details
-(tags, related files) (SPEC sections 5.1, 5.3, 5.4)."""
+"""The Library screen: search, your folders and tags on the left, and a file's details
+(tags, related files, compress/convert) (SPEC sections 5.1, 5.3, 5.4).
+
+Choosing a folder lists its files and lets you describe what belongs in it, which helps
+AutoShelf recognise such files (this used to be a Folders screen of its own).
+"""
 
 import html
 from datetime import datetime
@@ -12,33 +16,45 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
     QListWidgetItem,
-    QMenu,
     QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QSplitter,
-    QTableWidget,
     QTableWidgetItem,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from qfluentwidgets import (
+    Action,
+    BodyLabel,
+    CaptionLabel,
+    FluentIcon,
+    LineEdit,
+    ListWidget,
+    PlainTextEdit,
+    PushButton,
+    SearchLineEdit,
+    SimpleCardWidget,
+    StrongBodyLabel,
+    SubtitleLabel,
+    TableWidget,
+    TitleLabel,
+    TransparentToolButton,
+)
 
-from autoshelf.app_service import AppService, FileInfo
+from autoshelf.app_service import AppService, FileInfo, FolderInfo
 from autoshelf.features import convert
 from autoshelf.ui.tasks import TaskRunner
-from autoshelf.ui.widgets import plain_label, plain_tooltip, show_in_explorer
+from autoshelf.ui.widgets import open_folder, plain, plain_tooltip, show_in_explorer, show_menu
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
-COLUMNS = ("File", "Folder", "Match")
+COLUMNS = ("File", "Folder")
 HINT = (
-    'Search your files by meaning ("paper explaining k-means initialization") or by exact '
-    'words ("invoice 2025"). Tags on the left list every file with that tag, wherever it is.'
+    'Search by meaning ("paper explaining k-means initialization") or by exact words '
+    '("invoice 2025"), or pick a folder or a tag on the left.'
 )
+DESCRIBE_HINT = "What belongs in this folder? A few words help AutoShelf sort new files."
+LEFT_WIDTH = 200
+DETAIL_WIDTH = 320
+FOLDER_COLUMN_WIDTH = 130
 
 
 def _size(size: int) -> str:
@@ -50,38 +66,47 @@ def _size(size: int) -> str:
 
 
 class LibraryView(QWidget):
-    """Search results or a tag's files on the left, the selected file's details on the right."""
+    """Folders and tags on the left, search results or a folder's files in the middle, the
+    selected file's details on the right."""
 
-    changed = Signal(str)  # a message after tags changed
+    changed = Signal(str)  # a message after tags changed or a file was made or renamed
+    saved = Signal(str)  # a message after a folder's description was saved
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
         super().__init__(parent)
         self.service = service
         self.runner = runner
+        self.ai_enabled = False
         self._paths: list[Path] = []
         self._info: FileInfo | None = None
+        self._folders: list[FolderInfo] = []
+        self._folder: FolderInfo | None = None
         self._search_number = 0
 
-        self.query = QLineEdit()
-        self.query.setPlaceholderText("Search your library...")
+        self.query = SearchLineEdit()
+        self.query.setPlaceholderText("Search your files")
         self.query.returnPressed.connect(self.search)
-        search = QPushButton("Search")
-        search.clicked.connect(self.search)
-        top = QHBoxLayout()
-        top.addWidget(self.query, 1)
-        top.addWidget(search)
-        self.summary = plain_label(HINT)
+        self.query.searchSignal.connect(lambda _: self.search())
+        self.summary = plain(CaptionLabel(HINT))
         self.summary.setWordWrap(True)
 
-        self.tag_list = QListWidget()
+        self.folder_list = ListWidget()
+        self.folder_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.folder_list.itemClicked.connect(self._folder_clicked)
+        self.tag_list = ListWidget()
         self.tag_list.itemClicked.connect(self._tag_clicked)
-        tags_box = QWidget()
-        tags_layout = QVBoxLayout(tags_box)
-        tags_layout.setContentsMargins(0, 0, 0, 0)
-        tags_layout.addWidget(QLabel("Tags"))
-        tags_layout.addWidget(self.tag_list, 1)
+        left = QWidget()
+        left.setFixedWidth(LEFT_WIDTH)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(StrongBodyLabel("Folders"))
+        left_layout.addWidget(self.folder_list, 2)
+        left_layout.addWidget(StrongBodyLabel("Tags"))
+        left_layout.addWidget(self.tag_list, 1)
 
-        self.results = QTableWidget(0, len(COLUMNS))
+        self.folder_box = self._build_folder_box()
+        self.results = TableWidget()
+        self.results.setColumnCount(len(COLUMNS))
         self.results.setHorizontalHeaderLabels(COLUMNS)
         self.results.verticalHeader().setVisible(False)
         self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -89,113 +114,159 @@ class LibraryView(QWidget):
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results.setWordWrap(False)
         header = self.results.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.results.setColumnWidth(1, FOLDER_COLUMN_WIDTH)
+        self.results.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.results.itemSelectionChanged.connect(self._selected)
         self.results.itemDoubleClicked.connect(lambda _: self.open_file())
+        middle = QVBoxLayout()
+        middle.addWidget(self.folder_box)
+        middle.addWidget(self.results, 1)
 
         self.detail = self._build_detail()
-        splitter = QSplitter()
-        splitter.addWidget(tags_box)
-        splitter.addWidget(self.results)
-        splitter.addWidget(self.detail)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 2)
-        splitter.setSizes([150, 520, 380])
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        body.addWidget(left)
+        body.addLayout(middle, 1)
+        body.addWidget(self.detail)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(top)
+        layout.setContentsMargins(28, 20, 28, 20)
+        layout.setSpacing(12)
+        layout.addWidget(TitleLabel("Library"))
+        layout.addWidget(self.query)
         layout.addWidget(self.summary)
-        layout.addWidget(splitter, 1)
+        layout.addLayout(body, 1)
         self._show_detail(None)
 
+    def _build_folder_box(self) -> QWidget:
+        box = SimpleCardWidget()
+        self.folder_name = plain(SubtitleLabel())
+        self.description = LineEdit()
+        self.description.setPlaceholderText(DESCRIBE_HINT)
+        self.description.setToolTip(DESCRIBE_HINT)
+        self.description.editingFinished.connect(self._describe)
+        open_button = PushButton(FluentIcon.FOLDER, "Open in Explorer")
+        open_button.clicked.connect(self._open_folder)
+        self.study_button = PushButton(FluentIcon.BOOK_SHELF, "Study…")
+        self.study_button.setToolTip("A reading list and flashcards for this folder (AI)")
+        self.study_button.clicked.connect(self.study_folder)
+        self.study_button.setVisible(False)
+        heading = QHBoxLayout()
+        heading.addWidget(self.folder_name, 1)
+        heading.addWidget(self.study_button)
+        heading.addWidget(open_button)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.addLayout(heading)
+        layout.addWidget(self.description)
+        box.setVisible(False)
+        return box
+
     def _build_detail(self) -> QWidget:
-        box = QWidget()
-        self.name = plain_label()
+        box = SimpleCardWidget()
+        box.setFixedWidth(DETAIL_WIDTH)
+        self.name = plain(SubtitleLabel())
         self.name.setWordWrap(True)
         self.name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        font = self.name.font()
-        font.setBold(True)
-        self.name.setFont(font)
-        self.facts = QLabel()
+        self.menu_button = TransparentToolButton(FluentIcon.MORE)
+        self.menu_button.setToolTip("More actions")
+        self.menu_button.clicked.connect(lambda: show_menu(self.menu_button, self.menu_actions()))
+        heading = QHBoxLayout()
+        heading.addWidget(self.name, 1)
+        heading.addWidget(self.menu_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.facts = BodyLabel()
         self.facts.setWordWrap(True)
         self.facts.setTextFormat(Qt.TextFormat.RichText)
-        self.summary_text = plain_label()
+        self.summary_text = plain(BodyLabel())
         self.summary_text.setWordWrap(True)
-        open_button = QPushButton("Open")
-        open_button.clicked.connect(self.open_file)
-        show = QPushButton("Show in Explorer")
-        show.clicked.connect(self._show_in_explorer)
-        self.summarize_button = QPushButton("Summarize")
-        self.summarize_button.setToolTip("Ask the AI for a 2-3 sentence summary")
-        self.summarize_button.clicked.connect(self.summarize)
-        self.summarize_button.setVisible(False)
-        rename = QPushButton("Rename...")
-        rename.clicked.connect(self.rename_file)
-        buttons = QHBoxLayout()
-        self.compress_button = QPushButton("Compress")
-        self.compress_button.setToolTip(
-            "Make a smaller copy (a PDF or an image) or a ZIP next to the file; "
+
+        self.open_action = Action(FluentIcon.DOCUMENT, "Open", self)
+        self.open_action.triggered.connect(self.open_file)
+        self.show_action = Action(FluentIcon.FOLDER, "Show in Explorer", self)
+        self.show_action.triggered.connect(self._show_in_explorer)
+        self.rename_action = Action(FluentIcon.EDIT, "Rename…", self)
+        self.rename_action.triggered.connect(self.rename_file)
+        self.compress_action = Action(FluentIcon.ZIP_FOLDER, "Make a smaller copy", self)
+        self.compress_action.setToolTip(
+            "A smaller copy (a PDF or an image) or a ZIP next to the file; "
             "the file itself stays as it is"
         )
-        self.compress_button.clicked.connect(self.compress_file)
-        self.convert_button = QToolButton()
-        self.convert_button.setText("Convert to")
-        self.convert_button.setToolTip("Make a copy in another format next to the file")
-        self.convert_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.convert_menu = QMenu(self.convert_button)
-        self.convert_button.setMenu(self.convert_menu)
-        self.convert_button.setEnabled(False)
-        buttons.addWidget(open_button)
-        buttons.addWidget(show)
-        buttons.addWidget(rename)
-        buttons.addWidget(self.compress_button)
-        buttons.addWidget(self.convert_button)
-        buttons.addWidget(self.summarize_button)
-        buttons.addStretch(1)
+        self.compress_action.triggered.connect(self.compress_file)
+        self.convert_actions: list[Action] = []
+        self.summarize_action = Action(FluentIcon.ROBOT, "Summarize", self)
+        self.summarize_action.triggered.connect(self.summarize)
 
-        self.file_tags = QListWidget()
+        self.file_tags = ListWidget()
         self.file_tags.setMaximumHeight(90)
-        self.new_tag = QLineEdit()
-        self.new_tag.setPlaceholderText("Add a tag...")
+        self.new_tag = LineEdit()
+        self.new_tag.setPlaceholderText("Add a tag")
         self.new_tag.returnPressed.connect(self._add_typed_tag)
-        add = QPushButton("Add")
+        add = PushButton("Add")
         add.clicked.connect(self._add_typed_tag)
-        remove = QPushButton("Remove")
+        remove = PushButton("Remove")
         remove.clicked.connect(self._remove_tag)
         tag_row = QHBoxLayout()
         tag_row.addWidget(self.new_tag, 1)
         tag_row.addWidget(add)
         tag_row.addWidget(remove)
         self.suggested = QHBoxLayout()
-        self.suggested_buttons: list[QPushButton] = []
+        self.suggested_buttons: list[PushButton] = []
 
-        self.related = QListWidget()
+        self.related = ListWidget()
         self.related.itemDoubleClicked.connect(self._open_related)
-        self.preview = QPlainTextEdit()
+        self.preview = PlainTextEdit()
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("No text preview.")
 
         layout = QVBoxLayout(box)
-        layout.addWidget(self.name)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.addLayout(heading)
         layout.addWidget(self.facts)
         layout.addWidget(self.summary_text)
-        layout.addLayout(buttons)
-        layout.addWidget(QLabel("Tags"))
+        layout.addWidget(StrongBodyLabel("Tags"))
         layout.addWidget(self.file_tags)
         layout.addLayout(tag_row)
         layout.addLayout(self.suggested)
-        layout.addWidget(QLabel("Related files (double-click to show)"))
+        layout.addWidget(StrongBodyLabel("Related files (double-click to show)"))
         layout.addWidget(self.related, 1)
-        layout.addWidget(QLabel("Preview"))
+        layout.addWidget(StrongBodyLabel("Preview"))
         layout.addWidget(self.preview, 1)
         return box
+
+    def menu_actions(self) -> list[Action | None]:
+        """What the ⋯ menu offers for the selected file."""
+        actions: list[Action | None] = [self.open_action, self.show_action, self.rename_action]
+        actions += [None, self.compress_action, *self.convert_actions]
+        if self.ai_enabled:
+            actions += [None, self.summarize_action]
+        return actions
 
     # --- loading ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Reload the tag list."""
+        """Reload the folders and tags."""
+        self.runner.run(self.service.folders, self._show_folders, lambda exc: None)
         self.runner.run(self.service.tags, self._show_tags)
+
+    def _show_folders(self, folders: list[FolderInfo]) -> None:
+        self._folders = folders
+        self.folder_list.clear()
+        for folder in folders:
+            item = QListWidgetItem(f"{folder.key.replace('/', ' / ')}  ({folder.files})")
+            item.setData(PATH_ROLE, folder.key)
+            item.setToolTip(plain_tooltip(folder.description) if folder.description else "")
+            self.folder_list.addItem(item)
+        if not folders:
+            self.folder_list.addItem(QListWidgetItem("(no folders yet)"))
+        if self._folder is not None:
+            keys = [folder.key for folder in folders]
+            if self._folder.key in keys:
+                self._folder = folders[keys.index(self._folder.key)]
+            else:
+                self._folder = None
+                self.folder_box.setVisible(False)
 
     def _show_tags(self, tags: list[tuple[str, int]]) -> None:
         self.tag_list.clear()
@@ -213,6 +284,7 @@ class LibraryView(QWidget):
             return
         self._search_number += 1
         number = self._search_number
+        self._show_folder(None)
         self.summary.setText(f"Searching for {query!r}... (the first search loads the model)")
 
         def found(hits) -> None:
@@ -236,10 +308,63 @@ class LibraryView(QWidget):
 
         self.runner.run(lambda: self.service.search(query), found, self._failed)
 
+    def _folder_clicked(self, item: QListWidgetItem) -> None:
+        key = item.data(PATH_ROLE)
+        folder = next((folder for folder in self._folders if folder.key == key), None)
+        if folder is None:
+            return
+        self._search_number += 1  # a search still under way no longer shows
+        self._show_folder(folder)
+
+        def found(paths: list[Path]) -> None:
+            self._show_rows([(path, key, "") for path in paths])
+            count = len(paths)
+            self.summary.setText(f"{count} file{'' if count == 1 else 's'} in {key}")
+
+        self.runner.run(lambda: self.service.folder_files(key), found, self._failed)
+
+    def _show_folder(self, folder: FolderInfo | None) -> None:
+        self._folder = folder
+        self.folder_box.setVisible(folder is not None)
+        if folder is not None:
+            self.folder_name.setText(folder.key.replace("/", " / "))
+            self.description.setText(folder.description)
+
+    def _describe(self) -> None:
+        folder = self._folder
+        text = self.description.text().strip()
+        if folder is None or text == folder.description:
+            return
+        key = folder.key
+        self._folder = FolderInfo(key, folder.files, text)
+        self.runner.run(
+            lambda: self.service.describe(key, text),
+            lambda _: (self.saved.emit(f"Saved the description of {key}"), self.refresh()),
+            self._failed,
+        )
+
+    def _open_folder(self) -> None:
+        folder = self._folder
+        if folder is None:
+            return
+        self.runner.run(
+            self.service.root,
+            lambda root: root and open_folder(root.joinpath(*folder.key.split("/"))),
+        )
+
+    def study_folder(self) -> None:
+        """Open study mode (reading list, flashcards) for the chosen folder."""
+        from autoshelf.ui.study_dialog import StudyDialog
+
+        if self._folder is not None:
+            StudyDialog(self.service, self.runner, self._folder.key, self).exec()
+
     def _tag_clicked(self, item: QListWidgetItem) -> None:
         name = item.data(PATH_ROLE)
         if not name:
             return
+        self._search_number += 1
+        self._show_folder(None)
 
         def found(paths: list[Path]) -> None:
             self._show_rows([(path, path.parent.name, "") for path in paths])
@@ -255,10 +380,11 @@ class LibraryView(QWidget):
         self.results.clearSelection()  # so selecting row 0 below shows the new first file
         self.results.setRowCount(len(rows))
         for row, (path, folder, match) in enumerate(rows):
-            for column, text in enumerate((path.name, folder, match)):
+            tip = plain_tooltip(f"{path}\n{match}" if match else str(path))
+            for column, text in enumerate((path.name, folder)):
                 item = QTableWidgetItem(text)
                 item.setData(PATH_ROLE, str(path))
-                item.setToolTip(str(path) if column < 2 else plain_tooltip(text))
+                item.setToolTip(tip)
                 self.results.setItem(row, column, item)
         if rows:
             self.results.selectRow(0)
@@ -316,18 +442,18 @@ class LibraryView(QWidget):
         self._show_suggestions(info.tag_suggestions)
         self.related.clear()
         for item in related:
-            entry = QListWidgetItem(f"{item.similarity:.2f}  {item.path.name}  ({item.folder})")
+            entry = QListWidgetItem(f"{item.path.name}  ({item.folder})")
             entry.setData(PATH_ROLE, str(item.path))
-            entry.setToolTip(str(item.path))
+            entry.setToolTip(f"{item.path}\nsimilarity {item.similarity:.2f}")
             self.related.addItem(entry)
         self.preview.setPlainText(info.excerpt or "")
 
     def _fill_conversions(self, formats) -> None:
-        self.convert_menu.clear()
+        self.convert_actions = []
         for to in formats:
-            action = self.convert_menu.addAction(convert.label(to))
+            action = Action(FluentIcon.SYNC, f"Convert to {convert.label(to)}", self)
             action.triggered.connect(lambda _=False, to=to: self.convert_file(to))
-        self.convert_button.setEnabled(bool(formats))
+            self.convert_actions.append(action)
 
     def compress_file(self) -> None:
         """Make a smaller copy or a ZIP of the selected file, next to it (in the background)."""
@@ -359,9 +485,9 @@ class LibraryView(QWidget):
         self.runner.run(work, done, failed)
 
     def set_ai_enabled(self, enabled: bool) -> None:
-        """Show the AI buttons only when an AI provider is on."""
+        """Offer the AI features (summaries, study mode) only when an AI provider is on."""
         self.ai_enabled = enabled
-        self.summarize_button.setVisible(enabled)
+        self.study_button.setVisible(enabled)
 
     def summarize(self) -> None:
         """Ask the AI for a summary of the selected file (cached afterwards)."""
@@ -381,7 +507,7 @@ class LibraryView(QWidget):
         info = self._info
         if info is None:
             return
-        use_ai = getattr(self, "ai_enabled", False)
+        use_ai = self.ai_enabled
 
         def ask(proposal) -> None:
             current = proposal.new_name if proposal else info.path.name
@@ -410,7 +536,7 @@ class LibraryView(QWidget):
             button.deleteLater()
         self.suggested_buttons = []
         for name in names:
-            button = QPushButton(f"+ {name}")
+            button = PushButton(f"+ {name}")
             button.setToolTip(f"Tag it '{name}' (it also fits that folder)")
             button.clicked.connect(lambda _=False, tag=name: self.add_tags([tag]))
             self.suggested.addWidget(button)

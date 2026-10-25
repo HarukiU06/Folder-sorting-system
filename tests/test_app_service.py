@@ -242,3 +242,12 @@ def test_actions_need_a_root(paths: AppPaths) -> None:
 
 def repository_conn(service: AppService):
     return service._connect()
+
+
+def test_a_folders_files_by_name(paths: AppPaths, root: Path) -> None:
+    make(root / "Finance" / "a.txt", "a")
+    make(root / "Finance" / "Taxes" / "b.txt", "b")
+    service = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
+    service.set_root(root)
+    assert [path.name for path in service.folder_files("Finance")] == ["a.txt"]
+    assert [path.name for path in service.folder_files("Finance/Taxes")] == ["b.txt"]

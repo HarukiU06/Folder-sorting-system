@@ -18,7 +18,6 @@ from qfluentwidgets import (
     PlainTextEdit,
     PrimaryPushButton,
     PushButton,
-    RoundMenu,
     SimpleCardWidget,
     StrongBodyLabel,
     SubtitleLabel,
@@ -80,16 +79,13 @@ class InboxView(QWidget):
 
         self.menu_button = TransparentToolButton(FluentIcon.MORE)
         self.menu_button.setToolTip("More actions")
-        self.menu = RoundMenu(parent=self)
-        self.rename_action = Action(FluentIcon.EDIT, "Rename")
+        self.rename_action = Action(FluentIcon.EDIT, "Rename", self)
         self.rename_action.triggered.connect(self._rename)
-        self.menu.addAction(self.rename_action)
-        open_action = Action(FluentIcon.DOCUMENT, "Open the file")
-        open_action.triggered.connect(self._open_file)
-        show_action = Action(FluentIcon.FOLDER, "Show in Explorer")
-        show_action.triggered.connect(self._show_in_explorer)
-        self.menu.addActions([open_action, show_action])
-        self.menu_button.clicked.connect(lambda: show_menu(self.menu, self.menu_button))
+        self.open_action = Action(FluentIcon.DOCUMENT, "Open the file", self)
+        self.open_action.triggered.connect(self._open_file)
+        self.show_action = Action(FluentIcon.FOLDER, "Show in Explorer", self)
+        self.show_action.triggered.connect(self._show_in_explorer)
+        self.menu_button.clicked.connect(lambda: show_menu(self.menu_button, self.menu_actions()))
         heading = QHBoxLayout()
         names = QVBoxLayout()
         names.setSpacing(2)
@@ -269,9 +265,14 @@ class InboxView(QWidget):
             self.tag_row.insertWidget(self.tag_row.count() - 1, box)
             self.tag_boxes.append(box)
         self.tag_label.setVisible(bool(self.tag_boxes))
-        self.rename_action.setVisible(item.rename is not None)
         if item.rename is not None:
             self.rename_action.setText(f"Rename to “{item.rename.new_name}”")
+
+    def menu_actions(self) -> list[Action]:
+        """What the ⋯ menu offers for the selected file."""
+        item = self._current_item()
+        rename = [self.rename_action] if item is not None and item.rename is not None else []
+        return [*rename, self.open_action, self.show_action]
 
     def _toggle_why(self) -> None:
         shown = not self.why_panel.isVisible()

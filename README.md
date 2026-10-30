@@ -31,7 +31,8 @@ AutoShelf moves real files, so:
 - it only works inside the root you choose, and refuses paths that lead outside it;
 - it records every move in its history **before** doing it, so every move can be undone;
 - it never creates category folders (only its own `_Inbox/`, `_Duplicates/` and `_Trash/`,
-  when first needed);
+  when first needed); you make them, in Explorer, on your iPhone, or in the Library;
+- Delete in the Library moves things into `_Trash/`, which you empty yourself;
 - compressing or converting a file always makes a **new** file next to it; the original
   stays as it is, and undoing sets the new file aside in `_Trash/`;
 - it only moves a file on its own when one folder is a clear match; otherwise it asks;
@@ -46,14 +47,27 @@ AutoShelf moves real files, so:
 AutoShelf/                  <- the root you pass with --root
 ├── _Inbox/                 <- files waiting for your decision
 ├── _Duplicates/            <- copies you chose to set aside (delete them yourself)
-├── _Trash/                 <- copies AutoShelf made and you undid (delete them yourself)
-├── Finance/                <- your own folders; files you put here are never moved
+├── _Trash/                 <- what you deleted in the Library, and copies AutoShelf made
+│                              that you undid (empty it yourself)
+├── Finance/                <- your own folders; files you put here stay (see below)
 ├── Machine Learning/
 │   └── Unsupervised/
 └── new file.pdf            <- files dropped here (or into _Inbox) get processed
 ```
 
 Folders whose names start with `_` are reserved and are never treated as categories.
+
+Files you put in one of your folders stay there, with one exception: when a new folder
+appears inside a folder (you made "Notes" inside "University"), AutoShelf looks at the
+files lying directly in University again. A file whose name or title has every word of
+the new folder's name ("Calculus notes.pdf") moves into it by itself, as one batch you can
+undo in one click. Files whose content only suggests they might belong are listed for you
+to tick (the Library's Review); nothing moves on a guess. It works the same for a folder
+made in Explorer, on the iPhone or while AutoShelf was closed. Folders named "New folder" or
+"untitled folder" wait until you name them, a renamed or moved folder isn't new, and a
+whole folder tree pasted in keeps its own order. A new folder at the top level makes
+AutoShelf check the files waiting in the Inbox instead. Nothing is moved while sorting is
+paused (it happens when you resume).
 
 ## Setup (Windows)
 
@@ -105,7 +119,15 @@ AutoShelf then lives in the system tray. Its window has a sidebar:
   files, a preview; its ⋯ menu renames, compresses or converts it) or folder (a short
   description you can edit, which helps AutoShelf recognise what belongs there). Search
   by meaning or by exact words from the box at the top right: matching folders come
-  first, then files. The Library only browses: it never moves, deletes or makes folders.
+  first, then files.
+
+  Change things as in Explorer: drag files and folders onto a folder (in the list or the
+  tree), or use Move to…, Cut (Ctrl+X) and Paste (Ctrl+V); make a folder (the New folder
+  button, Ctrl+Shift+N); rename (F2); and delete (Del), which moves things into `_Trash/`
+  in your AutoShelf folder (only a folder asks first). Every change has an Undo button
+  and is in History. Files you move from one folder to another teach AutoShelf, like moves
+  made in Explorer. A folder's details offer "Sort into subfolders" (files whose names
+  match move; the others that might belong are offered for review).
 - **History:** what AutoShelf did, in sentences ("Moved bread.txt to Recipes", how and
   when). Undo the selected row, or move a file AutoShelf put in the wrong folder to the
   right one ("Move to another folder", which AutoShelf learns from); "Why?" shows the
@@ -280,6 +302,9 @@ Searching and tidying up:
 .venv\Scripts\python.exe -m autoshelf tag "C:\path\to\notes.pdf" Medicine "Exam prep"
 .venv\Scripts\python.exe -m autoshelf tags Medicine                 # every file tagged Medicine
 
+.venv\Scripts\python.exe -m autoshelf resort University --dry-run   # which loose files fit its subfolders?
+.venv\Scripts\python.exe -m autoshelf resort University             # move the ones whose names match
+
 .venv\Scripts\python.exe -m autoshelf organize "C:\Old stuff"           # preview: where would each file go?
 .venv\Scripts\python.exe -m autoshelf organize "C:\Old stuff" --apply   # move the confident ones (one batch)
 .venv\Scripts\python.exe -m autoshelf undo --batch <id>              # undo that whole batch
@@ -403,6 +428,8 @@ AutoShelf learns whenever you:
 - pick a folder for a file in the Inbox;
 - move a file it sorted into another folder ("Move to another folder" in History, or
   `autoshelf correct`), or undo an automatic move and then choose a folder;
+- move a file between your folders in the Library, or tick a file in the review of a new
+  folder;
 - move a file between your folders, or out of `_Inbox`, in Explorer or in the iPhone Files
   app. AutoShelf notices when it next looks at your folders (within seconds while it runs,
   or at the next start), recognising the file by its content, or, for iCloud online-only

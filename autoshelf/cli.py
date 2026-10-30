@@ -263,6 +263,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     with_root(commands.add_parser("versions", help="list files that look like versions"))
 
+    resort_cmd = with_root(
+        commands.add_parser(
+            "resort", help="sort a folder's loose files into its subfolders (names that match)"
+        )
+    )
+    resort_cmd.add_argument("folder", help='one of your folders, e.g. "University"')
+    resort_cmd.add_argument("--dry-run", action="store_true", help="only show what would move")
     organize = with_root(
         commands.add_parser("organize", help="propose where every file in a folder belongs")
     )
@@ -389,6 +396,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "duplicates": _cmd_duplicates,
             "versions": _cmd_versions,
             "organize": _cmd_organize,
+            "resort": _cmd_resort,
             "stats": _cmd_stats,
             "digest": _cmd_digest,
             "calibrate": _cmd_calibrate,
@@ -1093,6 +1101,33 @@ def _cmd_organize(args: argparse.Namespace, paths: AppPaths) -> int:
     if result.moved:
         print(f"Undo all of them with: autoshelf undo --batch {result.batch_id}")
     return 1 if result.failed else 0
+
+
+_MATCHES = {"name": "its name", "rule": "your rule", "inbox": "a clear match"}
+
+
+def _cmd_resort(args: argparse.Namespace, paths: AppPaths) -> int:
+    service = _service(args, paths)
+    if args.dry_run:
+        plan = service.plan_resort(args.folder)
+        for item in plan.moves:
+            how = _MATCHES.get(item.match, item.match)
+            print(f"Would move {item.path.name} to {item.target} ({how})")
+    else:
+        result = service.resort(args.folder)
+        plan = result.plan
+        root = service.root()
+        for moved in result.moved:
+            print(f"Moved {moved.dst.name} to {moved.dst.parent.relative_to(root).as_posix()}")
+        for path, error in result.failed:
+            print(f"  couldn't move {path.name}: {error}", file=sys.stderr)
+        if result.batch_id:
+            print(f"Undo all of them with: autoshelf undo --batch {result.batch_id}")
+    if not plan.moves:
+        print(f"No file in {plan.parent} has a subfolder's name.")
+    for item in plan.maybes:
+        print(f"Might belong in {item.target} ({item.score:.2f}): {item.path.name}")
+    return 0
 
 
 def _cmd_digest(args: argparse.Namespace, paths: AppPaths) -> int:

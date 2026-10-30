@@ -33,6 +33,10 @@ MIN_FILES = 3
 # ~0.42 with the default model, files in different folders ~0.10.
 CLUSTER_SIMILARITY = 0.40
 _INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Names Windows keeps for devices, with or without an extension ("nul.txt" too).
+_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"] + [f"{port}{n}" for port in ("COM", "LPT") for n in range(1, 10)]
+)
 
 
 class FolderNameError(Exception):
@@ -163,17 +167,26 @@ def clean_folder_name(name: str) -> str:
     return name.lstrip(RESERVED_PREFIX + " ")[:60].strip(" .")
 
 
+def valid_folder_name(name: str) -> str:
+    """``name`` without surrounding spaces, if a category folder may have it; raises
+    FolderNameError (invalid characters, a leading "_" or dot, a Windows device name)."""
+    cleaned = clean_folder_name(name)
+    if not cleaned or cleaned != name.strip():
+        raise FolderNameError(
+            f"{name!r} can't be a folder name" + (f"; try {cleaned!r}" if cleaned else "")
+        )
+    if cleaned.split(".")[0].strip().upper() in _DEVICE_NAMES:
+        raise FolderNameError(f"{cleaned!r} is a name Windows keeps for itself")
+    return cleaned
+
+
 def create_folder(root: Path, name: str, parent: str = "") -> str:
     """Create a category folder the user asked for and return its key.
 
     Only ever called when the user clicked Create (AutoShelf never creates folders by
     itself). Refuses reserved names and names that already exist.
     """
-    cleaned = clean_folder_name(name)
-    if not cleaned or cleaned != name.strip():
-        raise FolderNameError(
-            f"{name!r} can't be a folder name" + (f"; try {cleaned!r}" if cleaned else "")
-        )
+    cleaned = valid_folder_name(name)
     base = root.joinpath(*parent.split("/")) if parent else root
     if not base.is_dir():
         raise FolderNameError(f"There is no folder {parent!r}")

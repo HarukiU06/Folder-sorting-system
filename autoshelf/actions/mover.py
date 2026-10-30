@@ -20,7 +20,7 @@ from pathlib import Path, PurePath
 from typing import Any
 
 from autoshelf.db import repository
-from autoshelf.fsutil import is_within, sha256_file
+from autoshelf.fsutil import is_online_only, is_within, sha256_file
 from autoshelf.layout import Zone, zone_of
 
 log = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class MoveResult:
     """A completed move."""
 
     history_id: int
-    file_id: int
+    file_id: int | None  # None for a folder put back by an undo
     src: Path
     dst: Path
 
@@ -117,7 +117,8 @@ def move_file(
         raise MoveError(f"{source.name} is already in {target_dir}")
 
     st = source.stat()
-    digest = sha256 or sha256_file(source)
+    # Reading an online-only file would download it from iCloud; it moves unhashed.
+    digest = sha256 or (None if is_online_only(st) else sha256_file(source))
     file_id = repository.upsert_file(
         conn, source, sha256=digest, size=st.st_size, mtime=st.st_mtime
     )

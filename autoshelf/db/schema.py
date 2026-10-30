@@ -216,3 +216,35 @@ ALTER TABLE rules ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE rules ADD COLUMN rename_template TEXT NOT NULL DEFAULT '';
 UPDATE rules SET conditions_json = json_array(json_object('kind', kind, 'pattern', pattern));
 """
+
+V8 = """
+-- Folder changes made in the Library (rename, move, move to _Trash) are recorded with the
+-- action 'folder': src the folder's old path, dst its new path, details.kind what it was.
+-- A rebuild like V6, since SQLite can't change a CHECK constraint.
+CREATE TABLE history_new (
+    id           INTEGER PRIMARY KEY,
+    ts           TEXT    NOT NULL,
+    file_id      INTEGER REFERENCES files (id) ON DELETE SET NULL,
+    action       TEXT    NOT NULL
+                 CHECK (action IN ('move', 'rename', 'tag', 'undo', 'create', 'folder')),
+    src          TEXT,
+    dst          TEXT,
+    reason       TEXT    NOT NULL DEFAULT '',
+    confidence   REAL,
+    details_json TEXT    NOT NULL DEFAULT '{}',
+    batch_id     TEXT,
+    state        TEXT    NOT NULL CHECK (state IN ('pending', 'done', 'undone', 'failed')),
+    root         TEXT,
+    sha256       TEXT,
+    undo_of      INTEGER REFERENCES history (id)
+);
+INSERT INTO history_new (id, ts, file_id, action, src, dst, reason, confidence, details_json,
+                         batch_id, state, root, sha256, undo_of)
+    SELECT id, ts, file_id, action, src, dst, reason, confidence, details_json,
+           batch_id, state, root, sha256, undo_of FROM history;
+DROP TABLE history;
+ALTER TABLE history_new RENAME TO history;
+CREATE INDEX history_state ON history (state);
+CREATE INDEX history_batch ON history (batch_id);
+CREATE INDEX history_file ON history (file_id);
+"""

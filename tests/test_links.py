@@ -191,3 +191,7 @@ def test_cli_turns_notification_buttons_on_and_off(
     assert main(["config", "--notification-buttons", "off"]) == 0
     assert "Notification buttons: off" in capsys.readouterr().out
     assert fake_registry.keys == {}
+
+
+def test_review_link() -> None:
+    assert links.parse("autoshelf:review") == Link(links.REVIEW)

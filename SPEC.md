@@ -48,6 +48,7 @@ iCloud Drive/AutoShelf/          <- the root ("big folder"); user picks the loca
 - Reserved names start with `_` and are never treated as categories.
 - Files dropped into the root, **or** into `_Inbox/` from the iPhone, are processed.
 - Files the user places directly into a category folder are **not** re-sorted. They are treated as labeled training examples.
+  - Exception (decided 2026-10-30, see `docs/superpowers/specs/2026-10-30-library-editing-design.md`): when a new folder appears inside a folder, the loose files of that parent are sorted again among its subfolders. Files whose name or title matches a subfolder's name move automatically (one undoable batch); files whose content only suggests a subfolder are offered for the user to tick.
 
 ## 4. Core behavior
 

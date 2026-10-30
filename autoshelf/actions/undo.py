@@ -1,14 +1,16 @@
-"""Undo moves, renames and new files recorded in history.
+"""Undo moves, renames, folder changes and new files recorded in history.
 
-Undoing a move or rename puts the file back. Undoing a file AutoShelf made (a compressed or
-converted copy) moves that file into ``_Trash/``, where the user can delete it: AutoShelf
-never deletes files.
+Undoing a move or rename puts the file back, and undoing a folder change (a rename, a move,
+or a folder moved to ``_Trash``) puts the folder back. Undoing a file AutoShelf made (a
+compressed or converted copy) moves that file into ``_Trash/``, where the user can delete
+it: AutoShelf never deletes files.
 """
 
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
+from autoshelf.actions import folders
 from autoshelf.actions.create import ACTION_CREATE, trash_dir
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.db import repository
@@ -41,12 +43,15 @@ def undo(
         raise UndoError(f"There is no history entry #{history_id}")
     if entry.action not in repository.UNDOABLE_ACTIONS:
         raise UndoError(
-            f"#{history_id} is a {entry.action!r}; only moves, renames and new files can be undone"
+            f"#{history_id} is a {entry.action!r}; only moves, renames, folder changes and "
+            "new files can be undone"
         )
     if entry.state != "done":
         raise UndoError(f"#{history_id} is {entry.state}, so there is nothing to undo")
     if entry.action == ACTION_CREATE:
         return _undo_create(conn, entry, force=force, before_rename=before_rename)
+    if entry.action == folders.ACTION_FOLDER:
+        return _undo_folder(conn, entry, before_rename=before_rename)
 
     current = Path(entry.dst)
     original = Path(entry.src)
@@ -124,6 +129,39 @@ def _undo_create(
         raise UndoError(str(exc)) from exc
     repository.set_history_state(conn, entry.id, "undone")
     return result
+
+
+def _undo_folder(
+    conn: sqlite3.Connection,
+    entry: repository.HistoryEntry,
+    *,
+    before_rename: BeforeRename | None,
+) -> MoveResult:
+    """Put a renamed or moved folder (or one moved to _Trash) back where it was."""
+    current, original = Path(entry.dst), Path(entry.src)
+    if not current.is_dir():
+        raise UndoError(
+            f"The folder {current.name} is no longer in {current.parent}; "
+            "it was moved or deleted outside AutoShelf"
+        )
+    if not original.parent.is_dir():
+        raise UndoError(
+            f"The folder {original.parent} no longer exists, and AutoShelf won't recreate it"
+        )
+    try:
+        history_id = folders.folder_change(
+            conn,
+            Path(entry.root),
+            current,
+            original,
+            entry.details.get("kind", folders.KIND_MOVE),
+            undo_of=entry.id,
+            before_rename=before_rename,
+        )
+    except folders.FolderError as exc:
+        raise UndoError(str(exc)) from exc
+    repository.set_history_state(conn, entry.id, "undone")
+    return MoveResult(history_id=history_id, file_id=None, src=current, dst=original)
 
 
 def undo_batch(

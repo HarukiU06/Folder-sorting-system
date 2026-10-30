@@ -28,6 +28,9 @@ FOLDER_GONE = "folder_gone"  # folder: the chosen folder vanished before the mov
 USER_MOVED = "user_moved"  # from_folder, to_folder: a correction made in History
 RENAMED = "renamed"  # old_name: a rename the user approved
 
+# Sorted again when a new folder appeared (Library editing).
+RESORTED = "resorted"  # folder, trigger (the new folder), match ("name", "rule" or "content")
+
 # Files AutoShelf made (Phase 13).
 CREATED = "created"  # operation, sources: e.g. a compressed copy
 

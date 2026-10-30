@@ -23,6 +23,7 @@ from autoshelf import commands, explorer, links, wording
 from autoshelf.app_service import AppService, WhyHere
 from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
+from autoshelf.features.resort import ResortResult
 from autoshelf.logging_setup import setup_logging
 from autoshelf.ml import calibrate as calibration
 from autoshelf.pipeline import Outcome
@@ -89,6 +90,26 @@ def notification_note(outcomes: list[Outcome], offer: Callable[[Path, list[str]]
     return Note(title, message, launch=links.link(links.INBOX))
 
 
+def resort_text(result: ResortResult) -> tuple[str, str]:
+    """Title and message after files were sorted into a new folder."""
+    plan = result.plan
+    where = plan.parent.replace("/", " / ") if plan.parent else "the Inbox"
+
+    def into(candidates) -> str:
+        names = sorted({item.target.rpartition("/")[2] for item in candidates}, key=str.casefold)
+        return ", ".join(names)
+
+    maybes = len(plan.maybes)
+    if result.moved:
+        files = f"{len(result.moved)} file{'' if len(result.moved) == 1 else 's'}"
+        title = f"Moved {files} from {where} into {into(plan.moves)}"
+        if maybes:
+            return title, f"{maybes} more might belong there. Click to review them."
+        return title, "Undo it in History if it doesn't belong there."
+    files = f"{maybes} file{'' if maybes == 1 else 's'}"
+    return f"{files} in {where} might belong in {into(plan.maybes)}", "Click to review them."
+
+
 class AutoShelfApp(QObject):
     """Connects the AppService, the window and the tray. Lives on the GUI thread."""
 
@@ -96,6 +117,7 @@ class AutoShelfApp(QObject):
     status_arrived = Signal(str)
     learned_arrived = Signal(object)
     progress_arrived = Signal(object)  # watcher Progress, from the watcher's thread
+    resorted_arrived = Signal(object)  # ResortResult, from the watcher's thread
 
     def __init__(
         self,
@@ -129,6 +151,8 @@ class AutoShelfApp(QObject):
         service.on_status = self.status_arrived.emit
         service.on_learned = self.learned_arrived.emit
         service.on_progress = self.progress_arrived.emit
+        service.on_resorted = self.resorted_arrived.emit
+        self.resorted_arrived.connect(self._on_resorted)
         self.progress_arrived.connect(self.window.progress.show_progress)
         self.outcome_arrived.connect(self._on_outcome)
         self.status_arrived.connect(self._on_status)
@@ -371,6 +395,9 @@ class AutoShelfApp(QObject):
         if link.action == links.DASHBOARD:
             self.show_window(self.window.dashboard)
             return
+        if link.action == links.REVIEW:
+            self.show_review()
+            return
         token = link.offer
 
         def show(path: Path | None) -> None:
@@ -461,8 +488,46 @@ class AutoShelfApp(QObject):
     def _message_clicked(self) -> None:
         if self._clicked_opens == "dashboard":
             self.show_window(self.window.dashboard)
+        elif self._clicked_opens == "review":
+            self.show_review()
         else:
             self._open_inbox_from_tray()
+
+    def show_review(self) -> None:
+        """Open the Library on the files that might belong in a new folder."""
+        self.show_window()
+        self.window.show_review()
+
+    def _on_resorted(self, result: ResortResult) -> None:
+        """Files went into a new folder (or might belong there): say so, offer Review."""
+        self.window.library.show_resort(result)
+        self.window.history.refresh()
+        self.window.inbox.refresh()
+        if not result.moved and not result.plan.maybes:
+            return
+        title, message = resort_text(result)
+        if self.window.isVisible() and self.window.isActiveWindow():
+            self.window.show_message(f"{title}. {message}")
+            return
+        if not self._notifications:
+            return
+        note = Note(title, message, launch=links.link(links.REVIEW))
+
+        def with_toast() -> bool:
+            toaster = self._toaster()
+            if toaster is None:
+                return False
+            toaster.show(note)
+            return True
+
+        def plain(shown: bool) -> None:
+            if shown:
+                return
+            self._clicked_opens = "review"
+            if not self.tray.notify(title, message):
+                self.window.show_message(f"{title}. {message}")
+
+        self.runner.run(with_toast, plain, lambda exc: plain(False))
 
     def check_digest(self) -> None:
         """Show the weekly digest if a week has passed since the last one."""

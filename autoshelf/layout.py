@@ -4,7 +4,9 @@ Layout (SPEC section 3):
 
 - files directly in the root are *drops* and get sorted;
 - files directly in ``_Inbox/`` are waiting for the user and get processed;
-- files inside user-made category folders are never moved (they are training examples);
+- files inside user-made category folders stay where they are (they are training
+  examples), except that a new folder appearing inside a folder sorts that folder's loose
+  files again (``features.resort``: name matches move, the rest is only offered);
 - anything inside another ``_``-prefixed folder (e.g. ``_Duplicates``) is reserved and ignored.
 """
 

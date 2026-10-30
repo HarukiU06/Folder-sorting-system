@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         self.library.saved.connect(self._after_description)
         self.rules.changed.connect(self._after_rules)
         self.library.changed.connect(self._after_rules)
+        self.library.edited.connect(self._after_library_edit)
         self.tools.changed.connect(self._after_move)
         self.pages.currentChanged.connect(self._page_changed)
 
@@ -187,6 +188,19 @@ class MainWindow(QMainWindow):
         self.inbox.refresh()
         self.history.refresh()
         self.library.refresh()
+
+    def _after_library_edit(self, message: str) -> None:
+        self.show_message(message)
+        self.inbox.refresh()
+        self.history.refresh()
+
+    def show_review(self) -> None:
+        """Open the Library and the files that might belong in a new folder."""
+        self.show_tab(self.library)
+        plan = self.library.pending_review
+        if plan is not None:
+            self.library.go_to(plan.parent)
+            self.library.review()
 
     def _after_description(self, message: str) -> None:
         self.show_message(message)

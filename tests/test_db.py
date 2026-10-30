@@ -148,3 +148,101 @@ def test_nested_transactions_roll_back_only_the_inner_part(conn) -> None:
             raise LookupError("inner step failed")
     assert repository.get_setting(conn, "outer") == 1
     assert repository.get_setting(conn, "inner") is None
+
+
+# --- folder changes (migration V8) ------------------------------------------------------
+
+
+def test_migration_v8_allows_folder_rows(paths) -> None:
+    conn = connect(paths.db_path)
+    for number, migration in enumerate(MIGRATIONS[:7], start=1):
+        script = getattr(migration, "script", migration)
+        conn.executescript(f"BEGIN;{script}PRAGMA user_version = {number}; COMMIT;")
+    conn.execute(
+        "INSERT INTO history (id, ts, action, src, dst, reason, state)"
+        " VALUES (7, 't', 'move', 'a', 'b', 'auto', 'done')"
+    )
+    conn.close()
+
+    conn = open_database(paths.db_path)
+    try:
+        assert current_version(conn) == len(MIGRATIONS) >= 8
+        assert [tuple(row) for row in conn.execute("SELECT id, action FROM history")] == [
+            (7, "move")
+        ]
+        repository.insert_history(conn, action="folder", src="A", dst="B", reason="user", root="r")
+        assert "folder" in repository.UNDOABLE_ACTIONS
+    finally:
+        conn.close()
+
+
+def _file(conn, path: str) -> int:
+    return repository.upsert_file(conn, path, sha256=None, size=1, mtime=1.0)
+
+
+def test_follow_folder_moves_paths_and_keys(conn, tmp_path) -> None:
+    root = tmp_path / "shelf"
+    inside = _file(conn, root / "A_1" / "x.pdf")
+    deeper = _file(conn, root / "A_1" / "Sub" / "y.pdf")
+    near = _file(conn, root / "A_10" / "z.pdf")
+    odd = _file(conn, root / "A%1" / "w.pdf")
+    repository.set_suggestion(conn, inside, "a_1/Sub")
+    repository.set_folder_description(conn, "A_1", "maths")
+    repository.set_folder_description(conn, "A_10", "other")
+    repository.record_correction(
+        conn, file_id=inside, from_folder="Old", to_folder="A_1/Sub", source="external"
+    )
+    rule = repository.insert_rule(conn, name="r", target_folder="A_1", kind="ext", pattern=".pdf")
+    repository.add_flashcards(conn, [("q", "a")], file_id=None, folder="A_1/Sub")
+    version = repository.library_version(conn)
+
+    changed = repository.follow_folder(
+        conn, root / "A_1", root / "B 2", old_key="A_1", new_key="B 2", status=None
+    )
+
+    assert changed == 2
+    assert repository.get_file(conn, inside).path == str(root / "B 2" / "x.pdf")
+    assert repository.get_file(conn, deeper).path == str(root / "B 2" / "Sub" / "y.pdf")
+    assert repository.get_file(conn, near).path == str(root / "A_10" / "z.pdf")
+    assert repository.get_file(conn, odd).path == str(root / "A%1" / "w.pdf")
+    assert repository.get_file(conn, inside).suggestion == "B 2/Sub"
+    assert repository.folder_descriptions(conn) == {"b 2": "maths", "a_10": "other"}
+    assert repository.list_corrections(conn)[0]["to_folder"] == "B 2/Sub"
+    assert repository.get_rule(conn, rule).target_folder == "B 2"
+    assert repository.list_flashcards(conn)[0].folder == "B 2/Sub"
+    assert repository.library_version(conn) > version
+    # Doing it again changes nothing (the watcher may see the same rename).
+    assert (
+        repository.follow_folder(
+            conn, root / "A_1", root / "B 2", old_key="A_1", new_key="B 2", status=None
+        )
+        == 0
+    )
+
+
+def test_follow_folder_for_trash_changes_paths_only(conn, tmp_path) -> None:
+    root = tmp_path / "shelf"
+    inside = _file(conn, root / "Notes" / "x.pdf")
+    repository.set_folder_description(conn, "Notes", "lecture notes")
+
+    repository.follow_folder(
+        conn,
+        root / "Notes",
+        root / "_Trash" / "Notes",
+        old_key=None,
+        new_key=None,
+        status="ignored",
+    )
+
+    record = repository.get_file(conn, inside)
+    assert record.path == str(root / "_Trash" / "Notes" / "x.pdf")
+    assert record.status == "ignored"
+    assert repository.folder_descriptions(conn) == {"notes": "lecture notes"}
+
+
+def test_known_folders_round_trip(conn) -> None:
+    assert repository.known_folders(conn) == set()
+    repository.set_folder_description(conn, "Finance", "money")
+    repository.add_known_folders(conn, ["Finance", "Ünïcode notes", "Ünïcode notes"])
+    assert repository.known_folders(conn) == {"finance", "ünïcode notes"}
+    assert repository.folder_descriptions(conn) == {"finance": "money"}

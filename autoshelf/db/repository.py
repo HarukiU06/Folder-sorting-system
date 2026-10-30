@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -222,6 +223,121 @@ def set_folder_description(conn: sqlite3.Connection, folder: str, description: s
             (folder, description),
         )
         bump_library_version(conn)
+
+
+def known_folders(conn: sqlite3.Connection) -> set[str]:
+    """Every folder AutoShelf has seen (casefolded keys): a folder not among them is new."""
+    return {row["path"].casefold() for row in conn.execute("SELECT path FROM folders")}
+
+
+def add_known_folders(conn: sqlite3.Connection, keys: Iterable[str]) -> None:
+    """Remember folders as seen (a folder with a description is already known)."""
+    with transaction(conn):
+        conn.executemany(
+            "INSERT INTO folders (path) VALUES (?) ON CONFLICT (path) DO NOTHING",
+            [(key,) for key in keys],
+        )
+
+
+# Columns that hold a folder key ("A/B"), which follow a renamed or moved folder.
+_FOLDER_KEY_COLUMNS = (
+    ("folders", "path"),
+    ("files", "suggestion"),
+    ("corrections", "from_folder"),
+    ("corrections", "to_folder"),
+    ("rules", "target_folder"),
+    ("flashcards", "folder"),
+)
+
+
+def follow_folder(
+    conn: sqlite3.Connection,
+    old_dir: str | Path,
+    new_dir: str | Path,
+    *,
+    old_key: str | None,
+    new_key: str | None,
+    status: str | None,
+) -> int:
+    """Make the records follow a folder that was renamed or moved from ``old_dir`` to
+    ``new_dir``; returns how many file records changed.
+
+    Paths of the files in it and below get the new place (and ``status``, if given). With
+    both keys, everything that names the folder by key follows too: its description,
+    corrections, rules, flashcards and suggestions (a folder moved to _Trash keeps its keys,
+    so undoing brings it all back). A folder row already at the new key (a folder deleted
+    or trashed earlier) gives way. Compared case-insensitively, without LIKE (folder names
+    may contain "_" or "%"). Doing it twice changes nothing.
+    """
+    old_text, new_text = str(old_dir), str(new_dir)
+    changed = 0
+    with transaction(conn):
+        for row in conn.execute("SELECT id, path FROM files").fetchall():
+            rest = _below(row["path"], old_text, "/\\")
+            if rest is None:
+                continue
+            path = new_text + rest
+            conn.execute("DELETE FROM files WHERE path = ? AND id != ?", (path, row["id"]))
+            if status is None:
+                conn.execute("UPDATE files SET path = ? WHERE id = ?", (path, row["id"]))
+            else:
+                conn.execute(
+                    "UPDATE files SET path = ?, status = ? WHERE id = ?", (path, status, row["id"])
+                )
+            changed += 1
+        if old_key is not None and new_key is not None:
+            for table, column in _FOLDER_KEY_COLUMNS:
+                query = f"SELECT rowid AS row_id, {column} AS key FROM {table}"
+                rows = conn.execute(f"{query} WHERE {column} IS NOT NULL").fetchall()
+                for row in rows:
+                    rest = _below(row["key"], old_key, "/")
+                    if rest is None:
+                        continue
+                    if table == "folders":  # one row per folder: a stale one there gives way
+                        conn.execute(
+                            "DELETE FROM folders WHERE path = ? AND rowid != ?",
+                            (new_key + rest, row["row_id"]),
+                        )
+                    conn.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                        (new_key + rest, row["row_id"]),
+                    )
+        bump_library_version(conn)
+    return changed
+
+
+def folders_left(conn: sqlite3.Connection, file_id: int) -> tuple[set[str], list[str]]:
+    """Where the user said a file doesn't belong: the folders (casefolded keys) it was
+    taken out of or declined for (corrections), and the destinations of its moves that
+    were undone."""
+    corrected = {
+        row["from_folder"].casefold()
+        for row in conn.execute(
+            "SELECT from_folder FROM corrections WHERE file_id = ? AND from_folder IS NOT NULL",
+            (file_id,),
+        )
+    }
+    undone = [
+        row["dst"]
+        for row in conn.execute(
+            "SELECT dst FROM history WHERE file_id = ? AND action = 'move' AND state = 'undone'"
+            " AND dst IS NOT NULL",
+            (file_id,),
+        )
+    ]
+    return corrected, undone
+
+
+def _below(value: str, folder: str, separators: str) -> str | None:
+    """What follows ``folder`` in ``value`` ("" for the folder itself), or None if ``value``
+    is neither the folder nor inside it."""
+    if value.casefold() == folder.casefold():
+        return ""
+    head = value[: len(folder)]
+    after = value[len(folder) : len(folder) + 1]
+    if after and after in separators and head.casefold() == folder.casefold():
+        return value[len(folder) :]
+    return None
 
 
 LIBRARY_VERSION = "library_version"
@@ -484,7 +600,7 @@ def get_vector_blob(conn: sqlite3.Connection, file_id: int) -> tuple[str, bytes]
 
 # --- history ----------------------------------------------------------------
 
-UNDOABLE_ACTIONS = ("move", "rename", "create")  # undoing a create sets it aside in _Trash
+UNDOABLE_ACTIONS = ("move", "rename", "create", "folder")  # a create is undone into _Trash
 
 
 @dataclass(frozen=True)

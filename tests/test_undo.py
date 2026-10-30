@@ -96,7 +96,7 @@ def test_cannot_undo_twice(conn, root: Path, inbox: Path) -> None:
 def test_cannot_undo_an_undo(conn, root: Path, inbox: Path) -> None:
     moved = move_file(conn, make(root / "a.txt"), inbox, root=root, reason="test")
     result = undo(conn, moved.history_id)
-    with pytest.raises(UndoError, match="only moves, renames and new files"):
+    with pytest.raises(UndoError, match="only moves, renames, folder changes"):
         undo(conn, result.history_id)
 
 

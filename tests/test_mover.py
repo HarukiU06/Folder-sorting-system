@@ -192,6 +192,23 @@ def test_failed_rename_marks_history_failed_and_keeps_file(conn, root: Path) -> 
     assert not (root / "Docs" / "busy.txt").exists()
 
 
+def test_online_only_file_is_moved_without_reading_it(conn, root: Path, monkeypatch) -> None:
+    import autoshelf.actions.mover as mover
+
+    src = make(root / "_Inbox" / "big video.mp4", "not downloaded")
+    (root / "Videos").mkdir()
+
+    def read(path: Path) -> str:
+        raise AssertionError("reading it would download it from iCloud")
+
+    monkeypatch.setattr(mover, "sha256_file", read)
+    monkeypatch.setattr(mover, "is_online_only", lambda st: True)
+    result = move_file(conn, src, root / "Videos", root=root, reason="user")
+
+    assert result.dst == root / "Videos" / "big video.mp4" and result.dst.exists()
+    assert repository.get_history(conn, result.history_id).sha256 is None
+
+
 @pytest.mark.parametrize(
     ("relative", "action", "status"),
     [

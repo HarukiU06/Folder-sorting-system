@@ -169,9 +169,10 @@ class AutoShelfApp(QObject):
         self._digest_timer = QTimer(self, interval=DIGEST_CHECK_MSECS)
         self._digest_timer.timeout.connect(self.check_digest)
         self._release: updates.Release | None = None  # a newer AutoShelf, if one was found
-        self._update_timer = QTimer(self, interval=UPDATE_CHECK_MSECS)
+        # Owned by the window they report to: they never fire once it is gone.
+        self._update_timer = QTimer(self.window, interval=UPDATE_CHECK_MSECS)
         self._update_timer.timeout.connect(self._update_check_due)
-        self._first_update_check = QTimer(self, singleShot=True, interval=UPDATE_FIRST_MSECS)
+        self._first_update_check = QTimer(self.window, singleShot=True, interval=UPDATE_FIRST_MSECS)
         self._first_update_check.timeout.connect(self.check_updates)
         self.tray.pause_toggled.connect(self.set_paused)
         self.tray.quit_requested.connect(QApplication.quit)

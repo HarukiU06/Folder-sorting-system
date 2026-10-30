@@ -338,3 +338,118 @@ def test_progress_while_paused(root: Path, run_service) -> None:
     run_service(paused=True, on_progress=progress)
     assert done.wait(TIMEOUT), seen
     assert seen[-1] == watch.Progress(watch.PAUSED, 0, 1)
+
+
+# --- a new folder re-sorts its parent's loose files -----------------------------------------
+
+
+class Resorts:
+    """Collects re-sort results from the worker thread."""
+
+    def __init__(self) -> None:
+        self.results: list = []
+        self._changed = threading.Condition()
+
+    def __call__(self, result) -> None:
+        with self._changed:
+            self.results.append(result)
+            self._changed.notify_all()
+
+    def wait(self, count: int = 1) -> list:
+        with self._changed:
+            assert self._changed.wait_for(lambda: len(self.results) >= count, timeout=TIMEOUT)
+            return list(self.results)
+
+
+def _until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + TIMEOUT
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+@pytest.fixture
+def lectures(root: Path) -> Path:
+    make(root / "Uni" / "lecture notes 1.txt", "eigenvalues")
+    make(root / "Uni" / "invoice.txt", "tuition fee due")
+    make(root / "Uni" / "Old" / "kept.txt", "old things")
+    return root
+
+
+def _start_resorting(run_service, root: Path, conn, **kwargs):
+    resorts = Resorts()
+    recorder = run_service(
+        make_library=lambda c: LibraryIndex(c, root, FakeEmbedder()),
+        on_resorted=resorts,
+        learn_delay=0.2,
+        **kwargs,
+    )
+    _until(lambda: repository.get_setting(conn, "folders_seeded", False))
+    return recorder.service, resorts
+
+
+def test_new_folder_triggers_resort(lectures: Path, conn, run_service) -> None:
+    _, resorts = _start_resorting(run_service, lectures, conn)
+
+    (lectures / "Uni" / "Notes").mkdir()
+    (result,) = resorts.wait()
+
+    assert (lectures / "Uni" / "Notes" / "lecture notes 1.txt").exists()
+    assert (lectures / "Uni" / "invoice.txt").exists()
+    assert [item.dst.name for item in result.moved] == ["lecture notes 1.txt"]
+    assert repository.get_history(conn, result.moved[0].history_id).reason == "resort"
+
+
+def test_first_start_seeds_without_moving(lectures: Path, conn, run_service) -> None:
+    (lectures / "Uni" / "Notes").mkdir()
+    _, resorts = _start_resorting(run_service, lectures, conn)
+    time.sleep(0.8)
+
+    assert (lectures / "Uni" / "lecture notes 1.txt").exists()
+    assert resorts.results == []
+    assert "uni/notes" in repository.known_folders(conn)
+
+
+def test_paused_defers_resort_until_resume(lectures: Path, conn, run_service) -> None:
+    service, resorts = _start_resorting(run_service, lectures, conn, paused=True)
+
+    (lectures / "Uni" / "Notes").mkdir()
+    time.sleep(1.0)
+    assert (lectures / "Uni" / "lecture notes 1.txt").exists()
+    assert "uni/notes" not in repository.known_folders(conn)
+
+    service.resume()
+    resorts.wait()
+    assert (lectures / "Uni" / "Notes" / "lecture notes 1.txt").exists()
+
+
+def test_live_folder_rename_is_not_new_and_learns_nothing(
+    lectures: Path, conn, run_service
+) -> None:
+    repository.set_folder_description(conn, "Uni/Old", "old things")
+    _, resorts = _start_resorting(run_service, lectures, conn)
+
+    (lectures / "Uni" / "Old").rename(lectures / "Uni" / "Notes")  # as in Explorer
+    _until(lambda: "uni/notes" in repository.known_folders(conn))
+    time.sleep(0.8)
+
+    assert resorts.results == []
+    assert (lectures / "Uni" / "lecture notes 1.txt").exists()
+    assert repository.list_corrections(conn) == []
+    assert repository.folder_descriptions(conn) == {"uni/notes": "old things"}
+
+
+def test_dry_run_never_resorts(lectures: Path, conn, run_service) -> None:
+    resorts = Resorts()
+    run_service(
+        make_library=lambda c: LibraryIndex(c, lectures, FakeEmbedder()),
+        on_resorted=resorts,
+        learn_delay=0.2,
+        dry_run=True,
+    )
+    time.sleep(0.5)
+    (lectures / "Uni" / "Notes").mkdir()
+    time.sleep(1.0)
+
+    assert (lectures / "Uni" / "lecture notes 1.txt").exists()
+    assert resorts.results == []

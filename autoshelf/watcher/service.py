@@ -12,6 +12,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from autoshelf.actions import folders
 from autoshelf.actions.history import reconcile_pending
 from autoshelf.config import (
     DEFAULT_AUTO_MARGIN,
@@ -22,6 +23,7 @@ from autoshelf.config import (
 )
 from autoshelf.db import repository
 from autoshelf.db.connection import open_database
+from autoshelf.features import resort
 from autoshelf.layout import PROCESSED_ZONES, RESERVED_PREFIX, Zone, inbox_dir, zone_of
 from autoshelf.ml.library import LibraryIndex
 from autoshelf.pipeline import Outcome, OutcomeKind, Pipeline
@@ -74,7 +76,9 @@ class _EventHandler(FileSystemEventHandler):
             if event.event_type in ("created", "deleted", "moved"):
                 self._service.folder_changed(src)
             if event.event_type == "moved":
-                self._service.folder_changed(Path(os.fsdecode(event.dest_path)))
+                dest = Path(os.fsdecode(event.dest_path))
+                self._service.folder_changed(dest)
+                self._service.folder_moved(src, dest)
             return
         if event.event_type == "deleted":
             # Windows can't say whether a deleted path was a file or a folder, and reports
@@ -105,6 +109,11 @@ class WatchService:
     Every ``sweep_interval`` seconds (None: never) loose files in the root and ``_Inbox``
     are offered again and the library is rescanned (``sweep``): Windows can drop events on
     busy iCloud folders, and the tracker gives up on files that take too long to arrive.
+
+    After each rescan, a folder not seen before makes its parent's loose files sorted again
+    (``features.resort``): files whose names match move, others may be offered;
+    ``on_resorted(result)`` reports it. Not while paused (the folder is found again after
+    ``resume``) and never in a dry run. A folder renamed in Explorer is followed, not new.
     """
 
     def __init__(
@@ -128,6 +137,7 @@ class WatchService:
         watched: Sequence[Path] = (),
         watched_extensions: Iterable[str] = (),
         sweep_interval: float | None = DEFAULT_SWEEP_SECONDS,
+        on_resorted: Callable[[resort.ResortResult], None] | None = None,
     ) -> None:
         self.root = root
         self.db_path = db_path
@@ -143,6 +153,9 @@ class WatchService:
         self._on_status = on_status
         self._on_learned = on_learned
         self._on_progress = on_progress
+        self._on_resorted = on_resorted
+        self._folder_moves: list[tuple[Path, Path]] = []  # renamed in Explorer, to follow
+        self._folder_moves_lock = threading.Lock()
         self._sorting: list[int] | None = None  # [done, total] while new files are sorted
         self._learn_delay = learn_delay
         self.watched = tuple(watched)
@@ -213,6 +226,7 @@ class WatchService:
     def resume(self) -> None:
         """Sort again, starting with the files that arrived while paused."""
         self._paused.clear()
+        self._library_changed()  # folders that appeared while paused are looked at now
         with self._held_lock:
             held, self._held = self._held, set()
         log.info("Sorting resumed%s", f"; {len(held)} waiting file(s) next" if held else "")
@@ -265,6 +279,88 @@ class WatchService:
         """A folder was created, deleted or renamed: rescan if it is (or was) a category."""
         if folder != self.root and zone_of(folder / "x", self.root) is Zone.CATEGORY:
             self._library_changed()
+
+    def folder_moved(self, src: Path, dst: Path) -> None:
+        """A folder was renamed or moved (in Explorer): its records follow it on the
+        worker, before the next rescan. AutoShelf's own folder changes already did that."""
+        if self.self_moves.is_expected(dst):
+            return
+        with self._folder_moves_lock:
+            self._folder_moves.append((src, dst))
+
+    def _follow_folder_moves(self, conn: sqlite3.Connection) -> None:
+        """Make the records follow folders renamed in Explorer, if they were known: then
+        the folder isn't new and its files aren't taken for files the user moved."""
+        with self._folder_moves_lock:
+            moves, self._folder_moves = self._folder_moves, []
+        if self.dry_run:
+            return
+        known = repository.known_folders(conn)
+        for src, dst in moves:
+            if not (self._is_category(src) and self._is_category(dst)):
+                continue
+            key = "/".join(src.relative_to(self.root).parts)
+            if key.casefold() in known:
+                try:
+                    folders.follow(conn, self.root, src, dst)
+                except Exception:
+                    log.exception("Couldn't follow the folder %s to %s", src, dst)
+
+    def _is_category(self, folder: Path) -> bool:
+        return folder != self.root and zone_of(folder / "x", self.root) is Zone.CATEGORY
+
+    def _check_folders(self, library: LibraryIndex | None, relocations: Sequence = ()) -> None:
+        """After a rescan: sort the loose files of a folder in which a new folder appeared."""
+        if library is None or self.dry_run:
+            return
+        conn = library.conn
+        try:
+            news = resort.find_new_folders(conn, library.folders, relocations)
+            if news.seeded:  # the first start: what exists now is simply remembered
+                resort.remember_folders(conn, library.folders)
+                return
+            if self._paused.is_set() or not (news.new or news.renamed):
+                return
+            resort.remember_folders(conn, news.new + news.renamed)
+            for parent, children in news.parents.items():
+                self._resort(library, parent, children)
+        except Exception:
+            log.exception("Couldn't sort files into the new folders; still watching")
+
+    def _resort(self, library: LibraryIndex, parent: str, children: list[str]) -> None:
+        plan = resort.plan_resort(
+            library.conn,
+            self.root,
+            library,
+            parent,
+            triggers=children,
+            threshold=self.threshold,
+            margin=self.margin,
+            ignore_patterns=self.ignore_patterns,
+        )
+        if not plan.moves and not plan.maybes:
+            return
+        result = resort.apply_moves(
+            library.conn,
+            self.root,
+            plan,
+            plan.moves,
+            chosen_by_user=False,
+            before_rename=self.self_moves.expect_move,
+        )
+        if result.moved:
+            library.mark_dirty()
+            log.info(
+                "New folder %s: moved %d file(s) into it; %d more might belong",
+                ", ".join(children),
+                len(result.moved),
+                len(plan.maybes),
+            )
+        if self._on_resorted is not None:
+            try:
+                self._on_resorted(result)
+            except Exception:
+                log.exception("Re-sort callback failed")
 
     def _in_library(self, path: Path) -> bool:
         """True if a removed ``path`` may have been a library file or a category folder."""
@@ -376,6 +472,7 @@ class WatchService:
             log.info("No folders yet: create folders in the root and new files will be sorted")
         self._status(f"Ready: {stats.folders} folders, {stats.files} files in them")
         self._report_learned(stats.relocations)
+        self._check_folders(library, stats.relocations)
         return library
 
     def _relearn(self, library: LibraryIndex | None) -> None:
@@ -383,12 +480,14 @@ class WatchService:
         if library is None:
             return
         self._library_dirty.clear()  # this rescan covers every change noted so far
+        self._follow_folder_moves(library.conn)
         try:
             stats = library.refresh()
         except Exception:
             log.exception("Couldn't rescan your folders")
             return
         self._report_learned(stats.relocations)
+        self._check_folders(library, stats.relocations)
 
     def _sync_library(self, library: LibraryIndex | None) -> None:
         """Before sorting new files, rescan the folders if they changed since last time."""
@@ -397,6 +496,7 @@ class WatchService:
         if self._library_dirty.is_set():
             self._library_dirty.clear()
             library.mark_dirty()
+        self._follow_folder_moves(library.conn)
         try:
             stats = library.ensure_current()
         except Exception:
@@ -404,6 +504,7 @@ class WatchService:
             return
         if stats is not None:
             self._report_learned(stats.relocations)
+            self._check_folders(library, stats.relocations)
 
     def _report_learned(self, relocations: Sequence) -> None:
         learned = [item for item in relocations if item.correction_id is not None]

@@ -84,11 +84,24 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.xlsx\shell\AutoShe
 [Run]
 Filename: "{app}\autoshelf-cli.exe"; Parameters: "config --explorer-menu on"; Flags: runhidden; Tasks: explorermenu; StatusMsg: "Adding AutoShelf to Explorer's menu..."
 Filename: "{app}\AutoShelf.exe"; Description: "Start AutoShelf"; Flags: nowait postinstall skipifsilent
+; An update from the app (setup.exe /VERYSILENT ... /AUTOSHELFUPDATE) starts AutoShelf again.
+Filename: "{app}\AutoShelf.exe"; Flags: nowait; Check: IsUpdate
 
 [UninstallRun]
 Filename: "{app}\AutoShelf.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitAutoShelf"
 
 [Code]
+// True when the app started this setup to update itself (see autoshelf\updates.py).
+function IsUpdate: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/AUTOSHELFUPDATE') = 0 then
+      Result := True;
+end;
+
 // Quit a running AutoShelf before its files are replaced (an update).
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var

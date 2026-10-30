@@ -1772,3 +1772,33 @@ def test_a_new_folder_is_announced_and_opens_the_library(
     finally:
         conn.close()
         app.shutdown()
+
+
+def test_quit_waits_for_an_app_that_no_longer_answers(tmp_path: Path) -> None:
+    """An app quitting for an update stops answering before its process ends; --quit (run
+    by the installer) waits for that process, so no file of it is still in use."""
+    from autoshelf.app_service import watch_lock
+
+    paths = AppPaths(tmp_path)
+    app_module.wait_for_sorter_to_end(paths, 5)  # nobody holds the lock: at once
+    code = (
+        "import sys, time; from pathlib import Path; "
+        "from autoshelf.instance import WatchLock, LOCK_FILENAME; "
+        f"lock = WatchLock(Path({str(tmp_path)!r}) / LOCK_FILENAME); "
+        "assert lock.acquire(); print('held', flush=True); time.sleep(1.5)"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert watch_lock(paths).holder_pid() is not None
+        started = time.monotonic()
+
+        app_module.wait_for_sorter_to_end(paths, 10)
+
+        assert 0.5 < time.monotonic() - started < 10
+        lock = watch_lock(paths)
+        assert lock.acquire()  # its process has ended
+        lock.release()
+    finally:
+        holder.kill()
+        holder.wait()

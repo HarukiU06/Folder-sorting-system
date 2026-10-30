@@ -20,7 +20,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from autoshelf import commands, explorer, links, wording
-from autoshelf.app_service import AppService, WhyHere
+from autoshelf.app_service import AppService, WhyHere, watch_lock
 from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
 from autoshelf.features.resort import ResortResult
@@ -663,6 +663,19 @@ def _allow_foreground(pid: int) -> None:
         ctypes.windll.user32.AllowSetForegroundWindow(pid)
 
 
+def wait_for_sorter_to_end(paths: AppPaths, seconds: float) -> None:
+    """If a process still holds the single-sorter lock (an app that stopped answering
+    because it is quitting, e.g. to be updated), wait until it has ended (or ``seconds``
+    have passed), so none of AutoShelf's files is still in use."""
+    lock = watch_lock(paths)
+    if lock.acquire():
+        lock.release()
+        return
+    pid = lock.holder_pid()
+    if pid is not None and pid != os.getpid() and sys.platform == "win32":
+        _wait_for_exit(pid, seconds)
+
+
 def _wait_for_exit(pid: int, seconds: float) -> None:
     """Wait until a process has ended (or ``seconds`` have passed)."""
     from ctypes import wintypes
@@ -754,7 +767,9 @@ def run_app(*, verbose: bool = False, show: bool = True, command: Command | None
         log.info("AutoShelf is already running; handed it %s", message.action)
         return 0
     if message.action == commands.QUIT:
-        return 0  # nothing to quit
+        # Nothing answers, but an app quitting to update itself may not have ended yet.
+        wait_for_sorter_to_end(paths, QUIT_SECONDS)
+        return 0
     service = AppService(paths)
     if not service.acquire():
         # Another launch is starting the app right now, or `autoshelf watch` is running.

@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from autoshelf import links, llm
+from autoshelf.actions import folders as folder_actions
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
 from autoshelf.actions import undo as undo_actions
@@ -44,6 +45,7 @@ from autoshelf.features import estimate as estimate_features
 from autoshelf.features import new_folders as folder_features
 from autoshelf.features import organize as organize_features
 from autoshelf.features import rename as rename_features
+from autoshelf.features import resort as resort_features
 from autoshelf.features import study as study_features
 from autoshelf.features import summaries as summary_features
 from autoshelf.features import tags as tag_features
@@ -202,6 +204,7 @@ class AppService:
         self.on_status: Callable[[str], None] | None = None
         self.on_learned: Callable[[list[learning.Relocation]], None] | None = None
         self.on_progress: Callable[[Progress], None] | None = None
+        self.on_resorted: Callable[[resort_features.ResortResult], None] | None = None
         self._search_index = SearchIndex()
 
     # --- settings -----------------------------------------------------------------
@@ -357,6 +360,7 @@ class AppService:
                 watched=watched,
                 watched_extensions=settings.watched_extensions,
                 sweep_interval=settings.sweep_minutes * 60,
+                on_resorted=self._resorted,
             )
             service.start()
             self._service = service
@@ -402,6 +406,10 @@ class AppService:
     def _learned(self, relocations: list[learning.Relocation]) -> None:
         if self.on_learned is not None:
             self.on_learned(relocations)
+
+    def _resorted(self, result: resort_features.ResortResult) -> None:
+        if self.on_resorted is not None:
+            self.on_resorted(result)
 
     def _before_rename(self) -> BeforeRename | None:
         """Tell the running watcher about the app's own moves, so it ignores them."""
@@ -513,6 +521,122 @@ class AppService:
         with self._connect() as conn:
             repository.set_folder_description(conn, key, description.strip())
         return key
+
+    # --- changing folders from the Library (each change undoable; nothing deleted) ----------
+
+    def make_folder(self, parent: str, name: str) -> str:
+        """Make a folder the user named inside ``parent`` ("" for the top level). The
+        watcher then sorts the parent's loose files that belong in it."""
+        return folder_actions.make_folder(self._require_root(), parent, name)
+
+    def move_items(self, files: list[Path], folders: list[str], to: str) -> folder_actions.Changes:
+        """Move files and folders into the folder ``to`` ("" for the top level, folders
+        only), as one batch in History. Moved files teach AutoShelf."""
+        root = self._require_root()
+        batch = uuid.uuid4().hex if len(files) + len(folders) > 1 else None
+        done: list[folder_actions.Change] = []
+        failed: list[tuple[Path, str]] = []
+        with self._connect() as conn:
+            if files:
+                try:
+                    changes = folder_actions.move_files(
+                        conn, root, files, to, before_rename=self._before_rename(), batch_id=batch
+                    )
+                except folder_actions.FolderError as exc:
+                    failed += [(path, str(exc)) for path in files]
+                else:
+                    done += changes.done
+                    failed += changes.failed
+            for key in folders:
+                try:
+                    done.append(
+                        folder_actions.move_folder_change(
+                            conn, root, key, to, before_rename=self._before_rename(), batch_id=batch
+                        )
+                    )
+                except folder_actions.FolderError as exc:
+                    failed.append((folder_actions.folder_path(root, key), str(exc)))
+        if not done and failed:
+            raise folder_actions.FolderError("; ".join(reason for _, reason in failed))
+        return folder_actions.Changes(batch, done, failed)
+
+    def rename_folder(self, key: str, name: str) -> str:
+        """Rename a folder; returns its new key (its description and rules follow it)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return folder_actions.rename_folder(
+                conn, root, key, name, before_rename=self._before_rename()
+            )
+
+    def trash_items(self, files: list[Path], folders: list[str]) -> folder_actions.Changes:
+        """Move files and folders to _Trash in the AutoShelf folder (never deleted)."""
+        root = self._require_root()
+        with self._connect() as conn:
+            return folder_actions.trash(
+                conn, root, files, folders, before_rename=self._before_rename()
+            )
+
+    def undo_changes(self, history_ids: list[int]) -> list[MoveResult]:
+        """Undo some changes, newest first (stops at the first that can't be undone)."""
+        completed: list[MoveResult] = []
+        with self._connect() as conn:
+            for history_id in sorted(history_ids, reverse=True):
+                try:
+                    completed.append(
+                        undo_actions.undo(conn, history_id, before_rename=self._before_rename())
+                    )
+                except undo_actions.UndoError as exc:
+                    raise undo_actions.UndoError(str(exc), completed) from exc
+        return completed
+
+    def plan_resort(self, folder: str) -> resort_features.ResortPlan:
+        """Where the loose files of ``folder`` would go among its subfolders (moves
+        nothing; loads the model)."""
+        root = self._require_root()
+        settings = self.settings()
+        key = resolve_folder(root, folder, settings.ignore_patterns)
+        with self._connect() as conn:
+            library = self.library(conn, root)
+            return resort_features.plan_resort(
+                conn,
+                root,
+                library,
+                key,
+                threshold=settings.auto_threshold,
+                margin=settings.auto_margin,
+                ignore_patterns=settings.ignore_patterns,
+            )
+
+    def resort(self, folder: str) -> resort_features.ResortResult:
+        """Sort the loose files of ``folder`` into its subfolders: files whose names match
+        move (one batch); the plan's ``maybes`` are for the user to choose from."""
+        plan = self.plan_resort(folder)
+        with self._connect() as conn:
+            return resort_features.apply_moves(
+                conn,
+                self._require_root(),
+                plan,
+                plan.moves,
+                chosen_by_user=False,
+                before_rename=self._before_rename(),
+            )
+
+    def move_maybes(
+        self,
+        plan: resort_features.ResortPlan,
+        chosen: list[resort_features.Candidate],
+    ) -> resort_features.ResortResult:
+        """Move the files the user ticked among those that might belong (AutoShelf
+        learns from the choice)."""
+        with self._connect() as conn:
+            return resort_features.apply_moves(
+                conn,
+                self._require_root(),
+                plan,
+                chosen,
+                chosen_by_user=True,
+                before_rename=self._before_rename(),
+            )
 
     # --- learning -----------------------------------------------------------------
 

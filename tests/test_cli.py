@@ -237,3 +237,21 @@ def test_history_shows_reason_and_confidence(conn, root: Path) -> None:
         conn, make(root / "a.pdf"), root / "Finance", root=root, reason="auto", confidence=0.61
     )
     assert "[auto 0.61]" in format_history_entry(repository.list_history(conn)[0])
+
+
+def test_resort_dry_run_lists_moves_and_maybes(
+    shelf: Path, fake_model: FakeEmbedder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    make(shelf / "Recipes" / "baking notes.txt", "flour")
+    run(capsys, "config", "--threshold", "0.3", "--margin", "0.1")
+
+    code, out, _ = run(capsys, "resort", "--root", str(shelf), "Recipes", "--dry-run")
+
+    assert code == 0
+    assert "Would move baking notes.txt to Recipes/Baking (its name)" in out
+    assert (shelf / "Recipes" / "baking notes.txt").exists()
+
+    code, out, _ = run(capsys, "resort", "--root", str(shelf), "Recipes")
+    assert code == 0
+    assert "Moved baking notes.txt to Recipes/Baking" in out
+    assert (shelf / "Recipes" / "Baking" / "baking notes.txt").exists()

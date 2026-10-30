@@ -95,6 +95,7 @@ def move_files(
     folder: str,
     *,
     before_rename: BeforeRename | None = None,
+    batch_id: str | None = None,
 ) -> Changes:
     """Move files into one of the user's folders (not the root itself, where files get
     sorted). Each move to another folder is learned from, like a move in Explorer."""
@@ -104,7 +105,7 @@ def move_files(
             "again. Choose a folder."
         )
     target = _existing_folder(root, folder)
-    batch = uuid.uuid4().hex if len(paths) > 1 else None
+    batch = batch_id or (uuid.uuid4().hex if len(paths) > 1 else None)
     done, failed = [], []
     for path in paths:
         old_folder = learning.folder_key_of(path, root)
@@ -168,9 +169,26 @@ def move_folder(
     parent: str,
     *,
     before_rename: BeforeRename | None = None,
+    batch_id: str | None = None,
 ) -> str:
     """Move a folder into ``parent`` ("" for the top level); returns its new key. A name
     already taken there gets " (2)", " (3)"..."""
+    change = move_folder_change(
+        conn, root, key, parent, before_rename=before_rename, batch_id=batch_id
+    )
+    return folder_key(root, change.dst)
+
+
+def move_folder_change(
+    conn: sqlite3.Connection,
+    root: Path,
+    key: str,
+    parent: str,
+    *,
+    before_rename: BeforeRename | None = None,
+    batch_id: str | None = None,
+) -> Change:
+    """``move_folder``, returning the change (with its history row)."""
     source = _existing_folder(root, key)
     destination = folder_path(root, parent)
     if parent:
@@ -181,8 +199,10 @@ def move_folder(
     if source.parent == destination:
         raise FolderError(f"{source.name} is already in {_place(root, destination)}")
     target = _free_folder_name(destination, source.name)
-    folder_change(conn, root, source, target, KIND_MOVE, before_rename=before_rename)
-    return folder_key(root, target)
+    history_id = folder_change(
+        conn, root, source, target, KIND_MOVE, before_rename=before_rename, batch_id=batch_id
+    )
+    return Change(history_id, source, target, "folder")
 
 
 def trash(

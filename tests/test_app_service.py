@@ -251,3 +251,38 @@ def test_a_folders_files_by_name(paths: AppPaths, root: Path) -> None:
     service.set_root(root)
     assert [path.name for path in service.folder_files("Finance")] == ["a.txt"]
     assert [path.name for path in service.folder_files("Finance/Taxes")] == ["b.txt"]
+
+
+# --- editing folders from the Library, and re-sorting -----------------------------------
+
+
+def test_folder_changes_through_the_service(service: AppService, shelf: Path) -> None:
+    invoice = shelf / "Finance" / "invoice 2024.txt"
+    assert service.make_folder("Finance", "Taxes") == "Finance/Taxes"
+
+    moved = service.move_items([invoice], [], "Finance/Taxes")
+    assert [change.dst for change in moved.done] == [shelf / "Finance" / "Taxes" / invoice.name]
+    assert service.rename_folder("Finance/Taxes", "Tax") == "Finance/Tax"
+    service.move_items([], ["Finance/Tax"], "Recipes")
+    assert (shelf / "Recipes" / "Tax" / invoice.name).exists()
+
+    binned = service.trash_items([], ["Recipes/Tax"])
+    assert (shelf / "_Trash" / "Tax" / invoice.name).exists()
+    service.undo_changes(binned.history_ids)
+    assert (shelf / "Recipes" / "Tax" / invoice.name).exists()
+
+
+def test_resort_and_move_maybes(service: AppService, shelf: Path) -> None:
+    make(shelf / "Recipes" / "pancake notes.txt", "flour eggs milk")
+    make(shelf / "Recipes" / "loaf.txt", "bread dough yeast knead")
+    (shelf / "Recipes" / "Notes").mkdir()
+    (shelf / "Recipes" / "Breads").mkdir()
+    service.describe("Recipes/Breads", "bread dough yeast knead")
+
+    result = service.resort("Recipes")
+
+    assert [item.dst.name for item in result.moved] == ["pancake notes.txt"]
+    assert [item.path.name for item in result.plan.maybes] == ["loaf.txt"]
+    chosen = service.move_maybes(result.plan, result.plan.maybes)
+    assert (shelf / "Recipes" / "Breads" / "loaf.txt").exists()
+    assert [item.dst.name for item in chosen.moved] == ["loaf.txt"]

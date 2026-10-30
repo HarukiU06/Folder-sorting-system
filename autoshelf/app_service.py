@@ -13,10 +13,10 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from autoshelf import links, llm
+from autoshelf import links, llm, updates
 from autoshelf.actions import folders as folder_actions
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
@@ -206,6 +206,7 @@ class AppService:
         self.on_progress: Callable[[Progress], None] | None = None
         self.on_resorted: Callable[[resort_features.ResortResult], None] | None = None
         self._search_index = SearchIndex()
+        self.fetch: updates.Fetch | None = None  # how GitHub is asked (tests replace it)
 
     # --- settings -----------------------------------------------------------------
 
@@ -1036,6 +1037,57 @@ class AppService:
             return None
         week = self.digest(now)
         return None if week.empty else week
+
+    # --- updates from GitHub ---------------------------------------------------------------
+
+    def update_mode(self) -> str:
+        """How this copy can be updated (``updates.INSTALLER``, ``PORTABLE`` or ``SOURCE``)."""
+        return updates.current_install_mode()
+
+    def check_for_update(self, *, now: datetime | None = None) -> updates.Release | None:
+        """The newer release on GitHub, or None; remembers when it looked. Raises
+        UpdateError."""
+        now = now or datetime.now(UTC)
+        release = updates.latest_release(self.fetch)
+        settings = self.settings()
+        self.save_settings(replace(settings, update_checked=now.isoformat(timespec="seconds")))
+        return release if release is not None and updates.is_newer(release.version) else None
+
+    def update_due(self, *, now: datetime | None = None) -> bool:
+        """True if updates are looked for and the last look was a day ago (or never)."""
+        settings = self.settings()
+        if not settings.check_updates:
+            return False
+        if not settings.update_checked:
+            return True
+        try:
+            last = datetime.fromisoformat(settings.update_checked)
+        except ValueError:
+            return True
+        return (now or datetime.now(UTC)) - last >= timedelta(hours=updates.CHECK_HOURS)
+
+    def announce_update(self, release: updates.Release) -> bool:
+        """True the first time for each version (a notification is shown once)."""
+        settings = self.settings()
+        if settings.update_notified == release.version:
+            return False
+        self.save_settings(replace(settings, update_notified=release.version))
+        return True
+
+    def download_update(
+        self,
+        release: updates.Release,
+        progress: Callable[[int, int], None] | None = None,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> Path:
+        """Download and verify the release's installer in AutoShelf's cache."""
+        return updates.download(
+            release, self.paths.cache_dir / "updates", progress=progress, cancelled=cancelled
+        )
+
+    def install_update(self, installer: Path) -> None:
+        """Start the downloaded installer; the app quits right after."""
+        updates.start_installer(installer)
 
     # --- watched folders ------------------------------------------------------------------
 

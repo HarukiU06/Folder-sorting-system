@@ -232,6 +232,10 @@ class Settings:
     llm_model: str = ""  # questions and reading lists
     llm_bulk_model: str = ""  # summaries, names, flashcards ("": the cheapest Claude model)
     ollama_url: str = "http://localhost:11434"
+    # Look for a newer AutoShelf on GitHub (only installed when you click Update).
+    check_updates: bool = True
+    update_checked: str = ""  # when it was last looked for (ISO time)
+    update_notified: str = ""  # the version a notification was shown for
 
 
 def load_settings(conn: sqlite3.Connection) -> Settings:

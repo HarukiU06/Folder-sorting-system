@@ -116,7 +116,7 @@ def move_files(
                 target,
                 root=root,
                 reason=REASON_USER,
-                sha256=_known_hash(conn, path),
+                sha256=known_hash(conn, path),
                 batch_id=batch,
                 before_rename=before_rename,
             )
@@ -262,7 +262,7 @@ def trash(
                     bin_dir,
                     root=root,
                     reason=REASON_TRASH,
-                    sha256=_known_hash(conn, path),
+                    sha256=known_hash(conn, path),
                     batch_id=batch,
                     before_rename=before_rename,
                 )
@@ -372,9 +372,8 @@ def _free_folder_name(parent: Path, name: str) -> Path:
     raise FolderError(f"No free name left for {name} in {parent}")
 
 
-def _known_hash(conn: sqlite3.Connection, path: Path) -> str | None:
-    """The stored hash of an unchanged file, so moving it doesn't read it (an online-only
-    iCloud file would be downloaded)."""
+def known_hash(conn: sqlite3.Connection, path: Path) -> str | None:
+    """The stored hash of an unchanged file, so moving it doesn't read it again."""
     record = repository.get_file_by_path(conn, path)
     try:
         st = path.stat()

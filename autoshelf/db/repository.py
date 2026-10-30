@@ -265,7 +265,8 @@ def follow_folder(
     Paths of the files in it and below get the new place (and ``status``, if given). With
     both keys, everything that names the folder by key follows too: its description,
     corrections, rules, flashcards and suggestions (a folder moved to _Trash keeps its keys,
-    so undoing brings it all back). Compared case-insensitively, without LIKE (folder names
+    so undoing brings it all back). A folder row already at the new key (a folder deleted
+    or trashed earlier) gives way. Compared case-insensitively, without LIKE (folder names
     may contain "_" or "%"). Doing it twice changes nothing.
     """
     old_text, new_text = str(old_dir), str(new_dir)
@@ -290,13 +291,41 @@ def follow_folder(
                 rows = conn.execute(f"{query} WHERE {column} IS NOT NULL").fetchall()
                 for row in rows:
                     rest = _below(row["key"], old_key, "/")
-                    if rest is not None:
+                    if rest is None:
+                        continue
+                    if table == "folders":  # one row per folder: a stale one there gives way
                         conn.execute(
-                            f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                            "DELETE FROM folders WHERE path = ? AND rowid != ?",
                             (new_key + rest, row["row_id"]),
                         )
+                    conn.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                        (new_key + rest, row["row_id"]),
+                    )
         bump_library_version(conn)
     return changed
+
+
+def folders_left(conn: sqlite3.Connection, file_id: int) -> tuple[set[str], list[str]]:
+    """Where the user said a file doesn't belong: the folders (casefolded keys) it was
+    taken out of or declined for (corrections), and the destinations of its moves that
+    were undone."""
+    corrected = {
+        row["from_folder"].casefold()
+        for row in conn.execute(
+            "SELECT from_folder FROM corrections WHERE file_id = ? AND from_folder IS NOT NULL",
+            (file_id,),
+        )
+    }
+    undone = [
+        row["dst"]
+        for row in conn.execute(
+            "SELECT dst FROM history WHERE file_id = ? AND action = 'move' AND state = 'undone'"
+            " AND dst IS NOT NULL",
+            (file_id,),
+        )
+    ]
+    return corrected, undone
 
 
 def _below(value: str, folder: str, separators: str) -> str | None:

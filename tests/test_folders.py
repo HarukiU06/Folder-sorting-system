@@ -134,6 +134,29 @@ def test_rename_then_refresh_records_no_corrections(conn, shelf: Path) -> None:
     assert "Finance/Ünïcode notes" in index.folders
 
 
+def test_rename_onto_the_name_of_a_trashed_folder(conn, shelf: Path) -> None:
+    make(shelf / "Uni" / "Notes" / "Week 1" / "old.txt", "old notes")
+    make(shelf / "Uni" / "Lectures" / "Week 1" / "intro.txt", "first lecture")
+    index = LibraryIndex(conn, shelf, FakeEmbedder())
+    index.refresh()
+    repository.add_known_folders(
+        conn, ["Uni", "Uni/Notes", "Uni/Notes/Week 1", "Uni/Lectures", "Uni/Lectures/Week 1"]
+    )
+    repository.set_folder_description(conn, "Uni/Lectures", "lecture slides")
+    folders.trash(conn, shelf, [], ["Uni/Notes"])
+
+    key = folders.rename_folder(conn, shelf, "Uni/Lectures", "Notes")
+
+    assert key == "Uni/Notes"
+    assert repository.list_history(conn, 1)[0].state == "done"
+    known = repository.known_folders(conn)
+    assert {"uni/notes", "uni/notes/week 1"} <= known
+    assert not {"uni/lectures", "uni/lectures/week 1"} & known
+    assert repository.folder_descriptions(conn)["uni/notes"] == "lecture slides"
+    assert index.refresh().relocations == ()
+    assert repository.list_corrections(conn) == []
+
+
 # --- undo and crash recovery --------------------------------------------------------------
 
 

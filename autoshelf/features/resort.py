@@ -15,9 +15,13 @@ each may move down into one of Folder's subfolders, never anywhere else:
 For a new folder at the top level the files waiting in the Inbox are checked instead (loose
 files in the root are sorted anyway), and the clear decisions for the new folder move.
 
+A file the user took out of a subfolder (moved it back by hand, undid its move, or
+answered otherwise) is never moved or offered there again.
+
 Nothing here reads files: the library index already holds every file's vector, and names
-and titles are known. ``find_new_folders`` decides which folders are new; it records
-nothing (``remember_folders`` does), so a paused AutoShelf finds them again later.
+and titles are known; files without one (not indexed yet) are left alone.
+``find_new_folders`` decides which folders are new; it records nothing
+(``remember_folders`` does), so a paused AutoShelf finds them again later.
 """
 
 import logging
@@ -31,12 +35,12 @@ from pathlib import Path
 
 from autoshelf.actions import learning
 from autoshelf.actions import rules as rule_engine
-from autoshelf.actions.folders import folder_path
+from autoshelf.actions.folders import folder_path, known_hash
 from autoshelf.actions.inbox import waiting_files
 from autoshelf.actions.mover import BeforeRename, MoveError, MoveResult, move_file
 from autoshelf.config import DEFAULT_AUTO_MARGIN, DEFAULT_AUTO_THRESHOLD, DEFAULT_IGNORE_PATTERNS
 from autoshelf.db import repository
-from autoshelf.extract import FILENAME_ONLY, Extraction, extract
+from autoshelf.extract import FILENAME_ONLY, Extraction
 from autoshelf.extract.filename import filename_tokens, name_tokens
 from autoshelf.ml.library import LibraryIndex
 from autoshelf.reasons import RESORTED, reason
@@ -153,16 +157,31 @@ def plan_resort(
     for entry in library.entries():
         if entry.folder.casefold() != wanted:
             continue
-        title, excerpt = _content(conn, entry.path)
+        record = repository.get_file_by_path(conn, entry.path)
+        if record is None:
+            continue
+        title, excerpt = repository.get_file_content(conn, record.id)
+        left = _left_by_user(conn, root, record.id)
         target, match = _by_name_or_rule(entry.path, title, excerpt, children, rules)
         if target is not None:
-            plan.moves.append(Candidate(entry.path, target, match))
-            continue
+            if target.casefold() not in left:
+                plan.moves.append(Candidate(entry.path, target, match))
+            continue  # the user took it out of there: it stays
         guess = _by_content(library, entry, children, parent_profile, threshold, margin)
-        if guess is not None:
+        if guess is not None and guess.target.casefold() not in left:
             plan.maybes.append(guess)
     plan.maybes.sort(key=lambda item: -(item.score or 0.0))
     return plan
+
+
+def _left_by_user(conn: sqlite3.Connection, root: Path, file_id: int) -> set[str]:
+    """The folders (casefolded keys) the user took this file out of."""
+    corrected, undone = repository.folders_left(conn, file_id)
+    for dst in undone:
+        key = learning.folder_key_of(Path(dst), root)
+        if key is not None:
+            corrected.add(key.casefold())
+    return corrected
 
 
 def _content(conn: sqlite3.Connection, path: Path) -> tuple[str | None, str | None]:
@@ -224,11 +243,7 @@ def _plan_inbox(conn, root, library, triggers, threshold, margin, ignore_pattern
             continue
         vector = library.stored_vector(path)
         if vector is None:
-            try:
-                vector = library.vectorize(extract(path), path.name)
-            except OSError as exc:
-                log.warning("Couldn't read %s: %s", path, exc)
-                continue
+            continue  # not indexed yet: reading it now could download it from iCloud
         choice = library.classify(vector, threshold=threshold, margin=margin).choice
         if choice is not None and any(
             choice.folder.casefold() == key or choice.folder.casefold().startswith(key + "/")
@@ -264,6 +279,7 @@ def apply_moves(
                 folder_path(root, item.target),
                 root=root,
                 reason=REASON_USER if chosen_by_user else REASON_RESORT,
+                sha256=known_hash(conn, item.path),
                 confidence=item.score,
                 batch_id=batch,
                 details={"reason": why},

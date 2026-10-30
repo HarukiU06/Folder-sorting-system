@@ -6,10 +6,13 @@ import pytest
 from fakes import FakeEmbedder
 from helpers import make
 
+from autoshelf.actions import folders
 from autoshelf.actions.learning import Relocation
+from autoshelf.actions.undo import undo
 from autoshelf.db import repository
+from autoshelf.extract import extract
 from autoshelf.features import resort
-from autoshelf.ml.library import LibraryIndex
+from autoshelf.ml.library import LibraryIndex, store_vector
 
 LOOSE = {
     "lecture notes 1.txt": "eigenvalues and eigenvectors",
@@ -107,10 +110,21 @@ def test_maybes_need_threshold_and_both_margins(conn, shelf: Path) -> None:
     assert plan.moves == []
 
 
+def _waiting(conn, root: Path, name: str, text: str) -> Path:
+    """A file the watcher left in _Inbox: its vector is stored, as the pipeline does."""
+    path = make(root / "_Inbox" / name, text)
+    st = path.stat()
+    file_id = repository.upsert_file(conn, path, sha256=None, size=st.st_size, mtime=st.st_mtime)
+    library = LibraryIndex(conn, root, FakeEmbedder())
+    document = library.embed(extract(path), name)
+    store_vector(conn, file_id, document, model=library.model, size=st.st_size, mtime=st.st_mtime)
+    return path
+
+
 def test_inbox_branch_moves_clear_matches(conn, root: Path) -> None:
-    make(root / "_Inbox" / "pancake recipe.txt", "breakfast")
-    make(root / "_Inbox" / "cake.txt", "baking flour sugar oven")
-    make(root / "_Inbox" / "tax.txt", "income tax return")
+    _waiting(conn, root, "pancake recipe.txt", "breakfast")
+    _waiting(conn, root, "cake.txt", "baking flour sugar oven")
+    _waiting(conn, root, "tax.txt", "income tax return")
     (root / "Recipes").mkdir()
     (root / "Finance").mkdir()
     repository.set_folder_description(conn, "Recipes", "baking flour sugar oven")
@@ -149,6 +163,67 @@ def test_apply_user_choice_records_correction(conn, shelf: Path) -> None:
     assert [(row["from_folder"], row["to_folder"]) for row in learned] == [
         ("My Folder", "My Folder/Kubernetes")
     ]
+
+
+def test_a_file_put_back_is_not_moved_there_again(conn, shelf: Path) -> None:
+    (shelf / "My Folder" / "Notes").mkdir()
+    plan = _plan(conn, shelf, triggers=("My Folder/Notes",))
+    result = resort.apply_moves(conn, shelf, plan, plan.moves, chosen_by_user=False)
+    moved = {item.dst.name: item for item in result.moved}
+    undo(conn, moved["Calculus notes.md"].history_id)  # undone in History
+    folders.move_files(conn, shelf, [moved["lecture notes 1.txt"].dst], "My Folder")  # by hand
+    (shelf / "My Folder" / "Exams").mkdir()
+
+    again = _plan(conn, shelf, triggers=("My Folder/Exams",))
+
+    put_back = {"Calculus notes.md", "lecture notes 1.txt"}
+    assert [item for item in again.moves + again.maybes if item.path.name in put_back] == []
+
+
+def test_a_put_back_file_matching_two_folders_by_name_stays(conn, shelf: Path) -> None:
+    (shelf / "My Folder" / "Notes").mkdir()
+    (shelf / "My Folder" / "Lecture").mkdir()
+    index = LibraryIndex(conn, shelf, FakeEmbedder())
+    index.refresh()
+    record = repository.get_file_by_path(conn, shelf / "My Folder" / "lecture notes 1.txt")
+    repository.record_correction(
+        conn,
+        file_id=record.id,
+        from_folder="My Folder/Notes",
+        to_folder="My Folder",
+        source="external",
+    )
+
+    plan = _plan(conn, shelf, triggers=("My Folder/Lecture",))
+
+    assert "lecture notes 1.txt" not in {item.path.name for item in plan.moves}
+
+
+def test_moving_known_files_reads_none_of_them(conn, shelf: Path, monkeypatch) -> None:
+    (shelf / "My Folder" / "Notes").mkdir()
+    plan = _plan(conn, shelf, triggers=("My Folder/Notes",))
+
+    def read(path: Path) -> str:
+        raise AssertionError(f"{path.name} was read")
+
+    monkeypatch.setattr("autoshelf.actions.mover.sha256_file", read)
+    result = resort.apply_moves(conn, shelf, plan, plan.moves, chosen_by_user=False)
+
+    assert len(result.moved) == 3 and result.failed == []
+
+
+def test_inbox_files_not_indexed_are_left_alone(conn, root: Path, monkeypatch) -> None:
+    make(root / "_Inbox" / "cake.txt", "baking flour sugar oven")
+    (root / "Recipes").mkdir()
+    repository.set_folder_description(conn, "Recipes", "baking flour sugar oven")
+
+    def read(*args):
+        raise AssertionError("cake.txt was read")
+
+    monkeypatch.setattr(LibraryIndex, "vectorize", read)
+    plan = _plan(conn, root, parent="", triggers=("Recipes",))
+
+    assert plan.moves == [] and plan.maybes == []
 
 
 def test_find_new_folders(conn, root: Path) -> None:

@@ -26,6 +26,7 @@ MIGRATIONS: tuple[str | Rebuild, ...] = (
     schema.V5,
     Rebuild(schema.V6),
     schema.V7,
+    Rebuild(schema.V8),
 )
 
 

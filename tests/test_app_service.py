@@ -354,3 +354,14 @@ def test_updates_download_into_the_cache(service: AppService, monkeypatch) -> No
     assert seen == [(release, service.paths.cache_dir / "updates")]
     assert path == service.paths.cache_dir / "updates" / "AutoShelf-9.9.9-setup.exe"
     assert service.update_mode() == updates.SOURCE  # the tests run from source
+
+
+def test_old_update_downloads_are_cleared(service: AppService) -> None:
+    folder = service.paths.cache_dir / "updates"
+    folder.mkdir(parents=True)
+    (folder / "AutoShelf-0.2.0-setup.exe").write_bytes(b"installed already")
+    (folder / "keep.txt").write_text("not AutoShelf's", encoding="utf-8")
+
+    service.clear_update_downloads()
+
+    assert [item.name for item in folder.iterdir()] == ["keep.txt"]

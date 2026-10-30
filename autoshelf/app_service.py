@@ -1085,6 +1085,13 @@ class AppService:
             release, self.paths.cache_dir / "updates", progress=progress, cancelled=cancelled
         )
 
+    def clear_update_downloads(self) -> None:
+        """Remove installers downloaded earlier (about 1 GB each; one that is still
+        running stays until the next start)."""
+        folder = self.paths.cache_dir / "updates"
+        if folder.is_dir():
+            updates.remove_old_downloads(folder)
+
     def install_update(self, installer: Path) -> None:
         """Start the downloaded installer; the app quits right after."""
         updates.start_installer(installer)

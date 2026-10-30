@@ -151,7 +151,7 @@ def download(
     """Download the release's installer into ``folder`` and check it against the published
     checksum; returns its path. Raises UpdateError (then no installer is left behind)."""
     folder.mkdir(parents=True, exist_ok=True)
-    _remove_old_downloads(folder)
+    remove_old_downloads(folder)
     target = folder / release.installer_name
     part = folder / f"{release.installer_name}.part"
     try:
@@ -213,7 +213,7 @@ def start_installer(path: Path, *, popen=subprocess.Popen) -> None:
     log.info("Started the installer %s", path)
 
 
-def _remove_old_downloads(folder: Path) -> None:
+def remove_old_downloads(folder: Path) -> None:
     """AutoShelf's own earlier installers (about 1 GB each) and cut-off downloads."""
     for item in folder.iterdir():
         if item.is_file() and _OLD_DOWNLOAD.fullmatch(item.name):

@@ -1999,3 +1999,14 @@ def test_an_accepted_update_starts_the_installer_and_quits(
     app.start_update()
 
     assert started == [installer] and quit_called == [True]
+
+
+def test_starting_clears_old_update_downloads(qtbot, app) -> None:
+    folder = app.service.paths.cache_dir / "updates"
+    folder.mkdir(parents=True)
+    old = folder / "AutoShelf-0.2.0-setup.exe"
+    old.write_bytes(b"installed already")
+
+    app.start(show=False)
+
+    qtbot.waitUntil(lambda: not old.exists(), timeout=WAIT_MS)

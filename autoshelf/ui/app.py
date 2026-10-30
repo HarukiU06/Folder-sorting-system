@@ -195,6 +195,7 @@ class AutoShelfApp(QObject):
         # At start a newer version is always looked for (if that is on), so Settings knows.
         self._first_update_check.start()
         self._update_timer.start()
+        self.runner.run(self.service.clear_update_downloads, None, lambda exc: None)
         if self.service.root() is None:
             self.window.set_state("Choose the folder to sort (Settings)")
             self.show_window(self.window.settings)

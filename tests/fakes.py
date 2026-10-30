@@ -70,3 +70,72 @@ class FakeRegistry:
         for existing in list(self.keys):
             if existing.casefold() == key.casefold() or existing.casefold().startswith(prefix):
                 del self.keys[existing]
+
+
+# --- GitHub releases (autoshelf.updates) -------------------------------------------------
+
+GITHUB = "https://github.com/HarukiU06/Folder-sorting-system"
+
+
+def github_release(version: str = "9.9.9", **changes) -> dict:
+    """What the GitHub API says about a release with the app's usual assets."""
+    base = f"{GITHUB}/releases/download/v{version}/"
+    names = (
+        f"AutoShelf-{version}-windows.zip",
+        f"AutoShelf-{version}-setup.exe",
+        f"AutoShelf-{version}-setup.exe.sha256",
+    )
+    data = {
+        "tag_name": f"v{version}",
+        "draft": False,
+        "prerelease": False,
+        "body": f"What's new in {version}",
+        "html_url": f"{GITHUB}/releases/tag/v{version}",
+        "assets": [
+            {"name": name, "size": 1000, "browser_download_url": base + name} for name in names
+        ],
+    }
+    data.update(changes)
+    return data
+
+
+class FakeResponse:
+    """A urllib response: ``read`` in small chunks, the final URL, a Content-Length."""
+
+    def __init__(self, body: bytes, url: str, chunk: int = 4) -> None:
+        self.body, self.url, self.chunk = body, url, chunk
+        self.headers = {"Content-Length": str(len(body))}
+        self._at = 0
+
+    def read(self, size: int = -1) -> bytes:
+        size = len(self.body) if size is None or size < 0 else min(size, self.chunk)
+        data = self.body[self._at : self._at + size]
+        self._at += len(data)
+        return data
+
+    def geturl(self) -> str:
+        return self.url
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None
+
+
+class FakeWeb:
+    """Answers ``updates._urlopen`` from a dict of URL -> bytes; records what was asked."""
+
+    def __init__(self, pages: dict[str, bytes], redirect: dict[str, str] | None = None) -> None:
+        self.pages = pages
+        self.redirect = redirect or {}
+        self.asked: list[str] = []
+
+    def __call__(self, request, timeout: float) -> FakeResponse:
+        url = request.full_url
+        self.asked.append(url)
+        if url not in self.pages:
+            import urllib.error
+
+            raise urllib.error.URLError(f"no such page {url}")
+        return FakeResponse(self.pages[url], self.redirect.get(url, url))

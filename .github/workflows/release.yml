@@ -41,6 +41,14 @@ jobs:
           choco install innosetup --no-progress -y
           powershell -ExecutionPolicy Bypass -File packaging\installer.ps1
 
+      - name: Checksum the installer
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $name = "AutoShelf-$version-setup.exe"
+          $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+          # Read by autoshelf\updates.py before an update is installed.
+          Set-Content -Path "dist\$name.sha256" -Value "$hash  $name" -NoNewline -Encoding ascii
+
       - name: Zip the app
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
@@ -53,5 +61,6 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart("v")
           gh release create "${{ github.ref_name }}" `
             "dist\AutoShelf-$version-setup.exe" `
+            "dist\AutoShelf-$version-setup.exe.sha256" `
             "dist\AutoShelf-$version-windows.zip" `
             --title "AutoShelf $version" --generate-notes

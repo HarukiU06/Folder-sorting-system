@@ -81,7 +81,8 @@ py -3.13 -m venv .venv
 
 This installs PyTorch (the CPU build, about 1 GB in the venv). The first command that sorts
 or classifies files also downloads the language model (about 470 MB) into
-`%APPDATA%\AutoShelf\cache\models`; after that everything runs offline, on your PC.
+`%APPDATA%\AutoShelf\cache\models`; after that everything runs offline, on your PC
+(except the daily look for a newer AutoShelf on GitHub, see [Updating](#updating)).
 
 The commands below call the venv's Python directly, so they work without activating it.
 (If you do run `.venv\Scripts\Activate.ps1` and PowerShell blocks it, run
@@ -170,6 +171,22 @@ keeps AutoShelf running; quit it from the tray menu. Only one AutoShelf
 sorts at a time: starting the app again just shows its window, and `autoshelf watch`
 refuses to run while the app does.
 
+### Updating
+
+Settings → Updates shows your version. Once a day AutoShelf looks on GitHub for a newer
+release ("Check now" looks right away; the switch there turns the daily look off), and the
+first time it finds one, a notification says "AutoShelf 0.3.0 is available" with an Update
+button. Nothing is downloaded until you click Update: AutoShelf then shows what's new,
+downloads the installer into `%APPDATA%\AutoShelf\cache\updates` (with a progress bar;
+Cancel stops it), checks it against the checksum published with the release (a damaged or
+cut-off download is never run), closes, installs the new version and opens again. Your
+settings and history, and the options you chose when you first installed it, stay. The look
+only asks GitHub for its newest release: nothing about your files is sent.
+
+A copy unzipped from the release ZIP opens the release page instead, to download the new
+one by hand; running from source, update with `git pull`. AutoShelf 0.1.0 has no Update
+button, so getting 0.2.0 means running its installer by hand once.
+
 ### Start with Windows
 
 Settings → Windows → "Start AutoShelf when I sign in" (or `autoshelf config --startup on`)
@@ -230,12 +247,18 @@ removes all of that again, including the menu entries, the sign-in entry and the
 moves stay undoable if you reinstall). Your files are never touched. The installer isn't
 code-signed, so Windows SmartScreen may warn before it runs ("More info" → "Run anyway").
 
-### Releases
+### Publishing a release
 
-Pushing a tag that matches the version in `autoshelf\__init__.py` (for example `v0.1.0`)
-runs `.github\workflows\release.yml`: it builds the app and the installer on GitHub's
-Windows runner and attaches `AutoShelf-<version>-setup.exe` and a ZIP of the app folder to
-a GitHub Release.
+1. Set the new version in `pyproject.toml`, `autoshelf\__init__.py` and the default
+   `AppVersion` in `packaging\autoshelf.iss` (a test checks that they match), and commit.
+2. Push the commit, then a tag with that version: `git tag v0.2.0`, `git push origin v0.2.0`.
+
+The tag runs `.github\workflows\release.yml`: it refuses a tag that doesn't match
+`autoshelf.__version__`, builds the app and the installer on GitHub's Windows runner, and
+attaches `AutoShelf-<version>-setup.exe`, its checksum `AutoShelf-<version>-setup.exe.sha256`
+(what Update checks a download against) and a ZIP of the app folder to a GitHub Release,
+with notes generated from the merged pull requests (the Update dialog shows them). A release
+marked as a pre-release, or one without the checksum, is never offered by Update.
 
 ## Command line
 

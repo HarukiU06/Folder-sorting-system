@@ -45,6 +45,7 @@ def shelf(root: Path) -> Path:
 def service(paths: AppPaths, shelf: Path) -> Iterator[AppService]:
     app = AppService(paths, loader=lambda model, cache_dir: FakeEmbedder())
     app.save_settings(replace(app.settings(), root=str(shelf), stable_seconds=0.3))
+    app.fetch = lambda url: b"{}"  # GitHub knows no release (tests never use the network)
     app.describe("Finance", "invoice receipt tax bank")
     app.describe("Recipes", "recipe cooking baking oven")
     yield app
@@ -1772,3 +1773,240 @@ def test_a_new_folder_is_announced_and_opens_the_library(
     finally:
         conn.close()
         app.shutdown()
+
+
+def test_quit_waits_for_an_app_that_no_longer_answers(tmp_path: Path) -> None:
+    """An app quitting for an update stops answering before its process ends; --quit (run
+    by the installer) waits for that process, so no file of it is still in use."""
+    from autoshelf.app_service import watch_lock
+
+    paths = AppPaths(tmp_path)
+    app_module.wait_for_sorter_to_end(paths, 5)  # nobody holds the lock: at once
+    code = (
+        "import sys, time; from pathlib import Path; "
+        "from autoshelf.instance import WatchLock, LOCK_FILENAME; "
+        f"lock = WatchLock(Path({str(tmp_path)!r}) / LOCK_FILENAME); "
+        "assert lock.acquire(); print('held', flush=True); time.sleep(1.5)"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert watch_lock(paths).holder_pid() is not None
+        started = time.monotonic()
+
+        app_module.wait_for_sorter_to_end(paths, 10)
+
+        assert 0.5 < time.monotonic() - started < 10
+        lock = watch_lock(paths)
+        assert lock.acquire()  # its process has ended
+        lock.release()
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+# --- updates from GitHub ---------------------------------------------------------------------
+
+
+def _release(version: str = "9.9.9"):
+    from fakes import github_release
+
+    from autoshelf import updates
+
+    return updates.release_from(github_release(version))
+
+
+def _github(version: str):
+    import json
+
+    from fakes import github_release
+
+    return lambda url: json.dumps(github_release(version)).encode()
+
+
+def test_settings_show_an_available_update(qtbot, service, runner) -> None:
+    from autoshelf import updates
+
+    view = SettingsView(service, runner)
+    qtbot.addWidget(view)
+    release = _release()
+
+    view.show_update(release, updates.INSTALLER)
+    assert view.update_button.isVisibleTo(view) and view.update_button.text() == "Update…"
+    assert "AutoShelf 9.9.9 is available" in view.update_text.text()
+    with qtbot.waitSignal(view.update_requested, timeout=WAIT_MS):
+        view.update_button.click()
+    view.show_update(release, updates.PORTABLE)
+    assert view.update_button.isVisibleTo(view) and view.update_button.text() == "Download…"
+    view.show_update(None, updates.INSTALLER)
+    assert not view.update_button.isVisibleTo(view)
+    assert "newest version" in view.update_text.text()
+    view.show_update(release, updates.SOURCE)
+    assert not view.update_button.isVisibleTo(view) and "git pull" in view.update_text.text()
+    view.show_update(None, updates.INSTALLER, error="no network")
+    assert "Couldn't check" in view.update_text.text() and "no network" in view.update_text.text()
+    with qtbot.waitSignal(view.check_updates_requested, timeout=WAIT_MS):
+        view.check_button.click()
+
+    view.load()
+    settle(qtbot, runner)
+    assert view.auto_updates.isChecked()
+    view.auto_updates.setChecked(False)
+    settle(qtbot, runner)
+    assert service.settings().check_updates is False
+
+
+def test_update_dialog_downloads_and_accepts(qtbot, service, runner, tmp_path: Path) -> None:
+    from autoshelf.ui.update_dialog import UpdateDialog
+    from autoshelf.updates import UpdateError
+
+    release = _release()
+    installer = tmp_path / release.installer_name
+    calls = []
+
+    def download(found, progress=None, cancelled=lambda: False):
+        calls.append(found)
+        if len(calls) == 1:
+            raise UpdateError("The download is damaged")
+        progress(500, 1000)
+        progress(1000, 1000)
+        return installer
+
+    service.download_update = download
+    dialog = UpdateDialog(release, service, runner)
+    qtbot.addWidget(dialog)
+    assert "What's new in 9.9.9" in dialog.notes.toPlainText()
+
+    dialog.start()
+    settle(qtbot, runner)
+    assert "damaged" in dialog.status.text()
+    assert dialog.update_button.isEnabled() and dialog.installer is None
+    with qtbot.waitSignal(dialog.accepted, timeout=WAIT_MS):
+        dialog.start()
+    assert dialog.installer == installer and calls == [release, release]
+
+
+def test_update_dialog_can_be_cancelled(qtbot, service, runner) -> None:
+    from autoshelf.ui.update_dialog import UpdateDialog
+    from autoshelf.updates import UpdateError
+
+    def download(found, progress=None, cancelled=lambda: False):
+        deadline = time.monotonic() + 10
+        while not cancelled() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise UpdateError("The download was cancelled")
+
+    service.download_update = download
+    dialog = UpdateDialog(_release(), service, runner)
+    qtbot.addWidget(dialog)
+    dialog.start()
+    with qtbot.waitSignal(dialog.rejected, timeout=WAIT_MS):
+        dialog.cancel()
+    assert dialog.installer is None
+
+
+def test_app_announces_a_new_version_once(qtbot, service: AppService, monkeypatch) -> None:
+    from autoshelf import updates
+
+    toaster = FakeToaster()
+    monkeypatch.setattr(service, "update_mode", lambda: updates.INSTALLER)
+    service.fetch = _github("9.9.9")
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    try:
+        app.check_updates()
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        app.check_updates()
+        settle(qtbot, app.runner)
+        assert len(toaster.notes) == 1
+        note = toaster.notes[0]
+        assert note.title == "AutoShelf 9.9.9 is available"
+        assert note.launch == "autoshelf:settings"
+        assert note.buttons == (("Update", "autoshelf:update"),)
+        settings = app.window.settings
+        assert settings.update_button.isVisibleTo(settings)
+        app.run_command(Command(commands.URL, url=note.launch))
+        assert app.window.current_page() is app.window.settings
+
+        def never(url: str) -> bytes:
+            raise AssertionError("updates are off: nothing may be fetched")
+
+        service.save_settings(replace(service.settings(), check_updates=False))
+        service.fetch = never
+        app.check_updates()
+        settle(qtbot, app.runner)
+    finally:
+        app.shutdown()
+
+
+def test_update_link_checks_first(qtbot, service: AppService, monkeypatch) -> None:
+    from autoshelf import updates
+    from autoshelf.ui.update_dialog import UpdateDialog
+
+    shown = []
+    monkeypatch.setattr(UpdateDialog, "exec", lambda self: shown.append(self.release.version))
+    monkeypatch.setattr(service, "update_mode", lambda: updates.INSTALLER)
+    service.fetch = _github("9.9.9")
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: None)
+    qtbot.addWidget(app.window)
+    try:
+        app.run_command(Command(commands.URL, url="autoshelf:update"))
+        qtbot.waitUntil(lambda: shown == ["9.9.9"], timeout=WAIT_MS)
+        assert app.window.current_page() is app.window.settings
+    finally:
+        app.shutdown()
+
+
+def test_portable_copy_opens_the_release_page(qtbot, app, monkeypatch) -> None:
+    from PySide6.QtGui import QDesktopServices
+
+    from autoshelf import updates
+
+    opened, started = [], []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+    monkeypatch.setattr(app.service, "install_update", started.append)
+    monkeypatch.setattr(app.service, "update_mode", lambda: updates.PORTABLE)
+    app._release = _release()
+
+    app.start_update()
+
+    assert opened == [app._release.page] and started == []
+
+
+def test_an_accepted_update_starts_the_installer_and_quits(
+    qtbot, app, monkeypatch, tmp_path: Path
+) -> None:
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from autoshelf import updates
+    from autoshelf.ui.update_dialog import UpdateDialog
+
+    installer = tmp_path / "AutoShelf-9.9.9-setup.exe"
+
+    def accept(self) -> QDialog.DialogCode:
+        self.installer = installer
+        return QDialog.DialogCode.Accepted
+
+    started, quit_called = [], []
+    monkeypatch.setattr(UpdateDialog, "exec", accept)
+    monkeypatch.setattr(app.service, "install_update", started.append)
+    monkeypatch.setattr(app.service, "update_mode", lambda: updates.INSTALLER)
+    monkeypatch.setattr(QApplication, "quit", lambda: quit_called.append(True))
+    app._release = _release()
+
+    app.start_update()
+
+    assert started == [installer] and quit_called == [True]
+
+
+def test_starting_clears_old_update_downloads(qtbot, app) -> None:
+    folder = app.service.paths.cache_dir / "updates"
+    folder.mkdir(parents=True)
+    old = folder / "AutoShelf-0.2.0-setup.exe"
+    old.write_bytes(b"installed already")
+
+    app.start(show=False)
+
+    qtbot.waitUntil(lambda: not old.exists(), timeout=WAIT_MS)

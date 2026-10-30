@@ -195,3 +195,8 @@ def test_cli_turns_notification_buttons_on_and_off(
 
 def test_review_link() -> None:
     assert links.parse("autoshelf:review") == Link(links.REVIEW)
+
+
+def test_update_and_settings_links() -> None:
+    assert links.parse("autoshelf:update") == Link(links.UPDATE)
+    assert links.parse("autoshelf:settings") == Link(links.SETTINGS)

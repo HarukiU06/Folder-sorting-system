@@ -31,7 +31,7 @@ from qfluentwidgets import (
     TitleLabel,
 )
 
-from autoshelf import llm, wording
+from autoshelf import __version__, llm, updates, wording
 from autoshelf.actions.rules import extensions as parse_extensions
 from autoshelf.app_service import AppService
 from autoshelf.config import CONFIDENCE_LEVELS, Settings, confidence_level
@@ -126,6 +126,8 @@ class SettingsView(QWidget):
     message = Signal(str)  # a message for the status bar
     calibration_progress = Signal(int, int)  # (files tested, of), from a worker thread
     ai_state = Signal(bool)  # whether an AI provider is chosen
+    check_updates_requested = Signal()  # "Check now"
+    update_requested = Signal()  # "Update…" (or "Download…" for an unzipped copy)
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
         super().__init__(parent)
@@ -147,6 +149,7 @@ class SettingsView(QWidget):
         layout.addWidget(self._skipped_group())
         layout.addWidget(self._notifications_group())
         layout.addWidget(self._windows_group())
+        layout.addWidget(self._updates_group())
         self.rules = RulesView(service, runner)
         self.rules.setMinimumHeight(420)
         rules_group = QWidget()
@@ -323,6 +326,56 @@ class SettingsView(QWidget):
                 self.explorer_menu,
             ),
         )
+
+    def _updates_group(self) -> QWidget:
+        self.update_button = PrimaryPushButton("Update…")
+        self.update_button.setVisible(False)
+        self.update_button.clicked.connect(self.update_requested)
+        self.check_button = PushButton("Check now")
+        self.check_button.clicked.connect(self.check_updates_requested)
+        version = setting_row(f"AutoShelf {__version__}", "", self.update_button, self.check_button)
+        self.update_text = CaptionLabel("Click Check now to look for a newer version.")
+        self.update_text.setWordWrap(True)
+        version.layout().itemAt(0).layout().addWidget(self.update_text)
+        self.auto_updates = switch()
+        self.auto_updates.checkedChanged.connect(
+            lambda on: self._update(None, False, check_updates=on)
+        )
+        return setting_group(
+            "Updates",
+            version,
+            setting_row(
+                "Look for a newer version once a day",
+                "On GitHub. Nothing is downloaded or installed until you click Update.",
+                self.auto_updates,
+            ),
+        )
+
+    def checking_updates(self) -> None:
+        """Say that AutoShelf is looking for a newer version."""
+        self.check_button.setEnabled(False)
+        self.update_text.setText("Looking for a newer version...")
+
+    def show_update(
+        self, release: updates.Release | None, mode: str, error: str | None = None
+    ) -> None:
+        """Show what the last look for a newer version found."""
+        self.check_button.setEnabled(True)
+        offer = release is not None and mode != updates.SOURCE
+        self.update_button.setVisible(offer)
+        self.update_button.setText("Download…" if mode == updates.PORTABLE else "Update…")
+        if mode == updates.SOURCE:
+            found = f"AutoShelf {release.version} is available. " if release else ""
+            text = found + "Running from source: update with git pull."
+        elif error:
+            text = f"Couldn't check for a newer version: {error}"
+        elif release is not None:
+            text = f"AutoShelf {release.version} is available."
+            if mode == updates.PORTABLE:
+                text += " This copy wasn't installed with setup.exe: download the new one."
+        else:
+            text = "You have the newest version."
+        self.update_text.setText(text)
 
     def _advanced_settings(self) -> QWidget:
         box = QWidget()
@@ -540,6 +593,7 @@ class SettingsView(QWidget):
             self.weekly,
             self.ai_provider,
             self.sort_created,
+            self.auto_updates,
         )
         for widget in widgets:
             widget.blockSignals(True)
@@ -558,6 +612,7 @@ class SettingsView(QWidget):
         self.paused.setChecked(settings.paused)
         self.notifications.setChecked(settings.notifications)
         self.weekly.setChecked(settings.weekly_digest)
+        self.auto_updates.setChecked(settings.check_updates)
         self.stable.setValue(settings.stable_seconds)
         self.sweep.setValue(settings.sweep_minutes)
         self.sort_created.setChecked(settings.sort_created_files)

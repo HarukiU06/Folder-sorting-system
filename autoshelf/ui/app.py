@@ -15,12 +15,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from autoshelf import commands, explorer, links, wording
-from autoshelf.app_service import AppService, WhyHere
+from autoshelf import commands, explorer, links, updates, wording
+from autoshelf.app_service import AppService, WhyHere, watch_lock
 from autoshelf.commands import Command, CommandError
 from autoshelf.config import AppPaths, ConfigError, get_app_paths
 from autoshelf.features.resort import ResortResult
@@ -33,6 +34,7 @@ from autoshelf.ui.icons import app_icon
 from autoshelf.ui.main_window import MainWindow
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.tray import Tray
+from autoshelf.ui.update_dialog import UpdateDialog
 from autoshelf.ui.why_panel import WhyDialog
 
 log = logging.getLogger(__name__)
@@ -41,6 +43,8 @@ APP_USER_MODEL_ID = explorer.APP_ID
 NOTIFY_DELAY_MSECS = 1500  # files arriving together get one notification
 REFRESH_DELAY_MSECS = 700
 DIGEST_CHECK_MSECS = 60 * 60 * 1000  # the weekly digest is looked at every hour
+UPDATE_FIRST_MSECS = 30_000  # the first look for a newer version, after starting
+UPDATE_CHECK_MSECS = 60 * 60 * 1000  # then every hour, if a day has passed since the last
 # Explorer starts one AutoShelf per selected file; what arrives within this long of the
 # previous one is handled together (ten right-clicked images: one ZIP).
 BATCH_MSECS = 1500
@@ -164,6 +168,12 @@ class AutoShelfApp(QObject):
         self._clicked_opens = "inbox"  # what clicking the last plain notification opens
         self._digest_timer = QTimer(self, interval=DIGEST_CHECK_MSECS)
         self._digest_timer.timeout.connect(self.check_digest)
+        self._release: updates.Release | None = None  # a newer AutoShelf, if one was found
+        # Owned by the window they report to: they never fire once it is gone.
+        self._update_timer = QTimer(self.window, interval=UPDATE_CHECK_MSECS)
+        self._update_timer.timeout.connect(self._update_check_due)
+        self._first_update_check = QTimer(self.window, singleShot=True, interval=UPDATE_FIRST_MSECS)
+        self._first_update_check.timeout.connect(self.check_updates)
         self.tray.pause_toggled.connect(self.set_paused)
         self.tray.quit_requested.connect(QApplication.quit)
         settings = self.window.settings
@@ -171,6 +181,8 @@ class AutoShelfApp(QObject):
         settings.paused_toggled.connect(self.set_paused)
         settings.notifications_toggled.connect(self._set_notifications)
         settings.restart_needed.connect(self.restart)
+        settings.check_updates_requested.connect(lambda: self.check_updates(manual=True))
+        settings.update_requested.connect(self.start_update)
         self.window.inbox.count_changed.connect(self.tray.set_waiting)
 
     # --- lifecycle ----------------------------------------------------------------
@@ -180,6 +192,10 @@ class AutoShelfApp(QObject):
         settings = self.service.settings()
         self._notifications = settings.notifications
         self.tray.set_paused(settings.paused)
+        # At start a newer version is always looked for (if that is on), so Settings knows.
+        self._first_update_check.start()
+        self._update_timer.start()
+        self.runner.run(self.service.clear_update_downloads, None, lambda exc: None)
         if self.service.root() is None:
             self.window.set_state("Choose the folder to sort (Settings)")
             self.show_window(self.window.settings)
@@ -210,6 +226,8 @@ class AutoShelfApp(QObject):
 
     def shutdown(self) -> None:
         """Stop everything (called after the event loop ends)."""
+        self._first_update_check.stop()
+        self._update_timer.stop()
         self.tray.hide()
         self.window.hide()
         self.runner.wait(5000)
@@ -398,6 +416,13 @@ class AutoShelfApp(QObject):
         if link.action == links.REVIEW:
             self.show_review()
             return
+        if link.action == links.UPDATE:
+            self.show_window(self.window.settings)
+            self.start_update()
+            return
+        if link.action == links.SETTINGS:
+            self.show_window(self.window.settings)
+            return
         token = link.offer
 
         def show(path: Path | None) -> None:
@@ -490,6 +515,8 @@ class AutoShelfApp(QObject):
             self.show_window(self.window.dashboard)
         elif self._clicked_opens == "review":
             self.show_review()
+        elif self._clicked_opens == "update":
+            self.show_window(self.window.settings)
         else:
             self._open_inbox_from_tray()
 
@@ -559,6 +586,101 @@ class AutoShelfApp(QObject):
                 self.window.show_message(message)
 
         self.runner.run(with_toast, plain, lambda exc: plain(False))
+
+    # --- updates from GitHub -------------------------------------------------------
+
+    def check_updates(self, *, manual: bool = False) -> None:
+        """Look for a newer AutoShelf (on its own only if that is on); a new version is
+        announced once. Errors of an automatic look are only logged."""
+        if not manual and not self.service.settings().check_updates:
+            return
+        mode = self.service.update_mode()
+        if manual:
+            self.window.settings.checking_updates()
+
+        def found(release: updates.Release | None) -> None:
+            self._release = release
+            self.window.settings.show_update(release, mode)
+            # Found by hand, it is shown in Settings: no notification later either.
+            if release is not None and self.service.announce_update(release) and not manual:
+                self.announce_update(release)
+
+        def failed(exc: Exception) -> None:
+            log.info("Couldn't look for a newer version: %s", exc)
+            self.window.settings.show_update(self._release, mode, str(exc) if manual else None)
+
+        self.runner.run(self.service.check_for_update, found, failed)
+
+    def _update_check_due(self) -> None:
+        if self.service.update_due():
+            self.check_updates()
+
+    def announce_update(self, release: updates.Release) -> None:
+        """A notification with an Update button; clicking it opens Settings."""
+        title = f"AutoShelf {release.version} is available"
+        message = "Click Update to install it; AutoShelf then restarts on the new version."
+        note = Note(
+            title,
+            message,
+            launch=links.link(links.SETTINGS),
+            buttons=(("Update", links.link(links.UPDATE)),),
+        )
+
+        def with_toast() -> bool:
+            toaster = self._toaster()
+            if toaster is None:
+                return False
+            toaster.show(note)
+            return True
+
+        def plain(shown: bool) -> None:
+            if shown:
+                return
+            self._clicked_opens = "update"
+            if not self.tray.notify(title, message):
+                self.window.show_message(f"{title}. {message}")
+
+        self.runner.run(with_toast, plain, lambda exc: plain(False))
+
+    def start_update(self) -> None:
+        """Update to the newer release (looked for first if none is known yet): the Update
+        dialog for an installed copy, the release page for an unzipped one."""
+        mode = self.service.update_mode()
+        if mode == updates.SOURCE:
+            self.window.show_message("Running from source: update with git pull")
+            return
+        if self._release is None:
+
+            def found(release: updates.Release | None) -> None:
+                self._release = release
+                self.window.settings.show_update(release, mode)
+                if release is None:
+                    self.window.show_message("You have the newest version of AutoShelf")
+                else:
+                    self.start_update()
+
+            self.runner.run(
+                self.service.check_for_update,
+                found,
+                lambda exc: self._warn("Couldn't look for a newer version", str(exc)),
+            )
+            return
+        if mode == updates.PORTABLE:
+            QDesktopServices.openUrl(QUrl(self._release.page))
+            return
+        dialog = UpdateDialog(self._release, self.service, self.runner, self.window)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.installer is not None:
+            self.install_update(dialog.installer)
+
+    def install_update(self, installer: Path) -> None:
+        """Start the installer and quit; it installs the new version and opens it."""
+        try:
+            self.service.install_update(installer)
+        except OSError as exc:
+            self._warn("Couldn't start the installer", str(exc))
+            return
+        log.info("Quitting so that %s can install the new version", installer.name)
+        QApplication.quit()
 
     def _refresh_after_outcomes(self) -> None:
         self.window.inbox.refresh()
@@ -663,6 +785,19 @@ def _allow_foreground(pid: int) -> None:
         ctypes.windll.user32.AllowSetForegroundWindow(pid)
 
 
+def wait_for_sorter_to_end(paths: AppPaths, seconds: float) -> None:
+    """If a process still holds the single-sorter lock (an app that stopped answering
+    because it is quitting, e.g. to be updated), wait until it has ended (or ``seconds``
+    have passed), so none of AutoShelf's files is still in use."""
+    lock = watch_lock(paths)
+    if lock.acquire():
+        lock.release()
+        return
+    pid = lock.holder_pid()
+    if pid is not None and pid != os.getpid() and sys.platform == "win32":
+        _wait_for_exit(pid, seconds)
+
+
 def _wait_for_exit(pid: int, seconds: float) -> None:
     """Wait until a process has ended (or ``seconds`` have passed)."""
     from ctypes import wintypes
@@ -754,7 +889,9 @@ def run_app(*, verbose: bool = False, show: bool = True, command: Command | None
         log.info("AutoShelf is already running; handed it %s", message.action)
         return 0
     if message.action == commands.QUIT:
-        return 0  # nothing to quit
+        # Nothing answers, but an app quitting to update itself may not have ended yet.
+        wait_for_sorter_to_end(paths, QUIT_SECONDS)
+        return 0
     service = AppService(paths)
     if not service.acquire():
         # Another launch is starting the app right now, or `autoshelf watch` is running.

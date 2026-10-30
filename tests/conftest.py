@@ -104,13 +104,16 @@ def fake_registry(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """LLM providers must never reach the internet (or a local Ollama) from tests."""
+    """LLM providers and update checks must never reach the internet (or a local Ollama)
+    from tests."""
+    from autoshelf import updates
     from autoshelf.llm import base
 
     def refuse(request, timeout):
         raise AssertionError(f"tests must not use the network ({request.full_url})")
 
     monkeypatch.setattr(base, "_urlopen", refuse)
+    monkeypatch.setattr(updates, "_urlopen", refuse)
 
 
 @pytest.fixture(autouse=True)

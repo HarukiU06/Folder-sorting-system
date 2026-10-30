@@ -1,9 +1,11 @@
 """The desktop app's logic, tested without Qt."""
 
+import json
 import threading
 import time
 from collections.abc import Iterator
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -287,3 +289,79 @@ def test_resort_and_move_maybes(service: AppService, shelf: Path) -> None:
     chosen = service.move_maybes(result.plan, result.plan.maybes)
     assert (shelf / "Recipes" / "Breads" / "loaf.txt").exists()
     assert [item.dst.name for item in chosen.moved] == ["loaf.txt"]
+
+
+# --- updates -------------------------------------------------------------------------------
+
+
+def _github(version: str):
+    from fakes import github_release
+
+    asked: list[str] = []
+
+    def fetch(url: str) -> bytes:
+        asked.append(url)
+        return json.dumps(github_release(version)).encode()
+
+    fetch.asked = asked
+    return fetch
+
+
+def test_update_check_is_recorded_and_due_again_after_a_day(service: AppService) -> None:
+    now = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+    assert service.update_due(now=now)
+    service.fetch = _github("9.9.9")
+
+    found = service.check_for_update(now=now)
+
+    assert found is not None and found.version == "9.9.9"
+    assert service.settings().update_checked == now.isoformat(timespec="seconds")
+    assert not service.update_due(now=now + timedelta(hours=23))
+    assert service.update_due(now=now + timedelta(hours=25))
+    service.save_settings(replace(service.settings(), check_updates=False))
+    assert not service.update_due(now=now + timedelta(hours=25))
+    service.fetch = _github("0.0.1")
+    assert service.check_for_update(now=now) is None  # older than this AutoShelf
+
+
+def test_each_new_version_is_announced_once(service: AppService) -> None:
+    service.fetch = _github("9.9.9")
+    release = service.check_for_update()
+    assert release is not None
+
+    assert service.announce_update(release)
+    assert not service.announce_update(release)
+    service.fetch = _github("10.0.0")
+    newer = service.check_for_update()
+    assert service.announce_update(newer)
+    assert service.settings().update_notified == "10.0.0"
+
+
+def test_updates_download_into_the_cache(service: AppService, monkeypatch) -> None:
+    from autoshelf import updates
+
+    service.fetch = _github("9.9.9")
+    release = service.check_for_update()
+    seen = []
+
+    def download(found, folder, *, progress=None, cancelled=lambda: False):
+        seen.append((found, folder))
+        return folder / found.installer_name
+
+    monkeypatch.setattr(updates, "download", download)
+    path = service.download_update(release)
+
+    assert seen == [(release, service.paths.cache_dir / "updates")]
+    assert path == service.paths.cache_dir / "updates" / "AutoShelf-9.9.9-setup.exe"
+    assert service.update_mode() == updates.SOURCE  # the tests run from source
+
+
+def test_old_update_downloads_are_cleared(service: AppService) -> None:
+    folder = service.paths.cache_dir / "updates"
+    folder.mkdir(parents=True)
+    (folder / "AutoShelf-0.2.0-setup.exe").write_bytes(b"installed already")
+    (folder / "keep.txt").write_text("not AutoShelf's", encoding="utf-8")
+
+    service.clear_update_downloads()
+
+    assert [item.name for item in folder.iterdir()] == ["keep.txt"]

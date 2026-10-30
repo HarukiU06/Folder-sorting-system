@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from autoshelf.actions import folders
 from autoshelf.actions.create import ACTION_CREATE, record_settled
 from autoshelf.actions.mover import status_after_move
 from autoshelf.db import repository
@@ -41,7 +42,10 @@ def reconcile_pending(conn: sqlite3.Connection) -> list[Reconciled]:
             continue
         state, note = _settle(entry)
         repository.set_history_state(conn, entry.id, state, note=note)
-        if state == "done" and entry.file_id is not None:
+        if state == "done" and entry.details.get("folder"):
+            # The folder was moved, but its records may not have followed yet.
+            folders.follow(conn, Path(entry.root), Path(entry.src), Path(entry.dst))
+        elif state == "done" and entry.file_id is not None:
             dst, root = Path(entry.dst), Path(entry.root)
             repository.set_file_location(
                 conn, entry.file_id, dst, status_after_move(dst, root, entry.action)

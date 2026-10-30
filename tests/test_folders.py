@@ -132,3 +132,148 @@ def test_rename_then_refresh_records_no_corrections(conn, shelf: Path) -> None:
     assert stats.relocations == ()
     assert repository.list_corrections(conn) == []
     assert "Finance/Ünïcode notes" in index.folders
+
+
+# --- undo and crash recovery --------------------------------------------------------------
+
+
+def test_undo_folder_rename_restores_keys(conn, shelf: Path) -> None:
+    from autoshelf.actions.undo import undo
+
+    repository.set_folder_description(conn, "My Folder", "lectures")
+    folders.rename_folder(conn, shelf, "My Folder", "Lectures")
+    entry = repository.list_history(conn, 1)[0]
+
+    result = undo(conn, entry.id)
+
+    assert result.dst == shelf / "My Folder"
+    assert (shelf / "My Folder" / "lecture notes 1.txt").exists()
+    assert repository.folder_descriptions(conn) == {"my folder": "lectures"}
+    assert repository.get_history(conn, entry.id).state == "undone"
+    back = repository.get_history(conn, result.history_id)
+    assert (back.action, back.undo_of, back.details["folder"]) == ("undo", entry.id, True)
+
+
+def test_undo_trashed_folder_restores_status_sorted(conn, shelf: Path) -> None:
+    from autoshelf.actions.undo import undo_batch
+
+    note = shelf / "My Folder" / "lecture notes 1.txt"
+    repository.upsert_file(conn, note, sha256=None, size=1, mtime=1.0)
+    changes = folders.trash(conn, shelf, [shelf / "Finance" / "invoice march.txt"], ["My Folder"])
+
+    undo_batch(conn, changes.batch_id)
+
+    assert note.exists() and (shelf / "Finance" / "invoice march.txt").exists()
+    assert repository.get_file_by_path(conn, note).status == "sorted"
+    assert list((shelf / "_Trash").iterdir()) == []
+
+
+def test_undo_folder_refused_when_old_parent_gone(conn, shelf: Path) -> None:
+    from autoshelf.actions.undo import UndoError, undo
+
+    folders.move_folder(conn, shelf, "My Folder/Ünïcode notes", "Finance")
+    moved = repository.list_history(conn, 1)[0]
+    folders.trash(conn, shelf, [], ["My Folder"])
+
+    with pytest.raises(UndoError, match="recreate"):
+        undo(conn, moved.id)
+
+    assert repository.get_history(conn, moved.id).state == "done"
+    assert (shelf / "Finance" / "Ünïcode notes").is_dir()
+
+
+def test_undo_trashed_file(conn, shelf: Path) -> None:
+    from autoshelf.actions.undo import undo
+
+    invoice = shelf / "Finance" / "invoice march.txt"
+    changes = folders.trash(conn, shelf, [invoice], [])
+
+    undo(conn, changes.history_ids[0])
+
+    assert invoice.exists()
+    assert repository.get_file_by_path(conn, invoice).status == "sorted"
+
+
+def test_reconcile_pending_folder_rows(conn, shelf: Path) -> None:
+    from autoshelf.actions.history import reconcile_pending
+
+    note = shelf / "My Folder" / "lecture notes 1.txt"
+    repository.upsert_file(conn, note, sha256=None, size=1, mtime=1.0)
+    repository.set_folder_description(conn, "My Folder", "lectures")
+    renamed = repository.insert_history(
+        conn,
+        action="folder",
+        src=shelf / "My Folder",
+        dst=shelf / "Lectures",
+        reason="user",
+        root=shelf,
+        details={"kind": "rename", "folder": True},
+    )
+    (shelf / "My Folder").rename(shelf / "Lectures")  # AutoShelf stopped right after this
+    never = repository.insert_history(
+        conn,
+        action="folder",
+        src=shelf / "Finance",
+        dst=shelf / "Money",
+        reason="user",
+        root=shelf,
+        details={"kind": "rename", "folder": True},
+    )
+
+    reconcile_pending(conn)
+
+    assert repository.get_history(conn, renamed).state == "done"
+    assert repository.get_file_by_path(conn, shelf / "Lectures" / note.name) is not None
+    assert repository.folder_descriptions(conn) == {"lectures": "lectures"}
+    assert repository.get_history(conn, never).state == "failed"
+
+
+def test_history_wording_for_folder_changes() -> None:
+    from autoshelf import wording
+
+    def row(**changes) -> repository.HistoryEntry:
+        fields = dict(
+            id=7,
+            ts="t",
+            file_id=None,
+            action="folder",
+            src=None,
+            dst=None,
+            reason="user",
+            confidence=None,
+            details={},
+            batch_id=None,
+            state="done",
+            root=None,
+            sha256=None,
+            undo_of=None,
+        )
+        return repository.HistoryEntry(**{**fields, **changes})
+
+    renamed = row(src="C:/S/A", dst="C:/S/B", details={"kind": "rename", "folder": True})
+    assert wording.history_sentence(renamed, "(root)", "(root)") == "Renamed folder A to B"
+    moved = row(src="C:/S/A", dst="C:/S/Work/A", details={"kind": "move", "folder": True})
+    assert wording.history_sentence(moved, "(root)", "Work") == "Moved folder A to Work"
+    binned = row(
+        src="C:/S/A",
+        dst="C:/S/_Trash/A (2)",
+        reason="trash",
+        details={"kind": "trash", "folder": True},
+    )
+    assert wording.history_sentence(binned, "(root)", "_Trash") == "Moved folder A to the Trash"
+    assert wording.history_how(binned) == "you deleted it"
+    file_binned = row(action="move", src="C:/S/F/a.pdf", dst="C:/S/_Trash/a.pdf", reason="trash")
+    assert wording.history_sentence(file_binned, "F", "_Trash") == "Moved a.pdf to the Trash"
+    back = row(
+        action="undo",
+        src="C:/S/_Trash/A",
+        dst="C:/S/A",
+        undo_of=3,
+        reason="undo",
+        details={"kind": "trash", "folder": True},
+    )
+    assert wording.history_sentence(back, "_Trash", "(root)") == (
+        "Put folder A back in your AutoShelf folder"
+    )
+    resorted = row(action="move", src="C:/S/F/n.txt", dst="C:/S/F/Notes/n.txt", reason="resort")
+    assert wording.history_how(resorted) == "sorted again when a new folder appeared"

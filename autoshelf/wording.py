@@ -57,6 +57,13 @@ def reason_text(reason: Mapping | None) -> str:
         return f"renamed from {reason['old_name']!r}"
     if code == reasons.CREATED:
         return created(reason)
+    if code == reasons.RESORTED:
+        trigger = reason.get("trigger") or reason["folder"]
+        if reason.get("match") == "name":
+            return f"its name matches the new folder {trigger!r}"
+        if reason.get("match") == "rule":
+            return f"your rule sends it to {reason['folder']!r}"
+        return f"you chose {reason['folder']!r} after {trigger!r} appeared"
     return str(code or "")
 
 
@@ -340,6 +347,8 @@ _REASON_LABELS = {
     "organize": "Organized (you approved)",
     "rename": "Renamed (you approved)",
     "renamed (you approved)": "Renamed (you approved)",  # rows written before codes
+    "trash": "Moved to the Trash",
+    "resort": "Sorted again (a new folder)",
 }
 
 
@@ -374,8 +383,12 @@ def place(folder: str) -> str:
 def history_sentence(entry: HistoryEntry, src_folder: str, dst_folder: str) -> str:
     """What a history row did, in a sentence: "Moved bread.txt to Recipes"."""
     name = Path(entry.dst or entry.src or "?").name
+    if entry.details.get("folder"):
+        return _folder_sentence(entry, name, dst_folder)
     if entry.action == "undo":
         return f"Put {name} back in {place(dst_folder)}"
+    if entry.reason == "trash":
+        return f"Moved {name} to the Trash"
     if entry.action == "create":
         return f"Made {created(entry.details.get('reason') or {})}"
     if entry.action == "rename" or entry.reason in ("rename", "renamed (you approved)"):
@@ -388,6 +401,18 @@ def history_sentence(entry: HistoryEntry, src_folder: str, dst_folder: str) -> s
     if dst_folder == "_Inbox":
         return f"Put {name} in the Inbox"
     return f"Moved {name} to {place(dst_folder)}"
+
+
+def _folder_sentence(entry: HistoryEntry, name: str, dst_folder: str) -> str:
+    old = Path(entry.src or "?").name
+    if entry.action == "undo":
+        return f"Put folder {name} back in {place(dst_folder)}"
+    kind = entry.details.get("kind")
+    if kind == "rename":
+        return f"Renamed folder {old} to {name}"
+    if kind == "trash":
+        return f"Moved folder {old} to the Trash"
+    return f"Moved folder {old} to {place(dst_folder)}"
 
 
 def history_how(entry: HistoryEntry) -> str:
@@ -413,6 +438,8 @@ _HOW = {
     "duplicate": "you kept another copy",
     "tag": "you tagged it",
     "untag": "you removed the tag",
+    "trash": "you deleted it",
+    "resort": "sorted again when a new folder appeared",
 }
 
 

@@ -28,6 +28,7 @@ from autoshelf.layout import Zone, zone_of
 
 log = logging.getLogger(__name__)
 
+ACTION_FOLDER = "folder"
 REASON_USER = "user"
 REASON_TRASH = "trash"
 KIND_RENAME = "rename"
@@ -270,14 +271,9 @@ def folder_change(
     case_only = str(src).casefold() == str(dst).casefold()
     if os.path.lexists(dst) and not case_only:
         raise FolderError(f"{dst} already exists")
-    old_key, new_key = _key_or_none(root, src), _key_or_none(root, dst)
-    status = None
-    if old_key is None or new_key is None:  # into or out of _Trash: only the paths change
-        status = "sorted" if new_key is not None else "ignored"
-        old_key = new_key = None
     history_id = repository.insert_history(
         conn,
-        action="undo" if undo_of is not None else "folder",
+        action="undo" if undo_of is not None else ACTION_FOLDER,
         src=src,
         dst=dst,
         reason="undo"
@@ -295,10 +291,24 @@ def folder_change(
     except OSError as exc:
         repository.set_history_state(conn, history_id, "failed", note=str(exc))
         raise FolderError(f"Couldn't move {src.name}: {exc}") from exc
-    repository.follow_folder(conn, src, dst, old_key=old_key, new_key=new_key, status=status)
+    follow(conn, root, src, dst)
     repository.set_history_state(conn, history_id, "done")
     log.debug("History #%d: folder %s %s -> %s", history_id, kind, src, dst)
     return history_id
+
+
+def follow(conn: sqlite3.Connection, root: Path, src: Path, dst: Path) -> int:
+    """Make the records follow a folder moved from ``src`` to ``dst`` (both in the root).
+
+    Between two of the user's folders everything that names it follows; into or out of
+    _Trash only the paths and statuses change. Safe to repeat."""
+    old_key, new_key = _key_or_none(root, src), _key_or_none(root, dst)
+    if old_key is not None and new_key is not None:
+        return repository.follow_folder(
+            conn, src, dst, old_key=old_key, new_key=new_key, status=None
+        )
+    status = "sorted" if new_key is not None else "ignored"
+    return repository.follow_folder(conn, src, dst, old_key=None, new_key=None, status=status)
 
 
 def _key_or_none(root: Path, folder: Path) -> str | None:

@@ -39,7 +39,7 @@ class MoveResult:
     """A completed move."""
 
     history_id: int
-    file_id: int
+    file_id: int | None  # None for a folder put back by an undo
     src: Path
     dst: Path
 

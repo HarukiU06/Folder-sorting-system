@@ -262,7 +262,8 @@ def test_folder_changes_through_the_service(service: AppService, shelf: Path) ->
 
     moved = service.move_items([invoice], [], "Finance/Taxes")
     assert [change.dst for change in moved.done] == [shelf / "Finance" / "Taxes" / invoice.name]
-    assert service.rename_folder("Finance/Taxes", "Tax") == "Finance/Tax"
+    renamed = service.rename_folder("Finance/Taxes", "Tax")
+    assert renamed.dst == shelf / "Finance" / "Tax"
     service.move_items([], ["Finance/Tax"], "Recipes")
     assert (shelf / "Recipes" / "Tax" / invoice.name).exists()
 

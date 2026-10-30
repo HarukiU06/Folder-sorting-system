@@ -147,6 +147,19 @@ def rename_folder(
     before_rename: BeforeRename | None = None,
 ) -> str:
     """Rename a folder; returns its new key. A name already taken there is refused."""
+    change = rename_folder_change(conn, root, key, name, before_rename=before_rename)
+    return key if change is None else folder_key(root, change.dst)
+
+
+def rename_folder_change(
+    conn: sqlite3.Connection,
+    root: Path,
+    key: str,
+    name: str,
+    *,
+    before_rename: BeforeRename | None = None,
+) -> Change | None:
+    """``rename_folder``, returning the change (None if the name didn't change)."""
     source = _existing_folder(root, key)
     try:
         cleaned = valid_folder_name(name)
@@ -155,11 +168,11 @@ def rename_folder(
     target = source.parent / cleaned
     case_only = target.name != source.name and target.name.casefold() == source.name.casefold()
     if target.name == source.name:
-        return key
+        return None
     if os.path.lexists(target) and not case_only:
         raise FolderError(f"There is already a {cleaned!r} in {_place(root, source.parent)}")
-    folder_change(conn, root, source, target, KIND_RENAME, before_rename=before_rename)
-    return folder_key(root, target)
+    history_id = folder_change(conn, root, source, target, KIND_RENAME, before_rename=before_rename)
+    return Change(history_id, source, target, "folder")
 
 
 def move_folder(

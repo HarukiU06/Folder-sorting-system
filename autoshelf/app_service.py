@@ -560,11 +560,12 @@ class AppService:
             raise folder_actions.FolderError("; ".join(reason for _, reason in failed))
         return folder_actions.Changes(batch, done, failed)
 
-    def rename_folder(self, key: str, name: str) -> str:
-        """Rename a folder; returns its new key (its description and rules follow it)."""
+    def rename_folder(self, key: str, name: str) -> folder_actions.Change | None:
+        """Rename a folder (its description and rules follow it); None if the name is the
+        same."""
         root = self._require_root()
         with self._connect() as conn:
-            return folder_actions.rename_folder(
+            return folder_actions.rename_folder_change(
                 conn, root, key, name, before_rename=self._before_rename()
             )
 

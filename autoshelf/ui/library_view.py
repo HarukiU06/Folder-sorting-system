@@ -8,19 +8,26 @@ by exact words lists the matching folders and files instead.
 
 It browses what one scan found (names, sizes and dates: no file is read, and nothing is
 downloaded from iCloud), so it shows your folders and the files in them, not the files
-still waiting to be sorted, nor hidden or ignored ones. Unlike Explorer it never moves,
-deletes or makes folders.
+still waiting to be sorted, nor hidden or ignored ones.
+
+Things can be changed as in Explorer: drag files and folders onto a folder (or Move to...,
+or Ctrl+X and Ctrl+V), make a folder, rename, and delete, which moves things into ``_Trash``
+in your AutoShelf folder (nothing is ever deleted). Every change can be undone. A new folder
+makes AutoShelf sort the loose files of the folder it is in again: files whose names match
+move into it, and the ones that might belong are offered for review.
 """
 
 import html
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QMimeData, QModelIndex, QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QDrag, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -55,7 +62,9 @@ from qfluentwidgets import (
 from autoshelf import wording
 from autoshelf.app_service import AppService, FileInfo, FolderInfo, Shelf
 from autoshelf.features import convert
+from autoshelf.features.resort import Candidate, ResortPlan, ResortResult
 from autoshelf.ml.library import LibraryFile, folder_label
+from autoshelf.ui.folder_dialogs import FolderPicker, ReviewDialog
 from autoshelf.ui.tasks import TaskRunner
 from autoshelf.ui.widgets import (
     menu_at,
@@ -86,6 +95,7 @@ HINT = (
 )
 DESCRIBE_HINT = "What belongs in this folder? A few words help AutoShelf sort new files."
 ONLINE_ONLY = "Online only: it is in iCloud, and opening it downloads it"
+MIME = "application/x-autoshelf-items"  # dragged rows: a JSON list of [kind, value]
 TREE_WIDTH = 220
 DETAIL_WIDTH = 270
 SEARCH_WIDTH = 280
@@ -175,11 +185,96 @@ class _Item(QTableWidgetItem):
         return mine < theirs
 
 
+def _items(mime: QMimeData) -> list[tuple[str, str]]:
+    """The rows a drag carries."""
+    if not mime.hasFormat(MIME):
+        return []
+    try:
+        return [(str(kind), str(value)) for kind, value in json.loads(bytes(mime.data(MIME)))]
+    except (ValueError, TypeError):
+        return []
+
+
+class _ItemsTable(TableWidget):
+    """The middle list: its rows can be dragged onto folders, here or in the tree."""
+
+    def __init__(self, view: "LibraryView") -> None:
+        super().__init__()
+        self._view = view
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+
+    def startDrag(self, actions) -> None:
+        items = self._view.selected_items()
+        if items:
+            drag = QDrag(self)
+            drag.setMimeData(self._view.mime_for(items))
+            drag.exec(Qt.DropAction.MoveAction)  # the rows themselves stay until a rescan
+
+    def _target(self, event) -> str | None:
+        cell = self.itemAt(event.position().toPoint())
+        if cell is None or cell.data(KIND_ROLE) != FOLDER:
+            return None
+        return cell.data(PATH_ROLE)
+
+    def dragEnterEvent(self, event) -> None:
+        event.acceptProposedAction() if event.mimeData().hasFormat(MIME) else event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        key = self._target(event)
+        if key is not None and self._view.can_drop(event.mimeData(), key):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        key = self._target(event)
+        if key is not None:
+            self._view.drop_mime(event.mimeData(), key)
+        event.setDropAction(Qt.DropAction.IgnoreAction)  # nothing to remove from the list
+        event.accept()
+
+
+class _FolderTree(TreeWidget):
+    """The folder tree: rows from the list can be dropped on its folders."""
+
+    def __init__(self, view: "LibraryView") -> None:
+        super().__init__()
+        self._view = view
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+
+    def _target(self, event) -> str | None:
+        item = self.itemAt(event.position().toPoint())
+        if item is None or item.data(0, KIND_ROLE) != FOLDER:
+            return None
+        return item.data(0, PATH_ROLE)
+
+    def dragEnterEvent(self, event) -> None:
+        event.acceptProposedAction() if event.mimeData().hasFormat(MIME) else event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        key = self._target(event)
+        if key is not None and self._view.can_drop(event.mimeData(), key):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        key = self._target(event)
+        if key is not None:
+            self._view.drop_mime(event.mimeData(), key)
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
+
+
 class LibraryView(QWidget):
     """Your folders like File Explorer shows them, with search, tags and file details."""
 
     changed = Signal(str)  # a message after tags changed or a file was made or renamed
     saved = Signal(str)  # a message after a folder's description was saved
+    edited = Signal(str)  # a message after files or folders were moved, made or deleted
 
     def __init__(self, service: AppService, runner: TaskRunner, parent=None) -> None:
         super().__init__(parent)
@@ -205,13 +300,18 @@ class LibraryView(QWidget):
         self._folder_key: str | None = None
         self._search_number = 0
         self._syncing = False
+        self._clipboard: list[tuple[str, str]] = []  # cut, waiting to be pasted
+        self._undo_ids: list[int] = []  # the last change, for its Undo button
+        self.pending_review: ResortPlan | None = None  # files that might belong somewhere
 
         bar = self._build_bar()
-        self.tree = TreeWidget()
+        self.tree = _FolderTree(self)
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
         self.tree.setMinimumWidth(160)
         self.tree.currentItemChanged.connect(self._tree_changed)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
         self.results = self._build_results()
         self.detail = self._build_detail()
 
@@ -225,13 +325,25 @@ class LibraryView(QWidget):
 
         self.summary = plain(CaptionLabel())  # the status line, as at the foot of Explorer
         self.summary.setWordWrap(True)
+        self.undo_button = PushButton(FluentIcon.RETURN, "Undo")
+        self.undo_button.setToolTip("Undo the last change (it is also in History)")
+        self.undo_button.clicked.connect(self.undo_last_change)
+        self.undo_button.setVisible(False)
+        self.review_button = PushButton(FluentIcon.VIEW, "Review")
+        self.review_button.setToolTip("Files that might belong in the new folder")
+        self.review_button.clicked.connect(self.review)
+        self.review_button.setVisible(False)
+        status = QHBoxLayout()
+        status.addWidget(self.summary, 1)
+        status.addWidget(self.review_button)
+        status.addWidget(self.undo_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 18, 24, 12)
         layout.setSpacing(10)
         layout.addLayout(bar)
         layout.addWidget(self.splitter, 1)
-        layout.addWidget(self.summary)
+        layout.addLayout(status)
         self._add_shortcuts()
         self._show_detail(None)
         self._update_bar()
@@ -251,6 +363,9 @@ class LibraryView(QWidget):
         self.refresh_button = TransparentToolButton(FluentIcon.SYNC)
         self.refresh_button.setToolTip("Refresh (F5)")
         self.refresh_button.clicked.connect(self.refresh)
+        self.new_folder_button = TransparentToolButton(FluentIcon.FOLDER_ADD)
+        self.new_folder_button.setToolTip("New folder (Ctrl+Shift+N)")
+        self.new_folder_button.clicked.connect(self.new_folder)
 
         self.path_bar = BreadcrumbBar()
         self.path_bar.currentItemChanged.connect(self._crumb_clicked)
@@ -278,19 +393,20 @@ class LibraryView(QWidget):
             bar.addWidget(button)
         bar.addWidget(address, 1)
         bar.addWidget(self.refresh_button)
+        bar.addWidget(self.new_folder_button)
         bar.addSpacing(8)
         bar.addWidget(self.query)
         bar.addWidget(self.details_button)
         return bar
 
     def _build_results(self) -> TableWidget:
-        table = TableWidget()
+        table = _ItemsTable(self)
         table.setColumnCount(len(COLUMNS))
         table.setHorizontalHeaderLabels(COLUMNS)
         table.verticalHeader().setVisible(False)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setWordWrap(False)
         table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         table.setMinimumWidth(320)
@@ -341,10 +457,22 @@ class LibraryView(QWidget):
         self.study_button.setToolTip("A reading list and flashcards for this folder (AI)")
         self.study_button.clicked.connect(self.study_folder)
         self.study_button.setVisible(False)
+        self.resort_button = PushButton(FluentIcon.SYNC, "Sort into subfolders")
+        self.resort_button.setToolTip(
+            "Move the files lying in this folder into its subfolders: files whose names match "
+            "move; others that might belong are offered"
+        )
+        self.resort_button.clicked.connect(
+            lambda: self._folder_key is not None and self.resort_folder(self._folder_key)
+        )
+        self.resort_button.setVisible(False)
         buttons = QHBoxLayout()
         buttons.addWidget(open_button)
         buttons.addWidget(self.study_button)
         buttons.addStretch(1)
+        layout_more = QHBoxLayout()
+        layout_more.addWidget(self.resort_button)
+        layout_more.addStretch(1)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.addWidget(self.folder_name)
@@ -355,6 +483,7 @@ class LibraryView(QWidget):
         layout.addWidget(self.describe_note)
         layout.addSpacing(6)
         layout.addLayout(buttons)
+        layout.addLayout(layout_more)
         layout.addStretch(1)
         box.setVisible(False)
         return box
@@ -382,6 +511,13 @@ class LibraryView(QWidget):
         self.show_action.triggered.connect(self._show_in_explorer)
         self.rename_action = Action(FluentIcon.EDIT, "Rename…", self)
         self.rename_action.triggered.connect(self.rename_file)
+        self.move_action = Action(FluentIcon.MOVE, "Move to…", self)
+        self.move_action.triggered.connect(self.move_selected)
+        self.cut_action = Action(FluentIcon.CUT, "Cut", self)
+        self.cut_action.triggered.connect(self.cut)
+        self.delete_action = Action(FluentIcon.DELETE, "Delete", self)
+        self.delete_action.setToolTip("Move it to the Trash (in your AutoShelf folder)")
+        self.delete_action.triggered.connect(self.delete_selected)
         self.compress_action = Action(FluentIcon.ZIP_FOLDER, "Make a smaller copy", self)
         self.compress_action.setToolTip(
             "A smaller copy (a PDF or an image) or a ZIP next to the file; "
@@ -445,10 +581,33 @@ class LibraryView(QWidget):
         enter = QShortcut(QKeySequence("Return"), self.results)
         enter.setContext(Qt.ShortcutContext.WidgetShortcut)
         enter.activated.connect(self.open_selected)
+        new_folder = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        new_folder.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        new_folder.activated.connect(self.new_folder)
+        # Only in the list and the tree, so Delete in the search box deletes nothing.
+        for keys, slot in (
+            ("Delete", self.delete_selected),
+            ("F2", self.rename_selected),
+            ("Ctrl+X", self.cut),
+            ("Ctrl+V", self.paste),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self.results)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(slot)
+        for keys, slot in (
+            ("Delete", lambda: self._on_tree_folder(self._delete_items)),
+            ("F2", lambda: self._on_tree_folder(lambda items: self.rename_folder(items[0][1]))),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self.tree)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(slot)
 
     def menu_actions(self) -> list[Action | None]:
         """What the ⋯ menu (and a right-click) offers for the selected file."""
+        if len(self.selected_items()) > 1:
+            return [self.move_action, self.cut_action, self.delete_action]
         actions: list[Action | None] = [self.open_action, self.show_action, self.rename_action]
+        actions += [self.move_action, self.cut_action, self.delete_action]
         actions += [None, self.compress_action, *self.convert_actions]
         if self.ai_enabled:
             actions += [None, self.summarize_action]
@@ -610,6 +769,8 @@ class LibraryView(QWidget):
         self._set_location(location)
 
     def _set_location(self, location: Location) -> None:
+        if location != self.location:
+            self.undo_button.setVisible(False)
         self.location = location
         if location[0] == FOLDER:
             self._last_folder = location
@@ -713,8 +874,8 @@ class LibraryView(QWidget):
             text = "This folder is empty."
         else:
             text = (
-                "No folders yet. Make folders in your AutoShelf folder (in Explorer or on your "
-                "iPhone), and AutoShelf sorts new files into them."
+                "No folders yet. Make one here (New folder), in Explorer or on your iPhone, and "
+                "AutoShelf sorts new files into them."
             )
         self.summary.setText(self._note or text)
 
@@ -817,7 +978,7 @@ class LibraryView(QWidget):
         rows: list[Row],
         *,
         by_name: bool = False,
-        select: Path | None = None,
+        select: Path | tuple[str, str] | None = None,
         select_first_file: bool = False,
     ) -> None:
         """Show ``rows``: folders first, sorted by name (``by_name``), or in the order given
@@ -839,7 +1000,9 @@ class LibraryView(QWidget):
         table.blockSignals(False)
 
         wanted: tuple[str, str] | None = kept
-        if select is not None:
+        if isinstance(select, tuple):
+            wanted = select
+        elif select is not None:
             wanted = (FILE, str(select))
         elif select_first_file:
             wanted = next(((FILE, row.value) for row in rows if row.kind == FILE), None)
@@ -887,12 +1050,19 @@ class LibraryView(QWidget):
         return [self.results.item(row, NAME).text() for row in range(self.results.rowCount())]
 
     def selected_item(self) -> tuple[str, str] | None:
-        """(FOLDER, key) or (FILE, path) of the selected row."""
-        rows = self.results.selectionModel().selectedRows()
-        if not rows:
-            return None
-        cell = self.results.item(rows[0].row(), NAME)
-        return (cell.data(KIND_ROLE), cell.data(PATH_ROLE)) if cell else None
+        """(FOLDER, key) or (FILE, path) of the selected row (the first, if several)."""
+        items = self.selected_items()
+        return items[0] if items else None
+
+    def selected_items(self) -> list[tuple[str, str]]:
+        """(FOLDER, key) or (FILE, path) of every selected row, top to bottom."""
+        rows = sorted({index.row() for index in self.results.selectionModel().selectedRows()})
+        items = []
+        for row in rows:
+            cell = self.results.item(row, NAME)
+            if cell is not None:
+                items.append((cell.data(KIND_ROLE), cell.data(PATH_ROLE)))
+        return items
 
     def select(self, kind: str, value: str) -> bool:
         """Select the row of a folder (by key) or a file (by path)."""
@@ -923,15 +1093,13 @@ class LibraryView(QWidget):
     def _context_menu(self, pos: QPoint) -> None:
         cell = self.results.itemAt(pos)
         if cell is None:
+            self.results.clearSelection()
+            menu_at(self.results.viewport(), pos, self._background_actions())
             return
-        self.results.selectRow(cell.row())
-        if cell.data(KIND_ROLE) == FOLDER:
-            key = cell.data(PATH_ROLE)
-            open_here = Action(FluentIcon.FOLDER, "Open", self)
-            open_here.triggered.connect(lambda: self.go_to(key))
-            explorer = Action(FluentIcon.LINK, "Open in Explorer", self)
-            explorer.triggered.connect(lambda: self._open_in_explorer(key))
-            actions: list[Action | None] = [open_here, explorer]
+        if not self.results.item(cell.row(), NAME).isSelected():
+            self.results.selectRow(cell.row())
+        if len(self.selected_items()) == 1 and cell.data(KIND_ROLE) == FOLDER:
+            actions = self._folder_actions(cell.data(PATH_ROLE))
         else:
             actions = self.menu_actions()
         menu_at(self.results.viewport(), pos, actions)
@@ -947,6 +1115,9 @@ class LibraryView(QWidget):
         return Path(selected[1]) if selected and selected[0] == FILE else None
 
     def _selection_changed(self) -> None:
+        if len(self.selected_items()) > 1:
+            self._show_many(len(self.selected_items()))
+            return
         selected = self.selected_item()
         if selected is not None and selected[0] == FOLDER:
             self._show_folder_details(selected[1])
@@ -998,6 +1169,7 @@ class LibraryView(QWidget):
             widget.setVisible(has_description)
         self.description.setText(self._folder.description if self._folder else "")
         self.study_button.setVisible(self.ai_enabled and has_description)
+        self.resort_button.setVisible(bool(key) and self._has_subfolders(key))
 
     def _describe(self) -> None:
         folder = self._folder
@@ -1212,3 +1384,394 @@ class LibraryView(QWidget):
     def _open_related(self, item: QListWidgetItem) -> None:
         name = self._info.path.name if self._info else ""
         self.show_file(Path(item.data(PATH_ROLE)), f"Related to {name}" if name else "")
+
+    # --- changing things (as in Explorer; every change can be undone) -----------------------
+
+    def _show_many(self, count: int) -> None:
+        self._show_detail(None)
+        self.name.setText(f"{count} items selected")
+
+    def _has_subfolders(self, key: str) -> bool:
+        return any(_parent(other) == key for other in self._folders if other != key)
+
+    def _folder_actions(self, key: str) -> list[Action | None]:
+        """What a right-click on a folder offers."""
+        items = [(FOLDER, key)]
+
+        def action(icon, text: str, slot) -> Action:
+            item = Action(icon, text, self)
+            item.triggered.connect(slot)
+            return item
+
+        actions: list[Action | None] = [
+            action(FluentIcon.FOLDER, "Open", lambda: self.go_to(key)),
+            action(FluentIcon.LINK, "Open in Explorer", lambda: self._open_in_explorer(key)),
+            action(FluentIcon.EDIT, "Rename…", lambda: self.rename_folder(key)),
+            action(FluentIcon.MOVE, "Move to…", lambda: self._ask_target(items)),
+            action(FluentIcon.CUT, "Cut", lambda: self._cut(items)),
+            action(FluentIcon.DELETE, "Delete", lambda: self._delete_items(items)),
+        ]
+        if self._clipboard:
+            actions.append(action(FluentIcon.PASTE, "Paste into it", lambda: self.paste(key)))
+        if self._has_subfolders(key):
+            actions += [
+                None,
+                action(FluentIcon.SYNC, "Sort into subfolders", lambda: self.resort_folder(key)),
+            ]
+        return actions
+
+    def _background_actions(self) -> list[Action | None]:
+        """What a right-click on the list's empty space offers (inside a folder)."""
+        if self.location[0] != FOLDER:
+            return []
+        new = Action(FluentIcon.FOLDER_ADD, "New folder", self)
+        new.triggered.connect(self.new_folder)
+        actions: list[Action | None] = [new]
+        if self._clipboard:
+            paste = Action(FluentIcon.PASTE, "Paste", self)
+            paste.triggered.connect(lambda: self.paste())
+            actions.append(paste)
+        return actions
+
+    def _tree_menu(self, pos: QPoint) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None or item.data(0, KIND_ROLE) != FOLDER:
+            return
+        key = item.data(0, PATH_ROLE)
+        if key:
+            actions = self._folder_actions(key)
+        else:
+            self.go_to("")
+            actions = self._background_actions()
+        menu_at(self.tree.viewport(), pos, actions)
+
+    def _on_tree_folder(self, act) -> None:
+        item = self.tree.currentItem()
+        if item is not None and item.data(0, KIND_ROLE) == FOLDER and item.data(0, PATH_ROLE):
+            act([(FOLDER, item.data(0, PATH_ROLE))])
+
+    def mime_for(self, items: list[tuple[str, str]]) -> QMimeData:
+        """What dragging these rows carries."""
+        mime = QMimeData()
+        mime.setData(MIME, json.dumps([list(item) for item in items]).encode())
+        return mime
+
+    def can_drop(self, mime: QMimeData, key: str) -> bool:
+        """True if the dragged rows may go into the folder ``key``: files never go into the
+        root itself (they would be sorted again), and a folder never into itself."""
+        items = _items(mime)
+        if not items:
+            return False
+        for kind, value in items:
+            if kind == FILE and (not key or self._key_of(Path(value)) == key):
+                return False
+            if kind == FOLDER and (
+                key == value or key.startswith(value + "/") or key == _parent(value)
+            ):
+                return False
+        return True
+
+    def drop_mime(self, mime: QMimeData, key: str) -> None:
+        """Move the dragged rows into the folder ``key``."""
+        if self.can_drop(mime, key):
+            self._move_items(_items(mime), key)
+
+    def new_folder(self) -> None:
+        """Make a folder inside the open folder (AutoShelf then sorts into it what belongs)."""
+        kind, parent = self.location
+        if kind != FOLDER:
+            self.summary.setText("Open a folder to make a new folder in it.")
+            return
+        name, ok = QInputDialog.getText(
+            self,
+            "New folder",
+            f"Name of the new folder in {self._place(parent)}:",
+            text="New folder",
+        )
+        if not ok or not name.strip():
+            return
+
+        def made(key: str) -> None:
+            self._select_after_load = (FOLDER, key)
+            self.undo_button.setVisible(False)
+            self._note = (
+                f"Made {_leaf(key)}. Files in {self._place(parent)} whose names match it move "
+                "into it in a moment."
+            )
+            self.edited.emit(f"Made the folder {_leaf(key)}")
+            self.refresh()
+
+        self.runner.run(
+            lambda: self.service.make_folder(parent, name.strip()),
+            made,
+            self._failed_change("Couldn't make the folder"),
+        )
+
+    def rename_selected(self) -> None:
+        """Rename the selected file or folder (F2)."""
+        items = self.selected_items()
+        if len(items) != 1:
+            return
+        kind, value = items[0]
+        if kind == FOLDER:
+            self.rename_folder(value)
+        else:
+            self.rename_file()
+
+    def rename_folder(self, key: str) -> None:
+        """Ask for a new name for a folder; its description and rules follow it."""
+        name, ok = QInputDialog.getText(
+            self, "Rename folder", f"New name for {_leaf(key)}:", text=_leaf(key)
+        )
+        if not ok or not name.strip() or name.strip() == _leaf(key):
+            return
+
+        def renamed(change) -> None:
+            if change is None or self._shelf is None:
+                return
+            new_key = "/".join(change.dst.relative_to(self._shelf.root).parts)
+            kind, value = self.location
+            if kind == FOLDER and (value == key or value.startswith(key + "/")):
+                self.location = (FOLDER, new_key + value[len(key) :])
+            self._after_change(
+                [change.history_id],
+                f"Renamed {_leaf(key)} to {_leaf(new_key)}",
+                select=(FOLDER, new_key),
+            )
+
+        self.runner.run(
+            lambda: self.service.rename_folder(key, name.strip()),
+            renamed,
+            self._failed_change("Couldn't rename the folder"),
+        )
+
+    def move_selected(self) -> None:
+        """Ask where to move the selected rows (Move to...)."""
+        items = self.selected_items()
+        if items:
+            self._ask_target(items)
+
+    def move_selected_to(self, key: str) -> None:
+        """Move the selected rows into the folder ``key``."""
+        items = self.selected_items()
+        if items:
+            self._move_items(items, key)
+
+    def _ask_target(self, items: list[tuple[str, str]]) -> None:
+        if self._shelf is None:
+            return
+        picker = FolderPicker(
+            self._shelf.root.name,
+            [folder.key for folder in self._shelf.folders],
+            allow_root=all(kind == FOLDER for kind, _ in items),
+            exclude=tuple(value for kind, value in items if kind == FOLDER),
+            parent=self,
+        )
+        if picker.exec() == QDialog.DialogCode.Accepted and picker.chosen() is not None:
+            self._move_items(items, picker.chosen())
+
+    def _move_items(self, items: list[tuple[str, str]], key: str) -> None:
+        files = [Path(value) for kind, value in items if kind == FILE]
+        folders = [value for kind, value in items if kind == FOLDER]
+        if not key and files:
+            self.summary.setText(
+                "Files can't go into your AutoShelf folder itself (AutoShelf would sort them "
+                "again). Choose a folder."
+            )
+            return
+        what = self._what(items)
+
+        def moved(changes) -> None:
+            self._after_change(
+                changes.history_ids, f"Moved {what} to {self._place(key)}", changes.failed
+            )
+
+        self.runner.run(
+            lambda: self.service.move_items(files, folders, key),
+            moved,
+            self._failed_change("Couldn't move it"),
+        )
+
+    @staticmethod
+    def _what(items: list[tuple[str, str]]) -> str:
+        """ "report.pdf", "Notes" or "3 items"."""
+        if len(items) != 1:
+            return _count(len(items), "item")
+        kind, value = items[0]
+        return Path(value).name if kind == FILE else _leaf(value)
+
+    def cut(self) -> None:
+        """Cut the selected rows, to paste them into another folder (Ctrl+X)."""
+        self._cut(self.selected_items())
+
+    def _cut(self, items: list[tuple[str, str]]) -> None:
+        if not items:
+            return
+        self._clipboard = list(items)
+        self.summary.setText(f"Cut {self._what(items)}: open a folder and paste (Ctrl+V).")
+
+    def paste(self, key: str | None = None) -> None:
+        """Move what was cut into ``key``, or into the open folder (Ctrl+V)."""
+        if key is None:
+            kind, key = self.location
+            if kind != FOLDER:
+                self.summary.setText("Open a folder to paste into it.")
+                return
+        items, self._clipboard = self._clipboard, []
+        if items:
+            self._move_items(items, key)
+
+    def delete_selected(self) -> None:
+        """Move the selected rows to the Trash (Del); a folder asks first."""
+        self._delete_items(self.selected_items())
+
+    def _delete_items(self, items: list[tuple[str, str]]) -> None:
+        if not items:
+            return
+        files = [Path(value) for kind, value in items if kind == FILE]
+        folders = [value for kind, value in items if kind == FOLDER]
+        if folders and not self._confirm_delete(folders):
+            return
+        what = self._what(items)
+
+        def binned(changes) -> None:
+            self._after_change(
+                changes.history_ids,
+                f"Moved {what} to the Trash (the _Trash folder in your AutoShelf folder)",
+                changes.failed,
+            )
+
+        self.runner.run(
+            lambda: self.service.trash_items(files, folders),
+            binned,
+            self._failed_change("Couldn't move it to the Trash"),
+        )
+
+    def _confirm_delete(self, folders: list[str]) -> bool:
+        files = 0
+        if self._shelf is not None:
+            files = sum(
+                1
+                for item in self._shelf.files
+                if any(item.folder == key or item.folder.startswith(key + "/") for key in folders)
+            )
+        if len(folders) > 1:
+            what = f"{len(folders)} folders and their {_count(files, 'file')}"
+        elif files:
+            what = f"{_leaf(folders[0])} and its {_count(files, 'file')}"
+        else:
+            what = f"the empty folder {_leaf(folders[0])}"
+        answer = QMessageBox.question(
+            self,
+            "Delete",
+            f"Move {what} to the Trash?\n\nNothing is deleted: it goes into the _Trash folder "
+            "in your AutoShelf folder, and Undo brings it back.",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def resort_folder(self, key: str, *, review: bool = True) -> None:
+        """Sort the files lying in ``key`` into its subfolders: names that match move; the
+        others that might belong are offered (``review``: right away)."""
+        self.summary.setText(f"Looking at the files in {self._place(key)}...")
+
+        def done(result: ResortResult) -> None:
+            if not result.moved and not result.plan.maybes:
+                self.summary.setText(f"No file in {self._place(key)} belongs in its subfolders.")
+                return
+            self.show_resort(result)
+            if review and result.plan.maybes:
+                self.review()
+
+        self.runner.run(
+            lambda: self.service.resort(key),
+            done,
+            self._failed_change("Couldn't sort into the subfolders"),
+        )
+
+    def show_resort(self, result: ResortResult) -> None:
+        """Say what sorting into a new folder did, with Undo and (if any) Review."""
+        if not result.moved and not result.plan.maybes:
+            return
+        targets = sorted({_leaf(item.target) for item in result.plan.moves}, key=str.casefold)
+        parts = []
+        if result.moved:
+            parts.append(f"Moved {_count(len(result.moved), 'file')} into {', '.join(targets)}.")
+        if result.plan.maybes:
+            parts.append(f"{_count(len(result.plan.maybes), 'file')} might belong too: Review.")
+        self.pending_review = result.plan if result.plan.maybes else None
+        self.review_button.setVisible(self.pending_review is not None)
+        if result.moved:
+            self._after_change([item.history_id for item in result.moved], " ".join(parts))
+        else:
+            self._note = " ".join(parts)
+            self.summary.setText(self._note)
+            self.refresh()
+
+    def review(self) -> None:
+        """Choose which of the files that might belong in the new folder move."""
+        if self.pending_review is None:
+            return
+        dialog = ReviewDialog(self.pending_review, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.move_reviewed(dialog.chosen())
+
+    def move_reviewed(self, chosen: list[Candidate]) -> None:
+        """Move the files ticked in the review (AutoShelf learns from the choice)."""
+        plan, self.pending_review = self.pending_review, None
+        self.review_button.setVisible(False)
+        if plan is None or not chosen:
+            return
+        targets = sorted({_leaf(item.target) for item in chosen}, key=str.casefold)
+
+        def moved(result: ResortResult) -> None:
+            self._after_change(
+                [item.history_id for item in result.moved],
+                f"Moved {_count(len(result.moved), 'file')} into {', '.join(targets)}",
+                result.failed,
+            )
+
+        self.runner.run(
+            lambda: self.service.move_maybes(plan, chosen),
+            moved,
+            self._failed_change("Couldn't move them"),
+        )
+
+    def undo_last_change(self) -> None:
+        """Undo the change the status line reports."""
+        ids, self._undo_ids = self._undo_ids, []
+        self.undo_button.setVisible(False)
+        if not ids:
+            return
+
+        def undone(results) -> None:
+            self._note = f"Undone ({_count(len(results), 'change')})"
+            self.edited.emit(self._note)
+            self.refresh()
+
+        self.runner.run(
+            lambda: self.service.undo_changes(ids), undone, self._failed_change("Couldn't undo it")
+        )
+
+    def _after_change(
+        self,
+        history_ids: list[int],
+        message: str,
+        failed: list[tuple[Path, str]] = (),
+        select: tuple[str, str] | None = None,
+    ) -> None:
+        if failed:
+            message += f" ({_count(len(failed), 'item')} couldn't: {failed[0][1]})"
+        self._undo_ids = list(history_ids)
+        self.undo_button.setVisible(bool(history_ids))
+        self._note = message
+        self._select_after_load = select
+        self.summary.setText(message)
+        self.edited.emit(message)
+        self.refresh()
+
+    def _failed_change(self, title: str):
+        def failed(exc: Exception) -> None:
+            self.summary.setText(str(exc))
+            QMessageBox.warning(self, title, str(exc))
+
+        return failed

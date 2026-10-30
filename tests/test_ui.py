@@ -1573,3 +1573,202 @@ def test_the_app_starts_counting_weeks_on_its_first_start(qtbot, app) -> None:
     app.start(show=False)
     qtbot.waitUntil(lambda: bool(app.service.settings().digest_shown), timeout=WAIT_MS)
     assert app._digest_timer.isActive()
+
+
+# --- editing in the Library ----------------------------------------------------------------
+
+
+@pytest.fixture
+def answer(monkeypatch: pytest.MonkeyPatch):
+    """Type ``text`` into the next input dialog of the Library."""
+
+    def set_text(text: str) -> None:
+        monkeypatch.setattr(
+            "autoshelf.ui.library_view.QInputDialog.getText",
+            lambda *args, **kwargs: (text, True),
+        )
+
+    return set_text
+
+
+def _library(qtbot, service, runner):
+    from autoshelf.ui.library_view import LibraryView
+
+    view = LibraryView(service, runner)
+    qtbot.addWidget(view)
+    view.refresh()
+    settle(qtbot, runner)
+    return view
+
+
+def test_library_makes_and_renames_folders(qtbot, service, runner, shelf: Path, answer) -> None:
+    from autoshelf.ui.library_view import FOLDER
+
+    view = _library(qtbot, service, runner)
+    view.go_to("Finance")
+    answer("Taxes 税金")
+    view.new_folder()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "Taxes 税金").is_dir()
+    assert view.selected_item() == (FOLDER, "Finance/Taxes 税金")
+
+    answer("Tax")
+    view.rename_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "Tax").is_dir()
+    assert "Renamed" in view.summary.text()
+    assert view.undo_button.isVisibleTo(view)
+
+
+def test_library_moves_files_by_drop_and_undo(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.library_view import FILE
+
+    invoice = shelf / "Finance" / "invoice 2024.txt"
+    view = _library(qtbot, service, runner)
+    view.go_to("Finance")
+    mime = view.mime_for([(FILE, str(invoice))])
+    assert not view.can_drop(mime, "")  # files never go into the root itself
+
+    view.drop_mime(mime, "Recipes")
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Recipes" / invoice.name).exists()
+    assert "Moved invoice 2024.txt to Recipes" in view.summary.text()
+
+    view.undo_last_change()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert invoice.exists()
+    assert not view.undo_button.isVisibleTo(view)
+
+
+def test_library_deletes_to_trash_with_folder_confirmation(
+    qtbot, service, runner, shelf: Path, no_dialogs: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoshelf.ui.library_view import FOLDER
+
+    view = _library(qtbot, service, runner)
+    view.select(FOLDER, "Finance")
+    view.delete_selected()  # the question is answered No
+    settle(qtbot, runner)
+    assert (shelf / "Finance").is_dir()
+    assert "Move Finance and its 1 file to the Trash?" in str(no_dialogs[-1])
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    view.delete_selected()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "_Trash" / "Finance" / "invoice 2024.txt").exists()
+    assert "Finance" not in view.row_names()
+
+
+def test_library_cut_and_paste(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.library_view import FILE, FOLDER
+
+    view = _library(qtbot, service, runner)
+    view.go_to("Finance")
+    view.select(FILE, str(shelf / "Finance" / "invoice 2024.txt"))
+    view.cut()
+    view.go_to("Recipes")
+    view.paste()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Recipes" / "invoice 2024.txt").exists()
+
+    view.go_to("")
+    view.select(FOLDER, "Recipes")
+    view.cut()
+    view.go_to("Finance")
+    view.paste()
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Finance" / "Recipes" / "invoice 2024.txt").exists()
+
+
+def test_library_resorts_and_reviews_maybes(qtbot, service, runner, shelf: Path) -> None:
+    from autoshelf.ui.folder_dialogs import ReviewDialog
+
+    make(shelf / "Recipes" / "pancake notes.txt", "flour eggs")
+    make(shelf / "Recipes" / "loaf.txt", "bread dough yeast knead")
+    (shelf / "Recipes" / "Notes").mkdir()
+    (shelf / "Recipes" / "Breads").mkdir()
+    service.describe("Recipes/Breads", "bread dough yeast knead")
+    service.save_settings(replace(service.settings(), auto_threshold=0.3, auto_margin=0.1))
+    view = _library(qtbot, service, runner)
+
+    view.resort_folder("Recipes", review=False)
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Recipes" / "Notes" / "pancake notes.txt").exists()
+    assert "Moved 1 file into Notes" in view.summary.text()
+    assert view.review_button.isVisibleTo(view)
+
+    dialog = ReviewDialog(view.pending_review)
+    qtbot.addWidget(dialog)
+    assert dialog.chosen() == []
+    dialog.list.item(0).setCheckState(Qt.CheckState.Checked)
+    view.move_reviewed(dialog.chosen())
+    settle(qtbot, runner)
+    settle(qtbot, runner)
+    assert (shelf / "Recipes" / "Breads" / "loaf.txt").exists()
+    assert not view.review_button.isVisibleTo(view)
+
+
+def test_resort_notification_text(shelf: Path) -> None:
+    from autoshelf.features.resort import Candidate, ResortPlan, ResortResult
+    from autoshelf.ui.app import resort_text
+
+    note = shelf / "Uni" / "Notes" / "a notes.txt"
+    plan = ResortPlan(
+        "Uni",
+        ("Uni/Notes",),
+        [Candidate(note, "Uni/Notes", "name")],
+        [Candidate(shelf / "Uni" / f"{n}.txt", "Uni/Notes", "content", 0.5) for n in "bcde"],
+    )
+    moved = [type("Moved", (), {"dst": note})()]
+    assert resort_text(ResortResult(plan, None, moved, [])) == (
+        "Moved 1 file from Uni into Notes",
+        "4 more might belong there. Click to review them.",
+    )
+    assert resort_text(ResortResult(replace(plan, maybes=[]), None, moved, [])) == (
+        "Moved 1 file from Uni into Notes",
+        "Undo it in History if it doesn't belong there.",
+    )
+    assert resort_text(ResortResult(replace(plan, moves=[]), None, [], [])) == (
+        "4 files in Uni might belong in Notes",
+        "Click to review them.",
+    )
+
+
+def test_a_new_folder_is_announced_and_opens_the_library(
+    qtbot, service: AppService, shelf: Path
+) -> None:
+    from autoshelf.db import repository
+    from autoshelf.db.connection import open_database
+
+    make(shelf / "Recipes" / "baking notes.txt", "flour")
+    toaster = FakeToaster()
+    assert service.acquire()
+    app = AutoShelfApp(service, toaster=lambda: toaster)
+    qtbot.addWidget(app.window)
+    app._notifications = True
+    app.start(show=False)
+    conn = open_database(service.paths.db_path)
+    try:
+        qtbot.waitUntil(
+            lambda: repository.get_setting(conn, "folders_seeded", False), timeout=WAIT_MS
+        )
+        (shelf / "Recipes" / "Notes").mkdir()
+        qtbot.waitUntil(lambda: bool(toaster.notes), timeout=WAIT_MS)
+        note = toaster.notes[0]
+        assert note.title == "Moved 1 file from Recipes into Notes"
+        assert note.launch == "autoshelf:review"
+        assert (shelf / "Recipes" / "Notes" / "baking notes.txt").exists()
+
+        app.run_command(Command(commands.URL, url=note.launch))
+        assert app.window.current_page() is app.window.library
+    finally:
+        conn.close()
+        app.shutdown()

@@ -69,3 +69,14 @@ def test_the_release_publishes_a_checksum() -> None:
     assert "Get-FileHash" in workflow and "SHA256" in workflow
     assert r'"dist\AutoShelf-$version-setup.exe.sha256"' in workflow
     assert "-Encoding ascii" in workflow and "-NoNewline" in workflow
+
+
+def test_installer_version_matches_the_app() -> None:
+    import tomllib
+
+    import autoshelf
+
+    text = ISS.read_text(encoding="utf-8")
+    assert f'#define AppVersion "{autoshelf.__version__}"' in text
+    project = tomllib.loads((ISS.parent.parent / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["version"] == autoshelf.__version__
